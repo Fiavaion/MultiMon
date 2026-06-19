@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<assembly manifestVersion="1.0" xmlns="urn:schemas-microsoft-com:asm.v1">
+  <!--
+    Per-monitor-V2 DPI awareness. Without this the process is only system-DPI-aware, and on a
+    mixed-DPI / multi-monitor layout the bare D3D11 output windows are positioned with virtualized
+    coordinates that don't line up — the second monitor's window lands off-screen, so only one
+    monitor shows output. The stress harness sets PER_MONITOR_AWARE_V2 explicitly; this manifest gives
+    the WPF control app the SAME awareness so MonitorService's physical-pixel bounds map 1:1 to window
+    placement across monitors of different scaling.
+  -->
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/PM</dpiAware>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2</dpiAwareness>
+    </windowsSettings>
+  </application>
+</assembly>

@@ -1,0 +1,26 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\MultiMon.Core\MultiMon.Core.csproj" />
+    <ProjectReference Include="..\MultiMon.Platform\MultiMon.Platform.csproj" />
+    <ProjectReference Include="..\MultiMon.Graphics\MultiMon.Graphics.csproj" />
+    <ProjectReference Include="..\MultiMon.Decode\MultiMon.Decode.csproj" />
+    <ProjectReference Include="..\MultiMon.Audio\MultiMon.Audio.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="10.0.9" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net9.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <!-- Per-monitor-V2 DPI awareness (see app.manifest): aligns the bare D3D11 output-window placement
+         with MonitorService's physical-pixel bounds on mixed-DPI multi-monitor layouts. -->
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+  </PropertyGroup>
+
+</Project>

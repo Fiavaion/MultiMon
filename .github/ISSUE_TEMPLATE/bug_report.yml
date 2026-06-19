@@ -1,0 +1,82 @@
+name: Bug report
+description: Report a bug in MultiMon (this is what the in-app "Report a bug" button opens).
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug in MultiMon. The more detail you give — especially your GPU,
+        the steps, and a log file — the faster it can be fixed.
+  - type: input
+    id: version
+    attributes:
+      label: MultiMon version
+      description: Shown in the window title / file properties (e.g. 1.0.0-rc.1).
+      placeholder: "1.0.0-rc.1"
+    validations:
+      required: true
+  - type: dropdown
+    id: gpu_vendor
+    attributes:
+      label: GPU vendor
+      description: Which graphics hardware are you running on? (The startup log's "Primary GPU" line.)
+      options:
+        - NVIDIA
+        - AMD
+        - Intel (discrete / Arc)
+        - Intel (integrated / iGPU)
+        - Other / not sure
+    validations:
+      required: true
+  - type: input
+    id: monitors
+    attributes:
+      label: Monitor setup
+      description: How many monitors, resolutions/refresh, and which mode you were using.
+      placeholder: "2 monitors — 2560x1440@165 + 1920x1080@60, Span mode"
+    validations:
+      required: true
+  - type: textarea
+    id: what_happened
+    attributes:
+      label: What happened?
+      description: Describe the bug — what went wrong (crash, freeze/wedge, wrong output, audio issue, etc.).
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Exact steps so the bug can be reproduced.
+      placeholder: |
+        1. Load clip X into ...
+        2. Enter perform mode
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect to happen?
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log file
+      description: |
+        Please attach the relevant log from `%LOCALAPPDATA%\MultiMon\Logs\` (drag the file in, or paste
+        the lines around the failure). The startup banner (GPU, monitors, feature level) is especially useful.
+      render: text
+    validations:
+      required: false
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I'm on the latest MultiMon release.
+          required: false
+        - label: I searched existing issues and this isn't a duplicate.
+          required: false

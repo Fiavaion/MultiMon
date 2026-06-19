@@ -1,0 +1,109 @@
+<Window x:Class="MultiMon.Control.Views.ConvertToHapWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        xmlns:local="clr-namespace:MultiMon.Control.Views"
+        mc:Ignorable="d"
+        Title="Convert to HAP" Height="390" Width="640" ResizeMode="NoResize"
+        Background="{StaticResource WindowBackground}" WindowStartupLocation="CenterOwner">
+
+    <Window.Resources>
+        <local:HapFormatDescConverter x:Key="HapFmtDesc"/>
+    </Window.Resources>
+
+    <Grid Margin="20">
+        <Grid.RowDefinitions>
+            <!-- FFmpeg status -->
+            <RowDefinition Height="Auto"/>
+            <!-- Input -->
+            <RowDefinition Height="Auto"/>
+            <!-- Metadata -->
+            <RowDefinition Height="Auto"/>
+            <!-- Settings (format + chunks) -->
+            <RowDefinition Height="Auto"/>
+            <!-- Output -->
+            <RowDefinition Height="Auto"/>
+            <!-- Progress bar -->
+            <RowDefinition Height="Auto"/>
+            <!-- Status text -->
+            <RowDefinition Height="Auto"/>
+            <!-- Buttons -->
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <!-- FFmpeg discovery result -->
+        <TextBlock Grid.Row="0" Text="{Binding FfmpegStatus}"
+                   Style="{StaticResource HintText}" Foreground="{StaticResource CyanBrush}"
+                   Margin="0,0,0,14" TextWrapping="Wrap"/>
+
+        <!-- Input file -->
+        <Grid Grid.Row="1" Margin="0,0,0,4">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="90"/>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+            <TextBlock Grid.Column="0" Text="INPUT VIDEO" Style="{StaticResource FieldLabel}"/>
+            <TextBox Grid.Column="1" x:Name="InputBox"
+                     Text="{Binding InputPath, UpdateSourceTrigger=PropertyChanged}"
+                     IsEnabled="{Binding CanEdit}"/>
+            <Button Grid.Column="2" Content="Browse…" Margin="8,0,0,0"
+                    Click="BrowseInput_Click" IsEnabled="{Binding CanEdit}"/>
+        </Grid>
+
+        <!-- Metadata summary (hidden when empty) -->
+        <TextBlock Grid.Row="2" x:Name="MetaText" Text="{Binding MetadataText}"
+                   Style="{StaticResource HintText}" Margin="90,0,0,12"/>
+
+        <!-- Encode settings -->
+        <StackPanel Grid.Row="3" Orientation="Horizontal" Margin="0,0,0,12">
+            <TextBlock Text="FORMAT" Style="{StaticResource FieldLabel}" Width="90"/>
+            <ComboBox Width="270" ItemsSource="{Binding AvailableFormats}"
+                      SelectedItem="{Binding SelectedFormat}" IsEnabled="{Binding CanEdit}">
+                <ComboBox.ItemTemplate>
+                    <DataTemplate>
+                        <TextBlock Text="{Binding Converter={StaticResource HapFmtDesc}}"/>
+                    </DataTemplate>
+                </ComboBox.ItemTemplate>
+            </ComboBox>
+            <TextBlock Text="CHUNKS" Style="{StaticResource FieldLabel}" Margin="20,0,8,0"/>
+            <TextBox Width="46" Text="{Binding ChunkCount, UpdateSourceTrigger=PropertyChanged}"
+                     TextAlignment="Center" IsEnabled="{Binding CanEdit}"/>
+        </StackPanel>
+
+        <!-- Output path -->
+        <Grid Grid.Row="4" Margin="0,0,0,14">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="90"/>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+            <TextBlock Grid.Column="0" Text="OUTPUT .MOV" Style="{StaticResource FieldLabel}"/>
+            <TextBox Grid.Column="1" x:Name="OutputBox"
+                     Text="{Binding OutputPath, UpdateSourceTrigger=PropertyChanged}"
+                     IsEnabled="{Binding CanEdit}"
+                     TextChanged="OutputBox_TextChanged"/>
+            <Button Grid.Column="2" Content="Save…" Margin="8,0,0,0"
+                    Click="BrowseOutput_Click" IsEnabled="{Binding CanEdit}"/>
+        </Grid>
+
+        <!-- Progress bar -->
+        <ProgressBar Grid.Row="5" Height="14" Minimum="0" Maximum="100"
+                     Value="{Binding Progress, Mode=OneWay}" Margin="0,0,0,6"/>
+
+        <!-- Status text -->
+        <TextBlock Grid.Row="6" Text="{Binding StatusText}"
+                   Style="{StaticResource HintText}" Foreground="{StaticResource TextSecondaryBrush}"
+                   Margin="0,0,0,16" TextWrapping="Wrap"/>
+
+        <!-- Action buttons -->
+        <StackPanel Grid.Row="7" Orientation="Horizontal" HorizontalAlignment="Right">
+            <Button Content="Convert" Width="104" Height="30" Margin="0,0,8,0"
+                    Style="{StaticResource AccentButton}"
+                    Click="Convert_Click" IsEnabled="{Binding CanConvert}"/>
+            <Button Content="Cancel" Width="90" Height="30"
+                    Click="Cancel_Click" IsEnabled="{Binding CanCancel}"/>
+        </StackPanel>
+    </Grid>
+</Window>
