@@ -1,5 +1,6 @@
 using MultiMon.Core.Diagnostics;
 using SharpGen.Runtime;
+using Vortice;
 using Vortice.Direct3D;
 using Vortice.Direct3D11;
 using Vortice.Direct3D11.Debug;
@@ -42,6 +43,7 @@ public sealed class GraphicsDeviceProvider : IGraphicsDeviceProvider
     private ID3D11DeviceContext? _immediateContext;
     private ID3D11Debug? _debug;
     private ID3D11InfoQueue? _infoQueue;
+    private QuadPipeline? _quadPipeline;
 
     public GraphicsDeviceProvider(ILog log, bool? enableDebugLayer = null, string? adapterSelector = null)
     {
@@ -64,6 +66,14 @@ public sealed class GraphicsDeviceProvider : IGraphicsDeviceProvider
     /// <summary>The DXGI factory, used by <see cref="OutputWindow"/> to create its persistent swapchain.</summary>
     public IDXGIFactory2 Factory => _factory ?? throw new InvalidOperationException(
         "DXGI factory not available — call Acquire() first.");
+
+    /// <summary>
+    /// The device-wide fullscreen-quad shaders + pipeline state shared by every <see cref="FullscreenQuadPass"/>:
+    /// built once with the device, released with the device graph, rebuilt on <see cref="Recreate"/>. Read by
+    /// the render thread per draw (the same thread that runs Recreate, so it never observes a stale one).
+    /// </summary>
+    internal QuadPipeline QuadPipeline => _quadPipeline ?? throw new InvalidOperationException(
+        "Quad pipeline not available — call Acquire() first.");
 
     /// <summary>
     /// True if the device supports the given DXGI format as a 2D texture. Wraps
@@ -96,6 +106,23 @@ public sealed class GraphicsDeviceProvider : IGraphicsDeviceProvider
     /// <summary>Description of the adapter the device was created on, for the HMONITOR→adapter log (ADR 0002 D4).</summary>
     public string? DeviceAdapterName { get; private set; }
 
+    /// <summary>PCI vendor id of the device's adapter (0x10DE NVIDIA, 0x1002 AMD, 0x8086 Intel; 0 for WARP/unknown).
+    /// Read from the DEVICE's own adapter, so on Optimus/hybrid rigs it names the GPU actually rendering — unlike
+    /// a WMI "biggest VRAM" guess.</summary>
+    public uint DeviceAdapterVendorId { get; private set; }
+
+    /// <summary>LUID of the device's adapter — the identity <see cref="AdapterMap"/> matches on (descriptions are
+    /// not unique: two identical cards share one string).</summary>
+    public Luid DeviceAdapterLuid { get; private set; }
+
+    /// <summary>
+    /// True when the device was successfully marked multithread-protected (ID3D11Multithread on the context, or
+    /// the same interface via the device). Media Foundation's DXGI device manager requires this before decode
+    /// threads share the device with the render thread; when false the Decode layer must not use HW decode on
+    /// this device (software decode path) — logged as an error at device creation.
+    /// </summary>
+    public bool MultithreadProtected { get; private set; }
+
     /// <summary>The DXGI device-removed reason of the current device, as text (for recovery logging).</summary>
     public string DeviceRemovedReasonText
     {
@@ -108,8 +135,20 @@ public sealed class GraphicsDeviceProvider : IGraphicsDeviceProvider
         lock (_gate)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
-            if (++_refCount == 1)
+            if (++_refCount != 1)
+                return;
+            try
+            {
                 CreateDevice();
+            }
+            catch
+            {
+                // A failed first Acquire owns nothing: undo the count and drop the partial graph (the DXGI
+                // factory is created before the device and would otherwise leak), then surface the error.
+                _refCount--;
+                TeardownDeviceGraph();
+                throw;
+            }
         }
     }
 
@@ -183,29 +222,40 @@ public sealed class GraphicsDeviceProvider : IGraphicsDeviceProvider
                                   $"old-device residual live objects={(residual < 0 ? "n/a" : residual.ToString())}.");
 
             TeardownDeviceGraph();
-
-            // After a REAL TDR the adapter can be briefly unavailable while the driver resets — device
-            // creation then fails transiently. Retry with a short bounded backoff: this is WAITING FOR
-            // THE HARDWARE to come back, not a sleep masking an ownership bug. If it never returns within
-            // the window, the final attempt throws and the render loop stops loudly (no infinite wedge).
-            const int maxAttempts = 50;          // ~10s total — a removed adapter (real TDR / driver
-            const int backoffMs = 200;           // restart) can stay unavailable longer than a transparent reset.
-            for (var attempt = 1; ; attempt++)
-            {
-                try
-                {
-                    CreateDevice();
-                    break;
-                }
-                catch (Exception ex) when (attempt < maxAttempts)
-                {
-                    _log.Error("Graphics", $"Device recreate attempt {attempt}/{maxAttempts} failed ({ex.Message}); adapter may still be resetting — retrying in {backoffMs}ms.");
-                    TeardownDeviceGraph(); // clear any partial state before the next attempt
-                    Thread.Sleep(backoffMs);
-                }
-            }
-            _log.Info("Graphics", $"Device recreate: new device ready on '{DeviceAdapterName}', debugLayer={_infoQueue is not null}.");
         }
+
+        // After a REAL TDR the adapter can be briefly unavailable while the driver resets — device
+        // creation then fails transiently. Retry with a short bounded backoff: this is WAITING FOR
+        // THE HARDWARE to come back, not a sleep masking an ownership bug. If it never returns within
+        // the window, the final attempt throws and the render loop stops loudly (no infinite wedge).
+        // The backoff sleeps OUTSIDE _gate: the gate is taken only to swap the device graph, so
+        // SupportsTextureFormat / DeviceRemovedReasonText / GetLiveObjectCount callers on other threads
+        // see "no device" instantly instead of blocking behind a 10s retry window. (The device fields
+        // themselves are render-thread-owned during recovery — only this thread writes them.)
+        const int maxAttempts = 50;          // ~10s total — a removed adapter (real TDR / driver
+        const int backoffMs = 200;           // restart) can stay unavailable longer than a transparent reset.
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                lock (_gate)
+                {
+                    ObjectDisposedException.ThrowIf(_disposed, this);
+                    CreateDevice();
+                }
+                break;
+            }
+            catch (Exception ex)
+            {
+                lock (_gate)
+                    TeardownDeviceGraph(); // clear any partial state (e.g. a factory without a device)
+                if (attempt >= maxAttempts || _disposed)
+                    throw;
+                _log.Error("Graphics", $"Device recreate attempt {attempt}/{maxAttempts} failed ({ex.Message}); adapter may still be resetting — retrying in {backoffMs}ms.");
+                Thread.Sleep(backoffMs);
+            }
+        }
+        _log.Info("Graphics", $"Device recreate: new device ready on '{DeviceAdapterName}', debugLayer={_infoQueue is not null}.");
     }
 
     public void Dispose()
@@ -255,8 +305,7 @@ public sealed class GraphicsDeviceProvider : IGraphicsDeviceProvider
         // multithread-protected before it is used concurrently, so its internal context lock
         // serializes MF's decode/convert calls against the render thread's copy/present. Set it once,
         // here, before any other thread touches the device.
-        using (var multithread = _immediateContext!.QueryInterfaceOrNull<ID3D11Multithread>())
-            multithread?.SetMultithreadProtected(true);
+        MultithreadProtected = TryEnableMultithreadProtection();
 
         if ((flags & DeviceCreationFlags.Debug) != 0)
         {
@@ -265,17 +314,59 @@ public sealed class GraphicsDeviceProvider : IGraphicsDeviceProvider
             _infoQueue?.PushEmptyStorageFilter();
         }
 
-        var adapterName = adapter?.Description1.Description
-            ?? (driverType == DriverType.Warp ? "(WARP software rasterizer)" : "(default hardware adapter)");
-        DeviceAdapterName = adapterName;
-        _log.Info("Graphics", $"D3D11 device created on '{adapterName}', driverType={driverType}, feature level {achieved}, debugLayer={_infoQueue is not null}");
+        // Identify the adapter from the DEVICE (covers the WARP / default-adapter cases where `adapter` is null).
+        using (var dxgiDevice = _device!.QueryInterface<IDXGIDevice>())
+        using (var deviceAdapter = dxgiDevice.GetAdapter())
+        {
+            var desc = deviceAdapter.Description;
+            DeviceAdapterName = desc.Description;
+            DeviceAdapterVendorId = desc.VendorId;
+            DeviceAdapterLuid = desc.Luid;
+        }
+        _log.Info("Graphics", $"D3D11 device created on '{DeviceAdapterName}' (vendorId=0x{DeviceAdapterVendorId:X4}, luid={DeviceAdapterLuid.LowPart:X8}), " +
+                              $"driverType={driverType}, feature level {achieved}, debugLayer={_infoQueue is not null}, multithreadProtected={MultithreadProtected}");
+
+        // Shaders + pipeline state: once per device, here — never per pass (LESSON-ARCH-002). A failure
+        // here propagates to the caller, which tears down the partial graph.
+        _quadPipeline = new QuadPipeline(_device!);
+    }
+
+    /// <summary>
+    /// Marks the device multithread-protected. ID3D11Multithread is normally answered by the immediate
+    /// context; ID3D10Multithread — the interface Media Foundation itself queries — shares the SAME IID
+    /// (9B7E4E00-342C-4106-A19F-4F2704F689F0) and on some runtimes/drivers is answered by the DEVICE rather
+    /// than the context, so that is the fallback. If neither answers, the device cannot be shared safely with
+    /// decode threads: logged as an error; <see cref="MultithreadProtected"/> stays false.
+    /// </summary>
+    private bool TryEnableMultithreadProtection()
+    {
+        using (var viaContext = _immediateContext!.QueryInterfaceOrNull<ID3D11Multithread>())
+        {
+            if (viaContext is not null)
+            {
+                viaContext.SetMultithreadProtected(true);
+                return true;
+            }
+        }
+        using (var viaDevice = _device!.QueryInterfaceOrNull<ID3D11Multithread>())
+        {
+            if (viaDevice is not null)
+            {
+                viaDevice.SetMultithreadProtected(true);
+                _log.Info("Graphics", "ID3D11Multithread not on the immediate context; enabled via the device (ID3D10Multithread path).");
+                return true;
+            }
+        }
+        _log.Error("Graphics", "Neither the immediate context nor the device answers ID3D11Multithread/ID3D10Multithread — " +
+                               "the device is NOT multithread-protected; hardware decode must not share it (software decode only).");
+        return false;
     }
 
     /// <summary>
     /// Resolves which adapter + driver type to create the device on. Honors <see cref="_adapterSelector"/>
     /// (constructor arg / MULTIMON_ADAPTER) for cross-GPU testing: <c>warp</c> (software rasterizer), a
     /// vendor substring (<c>amd</c>/<c>nvidia</c>/<c>intel</c> — first matching hardware adapter), or a
-    /// numeric hardware-adapter index. Empty/unmatched → the normal primary-output hardware adapter.
+    /// numeric hardware-adapter index. Empty/unmatched → <see cref="SelectDefaultAdapter"/>.
     /// </summary>
     private IDXGIAdapter1? ResolveAdapter(IDXGIFactory2 factory, out DriverType driverType)
     {
@@ -283,9 +374,9 @@ public sealed class GraphicsDeviceProvider : IGraphicsDeviceProvider
 
         if (selector.Length == 0)
         {
-            var primary = SelectPrimaryAdapter(factory);
-            driverType = primary is null ? DriverType.Hardware : DriverType.Unknown;
-            return primary;
+            var chosen = SelectDefaultAdapter(factory);
+            driverType = chosen is null ? DriverType.Hardware : DriverType.Unknown;
+            return chosen;
         }
 
         if (selector == "warp")
@@ -312,8 +403,8 @@ public sealed class GraphicsDeviceProvider : IGraphicsDeviceProvider
             adapter.Dispose();
         }
 
-        _log.Error("Graphics", $"Adapter selector '{_adapterSelector}' matched no adapter — using the primary hardware adapter.");
-        var fallback = SelectPrimaryAdapter(factory);
+        _log.Error("Graphics", $"Adapter selector '{_adapterSelector}' matched no adapter — using the default selection.");
+        var fallback = SelectDefaultAdapter(factory);
         driverType = fallback is null ? DriverType.Hardware : DriverType.Unknown;
         return fallback;
     }
@@ -329,32 +420,58 @@ public sealed class GraphicsDeviceProvider : IGraphicsDeviceProvider
         };
 
     /// <summary>
-    /// Picks the hardware adapter driving the primary output (the output whose desktop rect starts
-    /// at the virtual-desktop origin). Returns null to fall back to the default hardware adapter.
+    /// Picks the hardware adapter that drives the MOST outputs, tie-broken by dedicated VRAM (ADR 0002 D4:
+    /// "the adapter driving the primary/most outputs"). The previous rule — whichever adapter owns the (0,0)
+    /// monitor — chose the iGPU on hybrid/iGPU-panel rigs, i.e. the weakest GPU, and made every external
+    /// monitor a cross-adapter present. Every candidate is logged so the choice is auditable per run.
+    /// Returns null (default hardware adapter) only when no hardware adapter is enumerable.
     /// </summary>
-    private IDXGIAdapter1? SelectPrimaryAdapter(IDXGIFactory2 factory)
+    private IDXGIAdapter1? SelectDefaultAdapter(IDXGIFactory2 factory)
     {
+        IDXGIAdapter1? best = null;
+        var bestOutputs = -1;
+        var bestVram = 0UL;
+        var candidates = new List<string>();
+
         for (uint i = 0; factory.EnumAdapters1(i, out var adapter).Success; i++)
         {
-            if ((adapter.Description1.Flags & AdapterFlags.Software) != 0)
+            var desc = adapter.Description1;
+            if ((desc.Flags & AdapterFlags.Software) != 0)
             {
                 adapter.Dispose();
                 continue;
             }
 
+            var outputs = 0;
             for (uint j = 0; adapter.EnumOutputs(j, out var output).Success; j++)
             {
-                var rect = output.Description.DesktopCoordinates;
-                var isPrimary = rect.Left == 0 && rect.Top == 0;
                 output.Dispose();
-                if (isPrimary)
-                    return adapter;
+                outputs++;
             }
-            adapter.Dispose();
+            var vram = (ulong)desc.DedicatedVideoMemory;
+            candidates.Add($"'{desc.Description}' (vendorId=0x{desc.VendorId:X4}, outputs={outputs}, dedicatedVram={vram / (1024.0 * 1024 * 1024):0.0}GB)");
+
+            if (outputs > bestOutputs || (outputs == bestOutputs && vram > bestVram))
+            {
+                best?.Dispose();
+                best = adapter;
+                bestOutputs = outputs;
+                bestVram = vram;
+            }
+            else
+            {
+                adapter.Dispose();
+            }
         }
 
-        _log.Info("Graphics", "No hardware adapter with the primary output found — using the default adapter.");
-        return null;
+        if (best is null)
+        {
+            _log.Info("Graphics", "No hardware adapter enumerable — using the default adapter.");
+            return null;
+        }
+        _log.Info("Graphics", $"Adapter selection: chose '{best.Description1.Description}' (most outputs, then most dedicated VRAM; " +
+                              $"override with MULTIMON_ADAPTER). Candidates: {string.Join("; ", candidates)}");
+        return best;
     }
 
     /// <summary>
@@ -371,6 +488,10 @@ public sealed class GraphicsDeviceProvider : IGraphicsDeviceProvider
     /// <summary>Disposes the device, context, factory, and debug interfaces. Shared by final release and recreate.</summary>
     private void TeardownDeviceGraph()
     {
+        // Device children first (they would otherwise be the "residual live objects" the debug report shows).
+        _quadPipeline?.Dispose();
+        _quadPipeline = null;
+
         _infoQueue?.Dispose();
         _infoQueue = null;
 

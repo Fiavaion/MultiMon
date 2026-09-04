@@ -39,7 +39,7 @@ public sealed class OutputWindow
 
     private IntPtr _hwnd;
     private IDXGISwapChain1? _swapChain;
-    private IntPtr _frameLatencyWaitable;   // owned by the swapchain; valid while _swapChain is alive
+    private IntPtr _frameLatencyWaitable;   // OUR handle (GetFrameLatencyWaitableObject hands out one the caller owns); closed with the swapchain
     private ID3D11RenderTargetView? _renderTargetView;
     private int _width;
     private int _height;
@@ -67,6 +67,18 @@ public sealed class OutputWindow
     /// that the 1ms system timer triggers (ADR 0002 D3). Render-thread-owned; re-fetched on recreate.
     /// </summary>
     internal IntPtr FrameLatencyWaitable => _frameLatencyWaitable;
+
+    /// <summary>
+    /// Render-thread-owned pacing state, written by <see cref="RenderLoop"/> each iteration. <see cref="PresentReady"/>:
+    /// this output's frame-latency object was signalled (and consumed) this iteration, so a Present will not
+    /// block. <see cref="LatencyTimeoutStreak"/> counts consecutive bounded waits this output failed to signal
+    /// within; at the loop's threshold it is <see cref="LatencyExcluded"/> — dropped from the shared waitAll set
+    /// (so a sleeping/unplugged monitor no longer drags every other output to the timeout) and presented only
+    /// when a non-blocking probe finds it signalled, until it signals and is re-included.
+    /// </summary>
+    internal bool PresentReady { get; set; }
+    internal int LatencyTimeoutStreak { get; set; }
+    internal bool LatencyExcluded { get; set; }
 
     /// <summary>What this output renders; null = clear to black. Render-thread-owned.</summary>
     public FullscreenQuadPass? Content { get; private set; }
@@ -155,8 +167,10 @@ public sealed class OutputWindow
         using (var swapChain2 = _swapChain.QueryInterface<IDXGISwapChain2>())
         {
             swapChain2.MaximumFrameLatency = 1;                       // render at most one frame ahead
-            _frameLatencyWaitable = swapChain2.FrameLatencyWaitableObject; // handle owned by the swapchain
+            _frameLatencyWaitable = swapChain2.FrameLatencyWaitableObject; // a handle WE own — see CloseFrameLatencyHandle
         }
+        LatencyTimeoutStreak = 0;   // a fresh swapchain has a fresh (signalled) latency object
+        LatencyExcluded = false;
         CreateRenderTargetView();
     }
 
@@ -253,7 +267,10 @@ public sealed class OutputWindow
     /// <summary>Render thread only. Returns true when a frame was presented.</summary>
     internal bool RenderAndPresent(ID3D11DeviceContext context, TimeSpan mediaTime)
     {
-        if (!Visible || DeviceLost || _swapChain is null || _renderTargetView is null)
+        // PresentReady: the loop's bounded latency wait (or its per-output probe) found this swapchain able to
+        // accept a frame. Presenting without it could block inside Present until the compositor drains —
+        // the wedge ADR 0002's addendum removed — so an unready output simply skips this beat.
+        if (!Visible || DeviceLost || !PresentReady || _swapChain is null || _renderTargetView is null)
             return false;
 
         // Per-output clock overrides the loop's shared sample (Individual free-run); null = shared clock.
@@ -262,7 +279,7 @@ public sealed class OutputWindow
         _renderPhase = "draw";
         if (Content is { } pass)
         {
-            pass.Draw(context, _renderTargetView, _width, _height, time, _uv);
+            pass.Draw(context, _provider.QuadPipeline, _renderTargetView, _width, _height, time, _uv);
         }
         else
         {
@@ -324,7 +341,7 @@ public sealed class OutputWindow
         Visible = false;
         _renderTargetView?.Dispose();
         _renderTargetView = null;
-        _frameLatencyWaitable = IntPtr.Zero; // invalidated with the swapchain (swapchain owns the handle)
+        CloseFrameLatencyHandle();
         _swapChain?.Dispose();
         _swapChain = null;
         if (_hwnd != IntPtr.Zero)
@@ -345,9 +362,19 @@ public sealed class OutputWindow
     {
         _renderTargetView?.Dispose();
         _renderTargetView = null;
-        _frameLatencyWaitable = IntPtr.Zero; // re-fetched by RecreateDeviceResources → CreateSwapchainResources
+        CloseFrameLatencyHandle(); // a new handle is fetched by RecreateDeviceResources → CreateSwapchainResources
         _swapChain?.Dispose();
         _swapChain = null;
+    }
+
+    /// <summary>Closes our frame-latency handle (one per swapchain creation — it leaked per recreate before).</summary>
+    private void CloseFrameLatencyHandle()
+    {
+        if (_frameLatencyWaitable == IntPtr.Zero)
+            return;
+        if (!Win32.CloseHandle(_frameLatencyWaitable))
+            _log.Error("Graphics", $"{Name}: CloseHandle(frame-latency waitable) failed (error {Marshal.GetLastWin32Error()}).");
+        _frameLatencyWaitable = IntPtr.Zero;
     }
 
     /// <summary>

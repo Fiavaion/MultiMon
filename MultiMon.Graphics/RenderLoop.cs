@@ -119,33 +119,59 @@ public sealed class RenderLoop
             var window = new OutputWindow(_provider, this, _log, name, initialBounds);
             _windows.Add(window);
             return window;
-        });
+        }) ?? throw new InvalidOperationException("RenderLoop is not running — cannot create an output window.");
 
-    /// <summary>Runs <paramref name="action"/> on the render thread and blocks until it completed.</summary>
-    public void Invoke(Action action)
+    /// <summary>
+    /// Runs <paramref name="action"/> on the render thread and blocks until it completed; returns true when
+    /// it ran. Returns false — logged once, never thrown — when the render thread is not alive (never
+    /// started, already stopped, or died on an unrecoverable error): the command cannot run, and a caller
+    /// mid-teardown (controller Dispose → SetContent(null)/Hide → Stop → Release) must still reach
+    /// Stop/Release instead of being thrown out of its ordered teardown. A command that DID run and threw
+    /// still surfaces as an exception — that is a real error, not a dead thread.
+    /// </summary>
+    public bool Invoke(Action action)
     {
         if (Environment.CurrentManagedThreadId == _renderThreadId)
         {
             action();
-            return;
+            return true;
         }
-        if (_thread is null)
-            throw new InvalidOperationException("RenderLoop is not running.");
+        if (_thread is null || _threadExited)
+            return LogDeadThreadOnce();
 
         var command = new Command { Action = action };
         _commands.Enqueue(command);
         _wake.Set();
         // Re-check the exited flag while waiting: if the render thread died between our enqueue and
-        // its final command drain, the command will never run — fail loudly instead of wedging.
+        // its final command drain, the command will never run — return false instead of wedging.
         while (!command.Done.Wait(100))
         {
             if (_threadExited)
-                throw new InvalidOperationException("Render thread exited before the command ran.");
+                return LogDeadThreadOnce();
         }
+        if (command.Error is RenderLoopStoppedException)
+            return LogDeadThreadOnce(); // failed by the exiting thread's final drain, not by the action
         if (command.Error is not null)
             throw new InvalidOperationException($"Render-thread command failed: {command.Error.Message}", command.Error);
+        return true;
     }
 
+    /// <summary>Marker the exiting render thread puts on commands it could not run (see <see cref="Invoke(Action)"/>).</summary>
+    private sealed class RenderLoopStoppedException : InvalidOperationException
+    {
+        public RenderLoopStoppedException() : base("RenderLoop stopped before the command ran.") { }
+    }
+
+    private int _deadThreadLogged;
+
+    private bool LogDeadThreadOnce()
+    {
+        if (Interlocked.Exchange(ref _deadThreadLogged, 1) == 0)
+            _log.Error("Graphics", "RenderLoop.Invoke with no live render thread (not started, stopped, or died) — command skipped; further skips are not logged.");
+        return false;
+    }
+
+    /// <summary>Func variant of <see cref="Invoke(Action)"/>; returns <c>default</c> when the render thread is not alive.</summary>
     public T Invoke<T>(Func<T> func)
     {
         T result = default!;
@@ -210,7 +236,7 @@ public sealed class RenderLoop
 
                 LogPresentRatesIfDue();
 
-                // Present(1, ...) paces the loop at vsync while anything is visible; otherwise
+                // The latency wait paces the loop while anything is visible and ready; otherwise
                 // idle on the wake event with a short tick so the message pump stays responsive.
                 if (!presentedAny)
                     _wake.WaitOne(5);
@@ -231,7 +257,7 @@ public sealed class RenderLoop
             // Never leave an Invoke caller blocked forever.
             while (_commands.TryDequeue(out var command))
             {
-                command.Error = new InvalidOperationException("RenderLoop stopped before the command ran.");
+                command.Error = new RenderLoopStoppedException();
                 command.Done.Set();
             }
             _threadExited = true; // Invoke waiters racing the drain above see this and bail
@@ -246,32 +272,95 @@ public sealed class RenderLoop
         return false;
     }
 
-    // Bounded so a stalled compositor can never freeze the loop; on timeout we present anyway (a dropped
-    // beat, not a wedge). Handles are collected fresh each iteration so a post-recovery swapchain's new
-    // waitable object is picked up automatically.
+    // Bounded so a stalled compositor can never freeze the loop (a dropped beat, not a wedge). Handles are
+    // collected fresh each iteration so a post-recovery swapchain's new waitable object is picked up
+    // automatically. Sets each visible output's PresentReady for this iteration.
+    //
+    // One output that never signals (its monitor asleep, unplugged, or on a stalled adapter) must not drag
+    // every other output to the timeout forever: after LatencyExcludeAfterTimeouts consecutive timeouts in
+    // which it alone was unsignalled, it is excluded from the waitAll set and presented best-effort (only
+    // when a zero-timeout probe finds it signalled — presenting an unsignalled waitable swapchain blocks
+    // inside Present, the very wedge the waitable model exists to avoid) until it signals again.
     private const uint FrameLatencyTimeoutMs = 100;
-    private readonly IntPtr[] _waitHandles = new IntPtr[16];
+    private const int LatencyExcludeAfterTimeouts = 5;
+    private readonly IntPtr[] _waitHandles = new IntPtr[Win32.MAXIMUM_WAIT_OBJECTS];
+    private readonly List<OutputWindow> _waiting = new(); // render-thread scratch, reused per iteration
 
     private void WaitForFrameLatency()
     {
-        var count = 0;
+        _waiting.Clear();
         foreach (var window in _windows)
         {
+            window.PresentReady = false;
             if (!window.Visible || window.DeviceLost)
                 continue;
             var handle = window.FrameLatencyWaitable;
-            if (handle != IntPtr.Zero && count < _waitHandles.Length)
-                _waitHandles[count++] = handle;
+            if (handle == IntPtr.Zero)
+            {
+                window.PresentReady = true; // not a waitable swapchain (never in practice): present unpaced
+                continue;
+            }
+            if (window.LatencyExcluded)
+            {
+                // Best-effort while excluded: a non-blocking probe; a signal means its compositor is
+                // consuming again, so it rejoins the shared wait set from the next iteration.
+                if (Win32.WaitForSingleObject(handle, 0) == Win32.WAIT_OBJECT_0)
+                {
+                    window.LatencyExcluded = false;
+                    window.LatencyTimeoutStreak = 0;
+                    window.PresentReady = true;
+                    _log.Info("Graphics", $"{window.Name}: frame-latency object signalled again — re-included in the present wait set.");
+                }
+                continue;
+            }
+            if (_waiting.Count < _waitHandles.Length)
+            {
+                _waitHandles[_waiting.Count] = handle;
+                _waiting.Add(window);
+            }
+            else
+            {
+                window.PresentReady = true; // beyond MAXIMUM_WAIT_OBJECTS (64 outputs): present unpaced
+            }
         }
-        if (count == 0)
-            return; // nothing visible to pace against; the idle wait below handles it
+        if (_waiting.Count == 0)
+            return; // nothing to pace against; the idle wait below handles it
 
-        // waitAll=true → pace to the slowest visible swapchain (matches the old Present(1) cadence;
+        // waitAll=true → pace to the slowest included swapchain (matches the old Present(1) cadence;
         // cross-monitor content-sync is by frame SELECTION at one clock sample, not present rate).
-        // Only the first `count` handles are read; stale entries in the tail are intentionally ignored
-        // (do NOT pass _waitHandles.Length here).
-        if (Win32.WaitForMultipleObjects((uint)count, _waitHandles, waitAll: true, FrameLatencyTimeoutMs) == Win32.WAIT_TIMEOUT)
-            _latencyTimeouts++; // a visible swapchain never signalled ready within the bound — present backed up
+        // Only the first `_waiting.Count` handles are read; stale entries in the tail are intentionally
+        // ignored (do NOT pass _waitHandles.Length here).
+        var result = Win32.WaitForMultipleObjects((uint)_waiting.Count, _waitHandles, waitAll: true, FrameLatencyTimeoutMs);
+        if (result != Win32.WAIT_TIMEOUT)
+        {
+            // WAIT_OBJECT_0: every object signalled and was consumed. Anything else (WAIT_FAILED = a bad
+            // handle) is not a pacing signal — present as before rather than silently starve the outputs.
+            foreach (var window in _waiting)
+            {
+                window.PresentReady = true;
+                window.LatencyTimeoutStreak = 0;
+            }
+            return;
+        }
+
+        _latencyTimeouts++; // some included swapchain never signalled ready within the bound — present backed up
+        // A timed-out waitAll consumed nothing, so probe each: the ready ones present this beat (their
+        // signal is consumed here, exactly as the waitAll would have); the unsignalled ones accrue a streak.
+        foreach (var window in _waiting)
+        {
+            if (Win32.WaitForSingleObject(window.FrameLatencyWaitable, 0) == Win32.WAIT_OBJECT_0)
+            {
+                window.PresentReady = true;
+                window.LatencyTimeoutStreak = 0;
+                continue;
+            }
+            if (++window.LatencyTimeoutStreak >= LatencyExcludeAfterTimeouts)
+            {
+                window.LatencyExcluded = true;
+                _log.Error("Graphics", $"{window.Name}: frame-latency object unsignalled for {window.LatencyTimeoutStreak} consecutive {FrameLatencyTimeoutMs}ms waits — " +
+                                       "excluded from the present wait set (sleeping/unplugged monitor or stalled adapter?) until it signals again; other outputs no longer wait on it.");
+            }
+        }
     }
 
     /// <summary>Pause-freeze diagnostic: log per-output present deltas every ~1.5s while anything is visible.
@@ -297,7 +386,7 @@ public sealed class RenderLoop
             _diagLastPresent[window.Name] = cur;
             parts.Add($"{window.Name}=+{delta}({window.RenderPhase})");
             if (delta > 0) anyAdvancing = true;
-            else if (!window.DeviceLost) stalled.Add(window.Name);
+            else if (!window.DeviceLost && !window.LatencyExcluded) stalled.Add(window.Name); // exclusion was already logged by name
         }
         if (!anyVisible)
             return;

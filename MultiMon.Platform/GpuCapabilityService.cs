@@ -5,11 +5,19 @@ using MultiMon.Core.Models;
 namespace MultiMon.Platform;
 
 /// <summary>
-/// Detects the primary GPU (WMI) and its vendor, and gates HAP capability via a blacklist of GPUs
-/// that handle the compressed-texture / BC7 path unreliably (pre-Skylake Intel iGPUs and some old
-/// AMD FirePro / NVIDIA cards). Salvaged from the old app's GpuCompatibilityService and repurposed:
-/// the blacklist now gates the HAP enhancement (BCn upload + YCoCg shader), NOT the dropped LibVLC
-/// backend ladder. Fail-safe: any detection error leaves vendor Unknown and HAP disabled.
+/// Detects the GPU (vendor + name) and derives two capability decisions from it:
+/// <list type="bullet">
+///   <item><see cref="PreferSoftwareDecode"/> — true for GPUs on the <see cref="FlakyHardwareDecodeGpus"/>
+///   list (or when MULTIMON_FORCE_SW_DECODE is set). The list is the old app's D3D11VA blacklist: on those
+///   generations hardware video decode is unreliable, so Media Foundation should take its software path.</item>
+///   <item><see cref="SupportsHap"/> — true unless MULTIMON_DISABLE_HAP is set. HAP needs BC1/BC3/BC4/BC7
+///   texture support, which is MANDATORY at feature level 11.0 (the device floor), so no GPU that can create
+///   our device lacks it; the env var is the user escape hatch and the way to exercise the HAP→MF fallback.</item>
+/// </list>
+/// Detection order: WMI (largest-AdapterRAM controller) before the device exists; once the D3D11 device is
+/// created the Graphics layer calls <see cref="ApplyDeviceAdapter"/> with the DEVICE's adapter, which wins —
+/// on Optimus/hybrid rigs WMI's biggest-VRAM guess and the adapter actually rendering can differ.
+/// Fail-safe: any detection error leaves the vendor Unknown, HAP enabled, and hardware decode preferred.
 /// </summary>
 public static class GpuCapabilityService
 {
@@ -18,14 +26,20 @@ public static class GpuCapabilityService
     private static string _gpuName = "Unknown";
     private static GpuVendor _vendor = GpuVendor.Unknown;
 
+    // PCI vendor ids as reported in DXGI_ADAPTER_DESC.VendorId.
+    private const uint PciVendorNvidia = 0x10DE;
+    private const uint PciVendorAmd = 0x1002;
+    private const uint PciVendorIntel = 0x8086;
+
     /// <summary>
-    /// GPUs known to handle compressed-texture/BC7 HAP playback unreliably. A match disables the HAP
-    /// enhancement (the source falls back to Media Foundation decode). Format: "Vendor|Model"
-    /// (case-insensitive Contains on both halves).
+    /// GPUs whose D3D11 hardware video decode (D3D11VA) is known-flaky — the old app's blacklist, kept for
+    /// the same reason: on a match, decode should prefer Media Foundation's software path. Format:
+    /// "Vendor|Model" (case-insensitive Contains on both halves). This list does NOT gate HAP: BCn texture
+    /// formats are mandatory at FL 11.0 and every GPU here that reaches FL 11.0 handles them.
     /// </summary>
-    private static readonly string[] HapUnreliableGpus =
+    private static readonly string[] FlakyHardwareDecodeGpus =
     {
-        // Older AMD FirePro — flaky compressed-texture / DXGI behaviour.
+        // Older AMD FirePro — unreliable D3D11VA.
         "AMD|FirePro W600", "AMD|FirePro W5000", "AMD|FirePro W7000",
         "AMD|FirePro V3800", "AMD|FirePro V4800", "AMD|FirePro V5800",
 
@@ -33,7 +47,7 @@ public static class GpuCapabilityService
         "NVIDIA|Quadro 600", "NVIDIA|Quadro 2000",
 
         // Pre-Skylake Intel iGPUs (Sandy Bridge → Broadwell, 2011–2015). Skylake (HD 510/520/530,
-        // 2015+) and later are NOT listed — they handle the modern texture path fine.
+        // 2015+) and later are NOT listed — their D3D11VA is fine.
         "Intel|HD Graphics 2000", "Intel|HD Graphics 3000",   // Sandy Bridge
         "Intel|HD Graphics 2500", "Intel|HD Graphics 4000",   // Ivy Bridge
         "Intel|HD Graphics 4200", "Intel|HD Graphics 4400", "Intel|HD Graphics 4600",
@@ -45,19 +59,65 @@ public static class GpuCapabilityService
     public static string DetectedGpuName { get { EnsureDetected(); return _gpuName; } }
     public static GpuVendor DetectedVendor { get { EnsureDetected(); return _vendor; } }
 
-    /// <summary>True if the detected GPU is NOT on the HAP-unreliable blacklist. HAP is an
-    /// enhancement: when this is false, sources fall back to Media Foundation decode (never crash).
-    /// MULTIMON_DISABLE_HAP forces this false — a user escape hatch and the way to exercise the
-    /// HAP-unsupported fallback on a GPU that actually supports HAP (cross-GPU testing of G1).</summary>
-    public static bool SupportsHap
+    /// <summary>True unless MULTIMON_DISABLE_HAP is set: the BCn formats HAP needs are mandatory at the
+    /// device's FL 11.0 floor (the Graphics layer additionally checks the exact format per clip). The env var
+    /// is a user escape hatch and the way to exercise the HAP-unsupported → Media Foundation fallback on any GPU.</summary>
+    public static bool SupportsHap => !IsEnvSet("MULTIMON_DISABLE_HAP");
+
+    /// <summary>True when Media Foundation should take its SOFTWARE decode path: the detected GPU is on the
+    /// flaky-D3D11VA list, or MULTIMON_FORCE_SW_DECODE is set (cross-GPU testing hook).</summary>
+    public static bool PreferSoftwareDecode
     {
         get
         {
-            if (Environment.GetEnvironmentVariable("MULTIMON_DISABLE_HAP") is "1" or "true")
-                return false;
+            if (IsEnvSet("MULTIMON_FORCE_SW_DECODE"))
+                return true;
             EnsureDetected();
-            return !IsHapUnreliable(_gpuName);
+            return IsHardwareDecodeFlaky(_gpuName);
         }
+    }
+
+    /// <summary>
+    /// Overrides detection with the adapter the D3D11 device was actually created on (from the Graphics layer,
+    /// once the device exists). The vendor comes from the PCI id, not the name. Wins over the WMI guess.
+    /// </summary>
+    public static void ApplyDeviceAdapter(string description, uint vendorId, ILog? log = null)
+    {
+        lock (_lock)
+        {
+            var previous = _detected ? $"'{_gpuName}' ({_vendor})" : "(not yet detected)";
+            _gpuName = string.IsNullOrWhiteSpace(description) ? "Unknown" : description;
+            _vendor = VendorFromPciId(vendorId);
+            _detected = true;
+            log?.Info("Gpu", $"GPU detection set from the D3D11 device adapter: '{_gpuName}' vendor={_vendor} (pciVendorId=0x{vendorId:X4}); " +
+                             $"WMI pre-device detection was {previous}. HAP={(SupportsHap ? "enabled" : "disabled (MULTIMON_DISABLE_HAP)")}, " +
+                             $"preferSoftwareDecode={PreferSoftwareDecode}.");
+        }
+    }
+
+    /// <summary>Maps a DXGI/PCI vendor id to <see cref="GpuVendor"/> (0x10DE NVIDIA, 0x1002 AMD, 0x8086 Intel; else Unknown).</summary>
+    public static GpuVendor VendorFromPciId(uint vendorId) => vendorId switch
+    {
+        PciVendorNvidia => GpuVendor.Nvidia,
+        PciVendorAmd => GpuVendor.Amd,
+        PciVendorIntel => GpuVendor.Intel,
+        _ => GpuVendor.Unknown,
+    };
+
+    /// <summary>Pure: true when <paramref name="gpuName"/> matches the flaky-hardware-decode list ("Vendor|Model",
+    /// case-insensitive Contains on both halves).</summary>
+    public static bool IsHardwareDecodeFlaky(string? gpuName)
+    {
+        if (string.IsNullOrWhiteSpace(gpuName)) return false;
+        var g = gpuName.ToLowerInvariant();
+        foreach (var entry in FlakyHardwareDecodeGpus)
+        {
+            var parts = entry.Split('|');
+            if (parts.Length != 2) continue;
+            if (g.Contains(parts[0].ToLowerInvariant()) && g.Contains(parts[1].ToLowerInvariant()))
+                return true;
+        }
+        return false;
     }
 
     /// <summary>Logs EVERY GPU adapter (name, VRAM, driver version/date) — not just the chosen primary.
@@ -66,7 +126,7 @@ public static class GpuCapabilityService
     public static void LogAdapters(ILog log)
     {
         EnsureDetected();
-        log.Info("Gpu", $"Primary GPU: '{_gpuName}' (vendor={_vendor}, HAP={(SupportsHap ? "enabled" : "disabled")}).");
+        log.Info("Gpu", $"Primary GPU: '{_gpuName}' (vendor={_vendor}, HAP={(SupportsHap ? "enabled" : "disabled")}, preferSoftwareDecode={PreferSoftwareDecode}).");
         try
         {
             using var searcher = new ManagementObjectSearcher(
@@ -88,7 +148,7 @@ public static class GpuCapabilityService
         }
     }
 
-    /// <summary>Run GPU detection once (thread-safe). Safe to call early at app start.</summary>
+    /// <summary>Run GPU detection once (thread-safe). Safe to call early at app start (pre-device WMI path).</summary>
     public static void EnsureDetected()
     {
         if (_detected) return;
@@ -99,16 +159,7 @@ public static class GpuCapabilityService
         }
     }
 
-    /// <summary>Force re-detection (tests).</summary>
-    public static void ResetDetection()
-    {
-        lock (_lock)
-        {
-            _detected = false;
-            _gpuName = "Unknown";
-            _vendor = GpuVendor.Unknown;
-        }
-    }
+    private static bool IsEnvSet(string name) => Environment.GetEnvironmentVariable(name) is "1" or "true";
 
     private static void Detect()
     {
@@ -124,7 +175,8 @@ public static class GpuCapabilityService
                 return;
             }
 
-            // Prefer the GPU with the most adapter RAM (usually the discrete/primary one).
+            // Prefer the GPU with the most adapter RAM (usually the discrete one). A guess until the device
+            // exists — ApplyDeviceAdapter then replaces it with the adapter that actually renders.
             var primary = gpus.OrderByDescending(g =>
             {
                 try { return g["AdapterRAM"] is { } r ? Convert.ToUInt64(r) : 0UL; }
@@ -132,7 +184,7 @@ public static class GpuCapabilityService
             }).First();
 
             _gpuName = primary["Name"]?.ToString() ?? "Unknown";
-            _vendor = ParseVendor(_gpuName);
+            _vendor = VendorFromName(_gpuName);
         }
         catch (Exception ex)
         {
@@ -141,7 +193,8 @@ public static class GpuCapabilityService
         }
     }
 
-    private static GpuVendor ParseVendor(string name)
+    /// <summary>Pure: vendor from a WMI/DXGI description string (the pre-device fallback; PCI id is authoritative).</summary>
+    public static GpuVendor VendorFromName(string name)
     {
         var n = name.ToLowerInvariant();
         if (n.Contains("nvidia") || n.Contains("geforce") || n.Contains("quadro") || n.Contains("rtx") || n.Contains("gtx"))
@@ -150,19 +203,5 @@ public static class GpuCapabilityService
             return GpuVendor.Amd;
         if (n.Contains("intel")) return GpuVendor.Intel;
         return GpuVendor.Unknown;
-    }
-
-    private static bool IsHapUnreliable(string gpuName)
-    {
-        if (string.IsNullOrWhiteSpace(gpuName)) return false;
-        var g = gpuName.ToLowerInvariant();
-        foreach (var entry in HapUnreliableGpus)
-        {
-            var parts = entry.Split('|');
-            if (parts.Length != 2) continue;
-            if (g.Contains(parts[0].ToLowerInvariant()) && g.Contains(parts[1].ToLowerInvariant()))
-                return true;
-        }
-        return false;
     }
 }
