@@ -76,7 +76,9 @@ public sealed class PerformanceController : IPerformanceController
 
         _provider = new GraphicsDeviceProvider(log, enableDebugLayer);
         _provider.Acquire();
-        AdapterMap.LogTopology(_provider.Factory, _provider.DeviceAdapterName, log);
+        // Vendor/name follow the adapter the device actually runs on (WMI can name the wrong GPU on hybrid rigs).
+        GpuCapabilityService.ApplyDeviceAdapter(_provider.DeviceAdapterName ?? "Unknown", _provider.DeviceAdapterVendorId, log);
+        AdapterMap.LogTopology(_provider, log);
 
         _loop = new RenderLoop(_provider, log) { Clock = _clock };
         _loop.Start();
@@ -219,6 +221,9 @@ public sealed class PerformanceController : IPerformanceController
         // is an instant Show+Start. No native teardown here — that only happens on ApplyShow / Dispose.
         _clock.Stop();
         foreach (var c in _freeRunClocks) c.Stop();
+        foreach (var s in _sources)
+            if (s.IsFaulted)
+                _log.Error("Control", $"Source '{s.Id}' faulted during the show (see Decode lines above); it is rebuilt on the next Perform.");
         try
         {
             foreach (var i in _activeOutputs)
@@ -411,7 +416,8 @@ public sealed class PerformanceController : IPerformanceController
         MediaFoundationSource? src = null;
         try
         {
-            _mf ??= new MfDeviceManager(_provider.Device, _log);
+            _mf ??= new MfDeviceManager(_provider.Device, _log,
+                preferSoftwareDecode: GpuCapabilityService.PreferSoftwareDecode || !_provider.MultithreadProtected);
             src = new MediaFoundationSource(_provider.Device, _mf, binding.FilePath, _log, binding.SourceId);
             pass.BindSource(src.Frames, src.Width, src.Height);
             return src;

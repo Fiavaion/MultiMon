@@ -15,6 +15,10 @@ public interface ISource : IDisposable
 
     bool IsRunning { get; }
 
+    /// <summary>True once the decode loop has given up (no decode path could continue). The output
+    /// holds its last frame; the fault is reported, never thrown into the render thread.</summary>
+    bool IsFaulted { get; }
+
     /// <summary>Presentation timestamp of the most recently decoded frame, in media time.
     /// The render thread selects frames against the MasterClock using this — never by seeking.</summary>
     TimeSpan CurrentPts { get; }

@@ -179,8 +179,9 @@ public static class StressHarness
         // Build the persistent pipeline ONCE. The debug layer is on so live objects can be counted.
         var provider = new GraphicsDeviceProvider(log, enableDebugLayer: true, adapterSelector: adapterSelector);
         provider.Acquire();
+        GpuCapabilityService.ApplyDeviceAdapter(provider.DeviceAdapterName ?? "Unknown", provider.DeviceAdapterVendorId, log);
         // Log the HMONITOR→adapter map up front so cross-adapter outputs are attributable (ADR 0002 D4).
-        AdapterMap.LogTopology(provider.Factory, provider.DeviceAdapterName, log);
+        AdapterMap.LogTopology(provider, log);
         var loop = new RenderLoop(provider, log);
         // M7: the pipeline may now hold MORE than one source+pass (per-monitor mode). All native objects
         // are tracked in these lists for the ordered off-thread teardown; outputPass/outputUv map each
@@ -214,7 +215,8 @@ public static class StressHarness
                 }
                 else
                 {
-                    mf ??= new MfDeviceManager(provider.Device, log);
+                    mf ??= new MfDeviceManager(provider.Device, log,
+                        preferSoftwareDecode: GpuCapabilityService.PreferSoftwareDecode || !provider.MultithreadProtected);
                     var s = new MediaFoundationSource(provider.Device, mf, path, log);
                     p.BindSource(s.Frames, s.Width, s.Height);
                     sources.Add(s);

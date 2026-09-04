@@ -59,7 +59,8 @@ public partial class MainWindow : Window
         DataContext = viewModel;
 
         GpuText.Text = $"GPU: {GpuCapabilityService.DetectedGpuName}   ·   " +
-                       $"HAP: {(GpuCapabilityService.SupportsHap ? "supported" : "fallback to Media Foundation")}";
+                       $"Decode: {(GpuCapabilityService.PreferSoftwareDecode ? "software (GPU on the compatibility list)" : "hardware")}   ·   " +
+                       $"HAP: {(GpuCapabilityService.SupportsHap ? "enabled" : "disabled")}";
 
         _vm.PropertyChanged += OnViewModelChanged;
         SourceInitialized += OnSourceInitialized;
