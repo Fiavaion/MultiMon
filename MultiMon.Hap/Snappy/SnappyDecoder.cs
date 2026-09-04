@@ -1,4 +1,4 @@
-namespace MultiMon.Decode.Hap.Snappy;
+namespace MultiMon.Hap.Snappy;
 
 /// <summary>
 /// Minimal, vendored Snappy block-format DECOMPRESSOR — the second-stage codec HAP chunks use

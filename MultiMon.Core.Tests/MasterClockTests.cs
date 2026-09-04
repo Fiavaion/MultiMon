@@ -1,6 +1,6 @@
 using MultiMon.Core.Timing;
 
-namespace MultiMon.Tests;
+namespace MultiMon.Core.Tests;
 
 /// <summary>
 /// Behavioral contract tests for MasterClock (ADR 0002 D1).

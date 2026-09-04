@@ -1,0 +1,16 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Portable HAP: the .mov atom parser, the Snappy inflater, and the chunk/frame decoder — pure C# over
+    byte spans, no GPU and no OS calls. Deliberately net9.0 (NOT net9.0-windows) with no reference to
+    MultiMon.Graphics, Vortice, or Media Foundation, so the whole HAP path compiles and is unit-tested on
+    macOS/Linux. The D3D11 upload of the BCn bytes this produces lives in MultiMon.Decode/Hap/HapSource.cs,
+    which is the Windows half of the seam.
+  -->
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+</Project>

@@ -3,6 +3,7 @@ using System.Runtime.InteropServices;
 using MultiMon.Core.Abstractions;
 using MultiMon.Core.Diagnostics;
 using MultiMon.Core.Models;
+using MultiMon.Core.Show;
 using MultiMon.Core.Sync;
 using MultiMon.Core.Timing;
 using MultiMon.Audio;
@@ -785,8 +786,7 @@ public static class StressHarness
             show.Sources.Add(new SourceBinding { SourceId = "main", FilePath = video, IsHap = hap });
             if (mode == ShowMode.Split)
             {
-                var cols = (int)Math.Ceiling(Math.Sqrt(windows));
-                var rows = (int)Math.Ceiling((double)windows / cols);
+                var (rows, cols) = ShowPlanner.AutoGrid(windows);
                 show.WallConfiguration = new VideoWallConfiguration { SourceVideoPath = video, Auto = true, Rows = rows, Columns = cols };
             }
         }
@@ -952,8 +952,7 @@ public static class StressHarness
     /// </summary>
     private static UvRect SplitCellUv(int index, int count)
     {
-        var cols = (int)Math.Ceiling(Math.Sqrt(count));
-        var rows = (int)Math.Ceiling((double)count / cols);
+        var (rows, cols) = ShowPlanner.AutoGrid(count);
         return UvLayout.Quadrant(index / cols, index % cols, rows, cols);
     }
 

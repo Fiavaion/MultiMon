@@ -1,8 +1,8 @@
 using System.Buffers.Binary;
-using MultiMon.Decode.Hap;
-using MultiMon.Decode.Hap.Snappy;
+using MultiMon.Hap;
+using MultiMon.Hap.Snappy;
 
-namespace MultiMon.Tests;
+namespace MultiMon.Core.Tests;
 
 /// <summary>
 /// Untrusted-input hardening for the HAP path: the demuxer rejects what the frame decoder cannot play

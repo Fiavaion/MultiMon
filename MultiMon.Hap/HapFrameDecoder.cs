@@ -1,6 +1,6 @@
-using MultiMon.Decode.Hap.Snappy;
+using MultiMon.Hap.Snappy;
 
-namespace MultiMon.Decode.Hap;
+namespace MultiMon.Hap;
 
 /// <summary>
 /// Decodes ONE HAP frame (a single MOV sample's bytes) into its raw BCn texture payload, from scratch

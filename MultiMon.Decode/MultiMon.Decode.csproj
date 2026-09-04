@@ -3,6 +3,7 @@
   <ItemGroup>
     <ProjectReference Include="..\MultiMon.Core\MultiMon.Core.csproj" />
     <ProjectReference Include="..\MultiMon.Graphics\MultiMon.Graphics.csproj" />
+    <ProjectReference Include="..\MultiMon.Hap\MultiMon.Hap.csproj" />
   </ItemGroup>
 
   <ItemGroup>

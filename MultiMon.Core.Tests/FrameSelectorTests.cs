@@ -1,6 +1,6 @@
 using MultiMon.Core.Sync;
 
-namespace MultiMon.Tests;
+namespace MultiMon.Core.Tests;
 
 /// <summary>
 /// Contract tests for FrameSelector.Select (ADR 0002 D2).

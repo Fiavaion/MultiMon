@@ -1,7 +1,7 @@
-using MultiMon.Decode.Hap;
-using MultiMon.Decode.Hap.Snappy;
+using MultiMon.Hap;
+using MultiMon.Hap.Snappy;
 
-namespace MultiMon.Tests;
+namespace MultiMon.Core.Tests;
 
 /// <summary>
 /// HAP container/frame parsing (M5.1). The synthetic tests pin the section-header + compressor logic
@@ -10,7 +10,18 @@ namespace MultiMon.Tests;
 /// </summary>
 public class HapParserTests
 {
-    private const string FixturePath = @"D:\testing Videos\Hap\5sec_hap.mov";
+    /// <summary>
+    /// The real HapY clip the fixture tests run against: the dev box's copy by default, overridable via
+    /// <c>MULTIMON_HAP_FIXTURE</c> so the suite can be pointed at a local copy on another machine — the
+    /// default is a Windows path and simply won't exist on a Mac, where the fixture tests then no-op and
+    /// the synthetic ones still gate the parser.
+    /// </summary>
+    private static readonly string FixturePath =
+        Environment.GetEnvironmentVariable("MULTIMON_HAP_FIXTURE") is { Length: > 0 } custom
+            ? custom
+            : @"D:\testing Videos\Hap\5sec_hap.mov";
+
+    private static bool FixtureMissing => !File.Exists(FixturePath);
 
     // 1920x1080 as YCoCg-DXT5 (BC3): ceil(w/4)*ceil(h/4)*16 bytes per block.
     private const int Bc3SizeFor1080p = (1920 / 4) * (1080 / 4) * 16; // 2,073,600
@@ -49,7 +60,7 @@ public class HapParserTests
     [Fact]
     public void MovDemuxer_ParsesHapYFixture()
     {
-        if (!File.Exists(FixturePath)) return; // media not present on this machine
+        if (FixtureMissing) return; // fixture not on this machine (see FixturePath)
         var demux = MovHapDemuxer.Parse(FixturePath);
 
         Assert.Equal("HapY", demux.Fourcc);
@@ -69,7 +80,7 @@ public class HapParserTests
     [Fact]
     public void Decode_FirstFixtureFrame_YieldsFullBc3Texture()
     {
-        if (!File.Exists(FixturePath)) return; // media not present on this machine
+        if (FixtureMissing) return; // fixture not on this machine (see FixturePath)
         var demux = MovHapDemuxer.Parse(FixturePath);
         var first = demux.Samples[0];
 
@@ -96,7 +107,7 @@ public class HapParserTests
     [Fact]
     public void Decode_EveryFixtureFrame_YieldsConsistentBc3Size()
     {
-        if (!File.Exists(FixturePath)) return; // media not present on this machine
+        if (FixtureMissing) return; // fixture not on this machine (see FixturePath)
         var demux = MovHapDemuxer.Parse(FixturePath);
         using var fs = new FileStream(FixturePath, FileMode.Open, FileAccess.Read);
 

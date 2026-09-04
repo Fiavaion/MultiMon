@@ -1,7 +1,7 @@
 using MultiMon.Core.Models;
 using MultiMon.Core.Sync;
 
-namespace MultiMon.Tests;
+namespace MultiMon.Core.Tests;
 
 /// <summary>
 /// Contract tests for UvLayout (ADR 0003 D1) — the pure per-output UV derivation for the three modes.

@@ -1,6 +1,6 @@
 using System.Buffers.Binary;
 
-namespace MultiMon.Decode.Hap;
+namespace MultiMon.Hap;
 
 /// <summary>
 /// A minimal, vendored QuickTime/MP4 atom demuxer that locates the HAP video track and resolves each

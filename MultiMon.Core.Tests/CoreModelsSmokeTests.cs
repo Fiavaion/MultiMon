@@ -1,6 +1,6 @@
 using MultiMon.Core.Models;
 
-namespace MultiMon.Tests;
+namespace MultiMon.Core.Tests;
 
 /// <summary>
 /// Milestone 0 smoke: the salvaged framework-agnostic Core models instantiate and compute correctly.

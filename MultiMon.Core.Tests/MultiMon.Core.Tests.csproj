@@ -1,12 +1,13 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <!--
-    The WINDOWS-BOUND test suite: WASAPI audio and GPU capability detection, which need a real Windows
-    host. Everything that only touches MultiMon.Core and MultiMon.Hap lives in MultiMon.Core.Tests, which
-    is net9.0 and runs on macOS too.
+    The PORTABLE test suite: everything that exercises MultiMon.Core and MultiMon.Hap and nothing else.
+    net9.0 (not net9.0-windows) and referencing no Windows assembly, so it runs unchanged on macOS and is
+    the regression gate for the platform-free half of the app during the port. Windows-bound tests
+    (WASAPI, GPU capability, D3D11/Media Foundation) stay in MultiMon.Tests.
   -->
   <PropertyGroup>
-    <TargetFramework>net9.0-windows</TargetFramework>
+    <TargetFramework>net9.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <IsPackable>false</IsPackable>
@@ -25,8 +26,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\MultiMon.Core\MultiMon.Core.csproj" />
-    <ProjectReference Include="..\MultiMon.Audio\MultiMon.Audio.csproj" />
-    <ProjectReference Include="..\MultiMon.Platform\MultiMon.Platform.csproj" />
+    <ProjectReference Include="..\MultiMon.Hap\MultiMon.Hap.csproj" />
   </ItemGroup>
 
 </Project>
