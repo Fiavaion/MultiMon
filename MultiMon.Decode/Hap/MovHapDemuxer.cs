@@ -10,6 +10,10 @@ namespace MultiMon.Decode.Hap;
 ///
 /// Scope: enough of the spec to demux FFmpeg-produced HAP .mov files (the only HAP producer in play).
 /// HAP fourccs: Hap1=RGB DXT1, Hap5=RGBA DXT5, HapY=scaled YCoCg DXT5 (Hap Q). Audio/other tracks are ignored.
+/// HapM (Hap Q Alpha) and HapA (Hap Alpha-Only) are rejected up front: their frames are multi-section
+/// containers (colour + alpha textures) that <see cref="HapFrameDecoder"/> does not decode.
+/// Every sample's byte range is bounded by the file length at parse time, so a crafted table can neither
+/// over-allocate the frame buffer nor read past the file.
 /// </summary>
 public sealed class MovHapDemuxer
 {
@@ -25,12 +29,18 @@ public sealed class MovHapDemuxer
     public static MovHapDemuxer Parse(string path)
     {
         using var stream = new FileStream(path, FileMode.Open, FileAccess.Read);
+        return Parse(stream);
+    }
+
+    /// <summary>Parses a seekable .mov stream (the file, or an in-memory fixture in tests).</summary>
+    public static MovHapDemuxer Parse(Stream stream)
+    {
         var moov = ReadMoov(stream);
-        return ParseMoov(moov);
+        return ParseMoov(moov, stream.Length);
     }
 
     /// <summary>Reads the moov atom fully into memory (it is small relative to mdat).</summary>
-    private static byte[] ReadMoov(FileStream stream)
+    private static byte[] ReadMoov(Stream stream)
     {
         long offset = 0;
         var header = new byte[16];
@@ -70,7 +80,7 @@ public sealed class MovHapDemuxer
         throw new InvalidDataException("HAP .mov: no 'moov' atom found.");
     }
 
-    private static MovHapDemuxer ParseMoov(byte[] moov)
+    private static MovHapDemuxer ParseMoov(byte[] moov, long fileLength)
     {
         foreach (var trak in FindChildren(moov, 0, moov.Length, "trak"))
         {
@@ -85,13 +95,18 @@ public sealed class MovHapDemuxer
             if (stsd is null) continue;
 
             var (fourcc, width, height) = ReadStsd(moov, stsd.Value);
+            if (fourcc is "HapM" or "HapA")
+                throw new InvalidDataException($"HAP .mov: '{fourcc}' (Hap Q Alpha / Hap Alpha-Only) is not supported — " +
+                                               "its frames are multi-section (colour + alpha); re-encode as Hap, Hap Alpha or Hap Q.");
             if (!IsHapFourcc(fourcc)) continue; // skip audio / non-HAP tracks
 
             var timescale = ReadTimescale(moov, mdhd.Value);
+            if (timescale == 0)
+                throw new InvalidDataException("HAP .mov: mdhd timescale is 0.");
             var sizes = ReadStsz(moov, RequireChild(moov, stbl.Value, "stsz"));
             var chunkOffsets = ReadChunkOffsets(moov, stbl.Value);
             var stsc = ReadStsc(moov, RequireChild(moov, stbl.Value, "stsc"));
-            var samples = BuildSamples(sizes, chunkOffsets, stsc, moov, stbl.Value, timescale, out var durationTicks);
+            var samples = BuildSamples(sizes, chunkOffsets, stsc, moov, stbl.Value, timescale, fileLength, out var durationTicks);
 
             return new MovHapDemuxer
             {
@@ -112,6 +127,8 @@ public sealed class MovHapDemuxer
     {
         // stsd: 4 version/flags + 4 entry_count, then the first sample entry (size, fourcc, ...).
         var entry = stsd.PayloadStart + 8;
+        if (entry + 36 > stsd.PayloadEnd)
+            throw new InvalidDataException("HAP .mov: truncated stsd sample entry.");
         var fourcc = System.Text.Encoding.ASCII.GetString(buf, entry + 4, 4);
         // QuickTime VisualSampleEntry: width @ +32, height @ +34 (big-endian uint16) from the entry start.
         var width = BinaryPrimitives.ReadUInt16BigEndian(buf.AsSpan(entry + 32));
@@ -190,7 +207,7 @@ public sealed class MovHapDemuxer
     }
 
     private static SampleRef[] BuildSamples(int[] sizes, long[] chunkOffsets,
-        (uint firstChunk, uint samplesPerChunk)[] stsc, byte[] buf, Box stbl, uint timescale, out long durationTicks)
+        (uint firstChunk, uint samplesPerChunk)[] stsc, byte[] buf, Box stbl, uint timescale, long fileLength, out long durationTicks)
     {
         var sampleDurations = ReadSttsDurations(buf, RequireChild(buf, stbl, "stts"), sizes.Length);
         var samples = new SampleRef[sizes.Length];
@@ -204,7 +221,13 @@ public sealed class MovHapDemuxer
             for (var s = 0; s < samplesPerChunk && sampleIndex < sizes.Length; s++)
             {
                 var ptsTicks = (long)(cumulativeUnits * (double)TimeSpan.TicksPerSecond / timescale);
-                samples[sampleIndex] = new SampleRef(chunkOffsets[chunk] + offsetInChunk, sizes[sampleIndex], ptsTicks);
+                var fileOffset = chunkOffsets[chunk] + offsetInChunk;
+                var size = sizes[sampleIndex];
+                // Untrusted tables: a sample must lie inside the file, or the frame read would over-allocate
+                // (size) or read past EOF (offset). Reject at parse time rather than mid-playback.
+                if (size < 0 || fileOffset < 0 || fileOffset + size > fileLength)
+                    throw new InvalidDataException($"HAP .mov: sample {sampleIndex} ({fileOffset}+{size}) lies outside the {fileLength}-byte file.");
+                samples[sampleIndex] = new SampleRef(fileOffset, size, ptsTicks);
                 offsetInChunk += sizes[sampleIndex];
                 cumulativeUnits += sampleDurations[sampleIndex];
                 sampleIndex++;
@@ -298,14 +321,14 @@ public sealed class MovHapDemuxer
             throw new InvalidDataException($"HAP .mov: implausible {atom} entry count ({count}).");
     }
 
-    private static bool IsHapFourcc(string fourcc) => fourcc is "Hap1" or "Hap5" or "HapY" or "HapM" or "HapA";
+    private static bool IsHapFourcc(string fourcc) => fourcc is "Hap1" or "Hap5" or "HapY";
 
     private static HapTextureFormat FourccToFormat(string fourcc) => fourcc switch
     {
         "Hap1" => HapTextureFormat.RgbDxt1,
         "Hap5" => HapTextureFormat.RgbaDxt5,
         "HapY" => HapTextureFormat.YCoCgDxt5,
-        _ => HapTextureFormat.YCoCgDxt5 // HapM/HapA carry multiple sections; the frame header is authoritative
+        _ => throw new InvalidDataException($"HAP .mov: unsupported fourcc '{fourcc}'.")
     };
 
     private static void ReadExactly(Stream stream, byte[] buffer)
