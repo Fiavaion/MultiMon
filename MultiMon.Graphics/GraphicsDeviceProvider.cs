@@ -108,8 +108,20 @@ public sealed class GraphicsDeviceProvider : IGraphicsDeviceProvider
         lock (_gate)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
-            if (++_refCount == 1)
+            if (++_refCount != 1)
+                return;
+            try
+            {
                 CreateDevice();
+            }
+            catch
+            {
+                // A failed first Acquire owns nothing: undo the count and drop the partial graph (the DXGI
+                // factory is created before the device and would otherwise leak), then surface the error.
+                _refCount--;
+                TeardownDeviceGraph();
+                throw;
+            }
         }
     }
 
@@ -183,29 +195,40 @@ public sealed class GraphicsDeviceProvider : IGraphicsDeviceProvider
                                   $"old-device residual live objects={(residual < 0 ? "n/a" : residual.ToString())}.");
 
             TeardownDeviceGraph();
-
-            // After a REAL TDR the adapter can be briefly unavailable while the driver resets — device
-            // creation then fails transiently. Retry with a short bounded backoff: this is WAITING FOR
-            // THE HARDWARE to come back, not a sleep masking an ownership bug. If it never returns within
-            // the window, the final attempt throws and the render loop stops loudly (no infinite wedge).
-            const int maxAttempts = 50;          // ~10s total — a removed adapter (real TDR / driver
-            const int backoffMs = 200;           // restart) can stay unavailable longer than a transparent reset.
-            for (var attempt = 1; ; attempt++)
-            {
-                try
-                {
-                    CreateDevice();
-                    break;
-                }
-                catch (Exception ex) when (attempt < maxAttempts)
-                {
-                    _log.Error("Graphics", $"Device recreate attempt {attempt}/{maxAttempts} failed ({ex.Message}); adapter may still be resetting — retrying in {backoffMs}ms.");
-                    TeardownDeviceGraph(); // clear any partial state before the next attempt
-                    Thread.Sleep(backoffMs);
-                }
-            }
-            _log.Info("Graphics", $"Device recreate: new device ready on '{DeviceAdapterName}', debugLayer={_infoQueue is not null}.");
         }
+
+        // After a REAL TDR the adapter can be briefly unavailable while the driver resets — device
+        // creation then fails transiently. Retry with a short bounded backoff: this is WAITING FOR
+        // THE HARDWARE to come back, not a sleep masking an ownership bug. If it never returns within
+        // the window, the final attempt throws and the render loop stops loudly (no infinite wedge).
+        // The backoff sleeps OUTSIDE _gate: the gate is taken only to swap the device graph, so
+        // SupportsTextureFormat / DeviceRemovedReasonText / GetLiveObjectCount callers on other threads
+        // see "no device" instantly instead of blocking behind a 10s retry window. (The device fields
+        // themselves are render-thread-owned during recovery — only this thread writes them.)
+        const int maxAttempts = 50;          // ~10s total — a removed adapter (real TDR / driver
+        const int backoffMs = 200;           // restart) can stay unavailable longer than a transparent reset.
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                lock (_gate)
+                {
+                    ObjectDisposedException.ThrowIf(_disposed, this);
+                    CreateDevice();
+                }
+                break;
+            }
+            catch (Exception ex)
+            {
+                lock (_gate)
+                    TeardownDeviceGraph(); // clear any partial state (e.g. a factory without a device)
+                if (attempt >= maxAttempts || _disposed)
+                    throw;
+                _log.Error("Graphics", $"Device recreate attempt {attempt}/{maxAttempts} failed ({ex.Message}); adapter may still be resetting — retrying in {backoffMs}ms.");
+                Thread.Sleep(backoffMs);
+            }
+        }
+        _log.Info("Graphics", $"Device recreate: new device ready on '{DeviceAdapterName}', debugLayer={_infoQueue is not null}.");
     }
 
     public void Dispose()
