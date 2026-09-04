@@ -21,6 +21,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "MultiMon.Tests", "MultiMon.
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "MultiMon.Hap", "MultiMon.Hap\MultiMon.Hap.csproj", "{8FD99F70-5619-464F-8CD7-F2913D08D06D}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "MultiMon.Core.Tests", "MultiMon.Core.Tests\MultiMon.Core.Tests.csproj", "{0664F043-D8C4-42B6-9FAD-A2610293619E}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -139,6 +141,18 @@ Global
 		{8FD99F70-5619-464F-8CD7-F2913D08D06D}.Release|x64.Build.0 = Release|Any CPU
 		{8FD99F70-5619-464F-8CD7-F2913D08D06D}.Release|x86.ActiveCfg = Release|Any CPU
 		{8FD99F70-5619-464F-8CD7-F2913D08D06D}.Release|x86.Build.0 = Release|Any CPU
+		{0664F043-D8C4-42B6-9FAD-A2610293619E}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{0664F043-D8C4-42B6-9FAD-A2610293619E}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{0664F043-D8C4-42B6-9FAD-A2610293619E}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{0664F043-D8C4-42B6-9FAD-A2610293619E}.Debug|x64.Build.0 = Debug|Any CPU
+		{0664F043-D8C4-42B6-9FAD-A2610293619E}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{0664F043-D8C4-42B6-9FAD-A2610293619E}.Debug|x86.Build.0 = Debug|Any CPU
+		{0664F043-D8C4-42B6-9FAD-A2610293619E}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{0664F043-D8C4-42B6-9FAD-A2610293619E}.Release|Any CPU.Build.0 = Release|Any CPU
+		{0664F043-D8C4-42B6-9FAD-A2610293619E}.Release|x64.ActiveCfg = Release|Any CPU
+		{0664F043-D8C4-42B6-9FAD-A2610293619E}.Release|x64.Build.0 = Release|Any CPU
+		{0664F043-D8C4-42B6-9FAD-A2610293619E}.Release|x86.ActiveCfg = Release|Any CPU
+		{0664F043-D8C4-42B6-9FAD-A2610293619E}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

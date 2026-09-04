@@ -2,7 +2,7 @@ using System.Text.Json;
 using MultiMon.Core;
 using MultiMon.Core.Models;
 
-namespace MultiMon.Tests;
+namespace MultiMon.Core.Tests;
 
 /// <summary>
 /// Contract tests for ProjectService (ADR 0003 D5): v2 round-trip fidelity, v1→v2 forward migration,
