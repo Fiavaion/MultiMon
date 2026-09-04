@@ -19,27 +19,6 @@ public static class AdapterMap
     public static int LogTopology(GraphicsDeviceProvider provider, ILog log)
         => LogTopology(provider.Factory, provider.DeviceAdapterLuid, log);
 
-    /// <summary>Logs the adapter→outputs map and returns the number of cross-adapter (non-device) outputs.
-    /// <paramref name="deviceAdapterName"/> is resolved to a LUID by description (first match) — prefer the
-    /// <see cref="LogTopology(GraphicsDeviceProvider, ILog)"/> overload, which uses the device's LUID directly.</summary>
-    public static int LogTopology(IDXGIFactory2 factory, string? deviceAdapterName, ILog log)
-    {
-        var luid = default(Luid);
-        for (uint i = 0; factory.EnumAdapters1(i, out var adapter).Success; i++)
-        {
-            using (adapter)
-            {
-                var desc = adapter.Description1;
-                if (desc.Description == deviceAdapterName)
-                {
-                    luid = desc.Luid;
-                    break;
-                }
-            }
-        }
-        return LogTopology(factory, luid, log);
-    }
-
     /// <summary>Logs the adapter→outputs map and returns the number of cross-adapter (non-device) outputs.</summary>
     public static int LogTopology(IDXGIFactory2 factory, Luid deviceAdapterLuid, ILog log)
     {

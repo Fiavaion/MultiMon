@@ -136,8 +136,17 @@ public sealed class MainViewModel : INotifyPropertyChanged
         foreach (var row in Rows)
             row.PropertyChanged += OnAssignmentRowChanged;
 
-        AudioDevices = new ObservableCollection<AudioOutputDevice>(controller.GetAudioDevices());
-        _selectedAudioDevice = AudioDevices.FirstOrDefault(d => d.IsDefault) ?? AudioDevices.FirstOrDefault();
+        // WASAPI enumeration is a COM call into the audio driver: off the UI thread, populated when it returns.
+        AudioDevices = new ObservableCollection<AudioOutputDevice>();
+        Task.Run(controller.GetAudioDevices).ContinueWith(t =>
+        {
+            if (t.IsFaulted) { _log.Error("Control", $"Audio device enumeration failed: {t.Exception}"); return; }
+            RunOnUi(() =>
+            {
+                foreach (var d in t.Result) AudioDevices.Add(d);
+                SelectedAudioDevice ??= AudioDevices.FirstOrDefault(d => d.IsDefault) ?? AudioDevices.FirstOrDefault();
+            });
+        });
         AudioTracks = new ObservableCollection<AudioTrackRow>();
 
         _controller.StateChanged += OnControllerStateChanged;

@@ -326,8 +326,8 @@ public partial class MainWindow : Window
     private static readonly Regex QuotedPath = new(@"'([A-Za-z]:\\[^']+)'", RegexOptions.Compiled);
 
     /// <summary>Drops the user's profile path and account name (as a path segment, so a short name can't
-    /// mangle ordinary words); error lines keep only a clip's file name (the directory tree can identify a
-    /// person or a client).</summary>
+    /// mangle ordinary words); every quoted clip path keeps only its file name (the directory tree can
+    /// identify a person or a client, and the controller logs clip paths at INFO as well as ERROR).</summary>
     private static string ScrubLine(string line)
     {
         var profile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
@@ -336,8 +336,7 @@ public partial class MainWindow : Window
         var user = Environment.UserName;
         if (!string.IsNullOrEmpty(user))
             line = Regex.Replace(line, @"(?<=\\)" + Regex.Escape(user) + @"(?=\\|$|\s)", "<user>", RegexOptions.IgnoreCase);
-        if (line.Contains("[ERROR]"))
-            line = QuotedPath.Replace(line, m => $"'{Path.GetFileName(m.Groups[1].Value)}'");
+        line = QuotedPath.Replace(line, m => $"'{Path.GetFileName(m.Groups[1].Value)}'");
         return line;
     }
 }

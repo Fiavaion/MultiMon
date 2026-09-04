@@ -62,6 +62,7 @@ public static class StressHarness
     private const int WarmupCycles = 3;
     private const int ControllerWarmupCycles = 5;   // sources rebuilt per cycle: lazy allocation settles later
     private const int ControllerGrowthStreak = 3;   // consecutive rising cycles that count as a leak
+    private const int ControllerGrowthTolerance = 2; // the documented one-time HW-decoder-pool step; anything above it is a leak
     private const int HoldFramesPerCycle = 20;
     private static readonly TimeSpan WedgeTimeout = TimeSpan.FromSeconds(5);
 
@@ -170,6 +171,12 @@ public static class StressHarness
         // PerformanceController, sources rebuilt every cycle) instead of the bind-once loop below.
         if (HasFlag(args, "--controller"))
         {
+            foreach (var unsupported in new[] { "--inject-device-loss", "--soak-seconds", "--capture", "--audio-reperform", "--pause-after" })
+                if (args.Any(a => a.StartsWith(unsupported, StringComparison.Ordinal)))
+                {
+                    log.Error("Stress", $"{unsupported} is not supported with --controller (use the bind-once loop for it).");
+                    return 2;
+                }
             if (adapterSelector is not null) // the controller builds its own provider, which reads the env hook
                 Environment.SetEnvironmentVariable("MULTIMON_ADAPTER", adapterSelector);
             return await RunControllerAsync(log, monitors, bounds, cycles, mode, video, video2, hap, hap2, freeRun,
@@ -726,10 +733,11 @@ public static class StressHarness
     /// <see cref="WedgeTimeout"/> (a stuck worker, a stuck render thread, or no frames). Live objects and
     /// working set are diffed exactly as in <see cref="RunCycles"/>, with two deliberate differences:
     /// warm-up is <see cref="ControllerWarmupCycles"/> (sources are rebuilt each cycle, so lazy allocation
-    /// settles later), and live-object growth FAILS only when the count RISES on
-    /// <see cref="ControllerGrowthStreak"/> consecutive cycles. Reason: a one-time step (+2 objects at
-    /// cycle 15 of a 30-cycle run, then flat — a lazily-grown HW decoder sample pool) was observed and is
-    /// NOT a leak; a leak rises every cycle. The step is still logged as maxGrowth so it stays visible.
+    /// settles later), and live-object growth FAILS when the count exceeds the baseline by more than
+    /// <see cref="ControllerGrowthTolerance"/> at any cycle OR rises on <see cref="ControllerGrowthStreak"/>
+    /// consecutive cycles. Reason: a one-time step (+2 objects at cycle 15 of a 30-cycle run, then flat — a
+    /// lazily-grown HW decoder sample pool) was observed and is NOT a leak; the tolerance admits exactly that
+    /// step, while a slow leak (+2 every other cycle would defeat a streak-only rule) still trips the bound.
     /// </summary>
     private static async Task<int> RunControllerAsync(ConsoleLog log, IReadOnlyList<MonitorInfo> monitors,
         MonitorRect[] bounds, int cycles, ShowMode mode, string? video, string? video2, bool hap, bool hap2,
@@ -884,7 +892,8 @@ public static class StressHarness
         }
         stopwatch.Stop();
 
-        var leakFail = controller.DebugLayerActive && maxGrowthStreak >= ControllerGrowthStreak;
+        var leakFail = controller.DebugLayerActive &&
+                       (maxGrowth > ControllerGrowthTolerance || maxGrowthStreak >= ControllerGrowthStreak);
         var wsGrowthMb = wsBaselineBytes > 0 ? (wsMaxBytes - wsBaselineBytes) / (1024 * 1024) : 0;
         var workingSetGrowthLimitMb = 150 + 110 * (show.Sources.Count - 1); // same backstop as RunCycles
         var wsFail = wsBaselineBytes > 0 && wsGrowthMb > workingSetGrowthLimitMb;
