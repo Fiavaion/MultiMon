@@ -85,3 +85,6 @@ desktop.ini
 # Coverage
 *.coverage
 *.coveragexml
+
+# Claude Code agent worktrees
+.claude/worktrees/
