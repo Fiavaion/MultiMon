@@ -1,11 +1,15 @@
 using System.ComponentModel;
 using System.Diagnostics;
+using System.IO;
+using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Text.RegularExpressions;
 using System.Windows;
 using System.Windows.Interop;
 using Microsoft.Win32;
 using MultiMon.Control.ViewModels;
 using MultiMon.Control.Views;
+using MultiMon.Core.Models;
 using MultiMon.Platform;
 
 namespace MultiMon.Control;
@@ -193,19 +197,142 @@ public partial class MainWindow : Window
     private void ConvertHap_Click(object sender, RoutedEventArgs e)
         => new ConvertToHapWindow { Owner = this }.ShowDialog();
 
-    /// <summary>Open the MultiMon issue tracker in the default browser so users can file a bug report.
-    /// Pure shell-launch (no controller/native involvement — the firewall, ADR 0003 D4, is unaffected).</summary>
+    /// <summary>Open the MultiMon issue tracker, pre-filling the bug form with real runtime diagnostics
+    /// (version, GPU, monitors, OS/.NET, and a recent log excerpt) so reports carry accurate data instead
+    /// of user guesses. Pure shell-launch — no controller/native involvement (the firewall, ADR 0003 D4,
+    /// is unaffected). Diagnostics gathering is best-effort: any failure falls back to the plain form URL.</summary>
     private void ReportBug_Click(object sender, RoutedEventArgs e)
     {
-        const string url = "https://github.com/Fiavaion/MultiMon/issues/new?template=bug_report.yml";
+        string url;
+        try { url = BuildBugReportUrl(); }
+        catch { url = IssueFormBase; }
         try
         {
             Process.Start(new ProcessStartInfo(url) { UseShellExecute = true });
         }
         catch (Exception ex)
         {
-            MessageBox.Show(this, $"Couldn't open the browser. Please report bugs at:\n{url}\n\n{ex.Message}",
+            MessageBox.Show(this, $"Couldn't open the browser. Please report bugs at:\nhttps://github.com/Fiavaion/MultiMon/issues\n\n{ex.Message}",
                 "Report a bug", MessageBoxButton.OK, MessageBoxImage.Information);
         }
+    }
+
+    private const string IssueFormBase = "https://github.com/Fiavaion/MultiMon/issues/new?template=bug_report.yml";
+    private const int MaxIssueUrlLength = 6500; // keep well under browser/GitHub URL limits
+
+    /// <summary>Builds the GitHub issue-form URL with prefilled fields. Each query key matches a field id
+    /// in .github/ISSUE_TEMPLATE/bug_report.yml (version, gpu_vendor, monitors, logs).</summary>
+    private string BuildBugReportUrl()
+    {
+        var version = ResolveVersion();
+        var gpuName = GpuCapabilityService.DetectedGpuName;
+        var vendor = GpuCapabilityService.DetectedVendor;
+        var hap = GpuCapabilityService.SupportsHap ? "enabled" : "disabled";
+        var monitors = DescribeMonitors();
+
+        var diagnostics =
+            "Auto-collected diagnostics (please keep this):\n" +
+            $"MultiMon version: {version}\n" +
+            $"OS: {RuntimeInformation.OSDescription}\n" +
+            $".NET: {RuntimeInformation.FrameworkDescription}\n" +
+            $"GPU: {gpuName} (vendor={vendor}, HAP={hap})\n" +
+            $"Monitors: {monitors}\n\n" +
+            "--- Recent log ---\n" + ReadLogExcerpt();
+
+        string Build(string logs) => IssueFormBase
+            + "&version=" + Uri.EscapeDataString(version)
+            + "&gpu_vendor=" + Uri.EscapeDataString(MapGpuVendorOption(vendor, gpuName))
+            + "&monitors=" + Uri.EscapeDataString(monitors)
+            + "&logs=" + Uri.EscapeDataString(logs);
+
+        var url = Build(diagnostics);
+        if (url.Length > MaxIssueUrlLength)
+        {
+            var overflow = url.Length - MaxIssueUrlLength;
+            var keep = Math.Max(0, diagnostics.Length - overflow - 16);
+            url = Build(diagnostics[..keep] + "\n...(truncated)");
+        }
+        return url;
+    }
+
+    private static string ResolveVersion()
+    {
+        var asm = typeof(MainWindow).Assembly;
+        var info = asm.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion;
+        if (!string.IsNullOrEmpty(info))
+        {
+            var plus = info.IndexOf('+'); // strip the +<commit-sha> SourceLink suffix
+            return plus > 0 ? info[..plus] : info;
+        }
+        return asm.GetName().Version?.ToString() ?? "unknown";
+    }
+
+    /// <summary>Maps the detected vendor to the exact dropdown option label in the issue form. The precise
+    /// GPU name still goes in the diagnostics block, so a mis-bucketed dropdown is never the only signal.</summary>
+    private static string MapGpuVendorOption(GpuVendor vendor, string gpuName) => vendor switch
+    {
+        GpuVendor.Nvidia => "NVIDIA",
+        GpuVendor.Amd => "AMD",
+        GpuVendor.Intel => gpuName.Contains("Arc", StringComparison.OrdinalIgnoreCase)
+            ? "Intel (discrete / Arc)" : "Intel (integrated / iGPU)",
+        _ => "Other / not sure",
+    };
+
+    private string DescribeMonitors()
+    {
+        var list = _vm.Monitors
+            .Select(m => $"{m.Resolution}@{m.RefreshRate:0}Hz{(m.IsPrimary ? " (primary)" : "")}")
+            .ToList();
+        return list.Count == 0 ? "none detected" : $"{list.Count} — {string.Join(", ", list)}";
+    }
+
+    /// <summary>Reads the newest MultiMon log and returns the startup banner + any error lines (crashes are
+    /// logged as "[ERROR] CRASH:") + the tail, PII-scrubbed and capped in length — this text lands in a
+    /// PUBLIC GitHub issue URL. Best-effort — never throws into the caller.</summary>
+    private static string ReadLogExcerpt()
+    {
+        try
+        {
+            var dir = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "MultiMon", "Logs");
+            var newest = new DirectoryInfo(dir).GetFiles("multimon-*.log")
+                .OrderByDescending(f => f.Name).FirstOrDefault();
+            if (newest is null) return "(no log file found)";
+
+            var lines = File.ReadAllLines(newest.FullName)
+                .Where(l => !l.Contains("machine=") && !l.Contains("appDir=")) // machine name / install path
+                .Select(ScrubLine)
+                .ToArray();
+            var banner = lines.Where(l =>
+                l.Contains("Env:") || l.Contains("Gpu:") || l.Contains("Monitor") || l.Contains("feature level"))
+                .Take(14);
+            var errors = lines.Where(l => l.Contains("[ERROR]")).Reverse().Take(8).Reverse();
+            var tail = lines.Reverse().Take(10).Reverse();
+            var text = string.Join("\n", banner.Concat(errors).Concat(tail).Distinct());
+            return text.Length > 2500 ? text[..2500] + "\n...(truncated)" : text;
+        }
+        catch (Exception ex)
+        {
+            return $"(could not read log: {ex.Message})";
+        }
+    }
+
+    // A quoted absolute Windows path, as the controller logs clip paths ('D:\clips\show.mp4').
+    private static readonly Regex QuotedPath = new(@"'([A-Za-z]:\\[^']+)'", RegexOptions.Compiled);
+
+    /// <summary>Drops the user's profile path and account name (as a path segment, so a short name can't
+    /// mangle ordinary words); error lines keep only a clip's file name (the directory tree can identify a
+    /// person or a client).</summary>
+    private static string ScrubLine(string line)
+    {
+        var profile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        if (!string.IsNullOrEmpty(profile))
+            line = line.Replace(profile, "<user>", StringComparison.OrdinalIgnoreCase);
+        var user = Environment.UserName;
+        if (!string.IsNullOrEmpty(user))
+            line = Regex.Replace(line, @"(?<=\\)" + Regex.Escape(user) + @"(?=\\|$|\s)", "<user>", RegexOptions.IgnoreCase);
+        if (line.Contains("[ERROR]"))
+            line = QuotedPath.Replace(line, m => $"'{Path.GetFileName(m.Groups[1].Value)}'");
+        return line;
     }
 }
