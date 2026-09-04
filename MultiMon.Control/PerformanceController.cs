@@ -304,13 +304,17 @@ public sealed class PerformanceController : IPerformanceController
     /// unsupported clip. HAP is an ENHANCEMENT (hap-playback.md): if it's gated off on this GPU (blacklist
     /// or the clip's BCn format isn't supported) or the clip can't open, fall back to Media Foundation; if
     /// MF can't open it either, SKIP the source (that output stays black) — NEVER crash (the success
-    /// metric). Returns the bound pass, or null when no decode path could open the clip.
+    /// metric). The ladder is symmetric: a HAP clip assigned in a non-HAP mode (Individual/Span/Split)
+    /// fails in MF (no HAP MFT exists) and is then tried on the HAP path, so a HAP .mov plays wherever
+    /// the GPU allows it. Returns the bound pass, or null when no decode path could open the clip.
     /// </summary>
     private FullscreenQuadPass? BuildSource(PlannedSource planned)
     {
         var pass = new FullscreenQuadPass(_provider.Device);
         ISource? source = planned.PreferHap ? TryBuildHapSource(planned, pass) : null;
         source ??= TryBuildMfSource(planned, pass);
+        if (source is null && !planned.PreferHap)
+            source = TryBuildHapSource(planned, pass);
         if (source is null)
         {
             pass.Dispose();

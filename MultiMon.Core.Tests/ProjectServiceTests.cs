@@ -16,7 +16,7 @@ public class ProjectServiceTests
         Mode = ShowMode.Split,
         VideoAssignments =
         {
-            new VideoAssignment { MonitorDeviceId = @"\\.\DISPLAY1", VideoFilePath = @"D:\a.mp4", TimeOffset = TimeSpan.FromMilliseconds(250), Volume = 0.8 },
+            new VideoAssignment { MonitorDeviceId = @"\\.\DISPLAY1", VideoFilePath = @"D:\a.mp4", Volume = 0.8 },
             new VideoAssignment { MonitorDeviceId = @"\\.\DISPLAY2", VideoFilePath = @"D:\b.mov", IsHap = true },
         },
         VideoWall = new VideoWallConfiguration { SourceVideoPath = @"D:\4k.mp4", SourceWidth = 3840, SourceHeight = 2160, Rows = 2, Columns = 2 },
@@ -38,7 +38,6 @@ public class ProjectServiceTests
 
         Assert.Equal(2, loaded.VideoAssignments.Count);
         Assert.Equal(@"\\.\DISPLAY1", loaded.VideoAssignments[0].MonitorDeviceId);
-        Assert.Equal(TimeSpan.FromMilliseconds(250), loaded.VideoAssignments[0].TimeOffset);
         Assert.Equal(0.8, loaded.VideoAssignments[0].Volume, 6);
         Assert.True(loaded.VideoAssignments[1].IsHap);
 

@@ -71,9 +71,10 @@ to MSL, not logic to redesign.
 
 ## Order of work
 
-1. On Windows first: hoist `DecodedFrame` / `IGraphicsDeviceProvider` texture types behind Core opaque
-   handles, so `ISource` can publish a frame without naming a D3D11 type. This is the remaining
-   precondition from the audit and is *not* done.
+1. No further Windows-side hoisting is needed. `MultiMon.Core` and `MultiMon.Hap` already contain no
+   D3D11 type; `DecodedFrame` and `IGraphicsDeviceProvider` live in `MultiMon.Graphics`, which a Mac
+   port replaces wholesale with a Metal twin (a Metal `DecodedFrame` carrying an `MTLTexture`). Putting
+   an opaque texture handle in Core would be the GPU abstraction layer the ADR forbids, for no gain.
 2. On a Mac: `MultiMon.Platform.Mac` (`NSScreen` monitor service) — smallest seam, proves the toolchain.
 3. `MultiMon.Graphics.Mac`: Metal device + `CAMetalLayer` per screen, persistent for the session, plus
    the fullscreen-quad pass and the UV sub-rect constant buffer.

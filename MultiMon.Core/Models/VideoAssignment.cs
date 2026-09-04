@@ -14,8 +14,6 @@ public sealed class VideoAssignment
     /// <summary>Path to the video file.</summary>
     public string VideoFilePath { get; set; } = string.Empty;
 
-    /// <summary>Per-clip offset for synchronization against the MasterClock.</summary>
-    public TimeSpan TimeOffset { get; set; } = TimeSpan.Zero;
 
     /// <summary>Linear gain for this clip's audio, 0.0–1.0.</summary>
     public double Volume { get; set; } = 1.0;
@@ -24,5 +22,5 @@ public sealed class VideoAssignment
     public bool IsHap { get; set; }
 
     public override string ToString()
-        => $"Monitor {MonitorDeviceId}: {System.IO.Path.GetFileName(VideoFilePath)} (+{TimeOffset})";
+        => $"Monitor {MonitorDeviceId}: {System.IO.Path.GetFileName(VideoFilePath)}";
 }

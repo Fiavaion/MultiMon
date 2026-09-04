@@ -40,8 +40,6 @@ public sealed class SourceBinding
     /// <summary>True if the file is a HAP clip (decoded by HapSource, not Media Foundation).</summary>
     public bool IsHap { get; init; }
 
-    /// <summary>Per-clip playback offset applied against the MasterClock (drift corrected by frame selection).</summary>
-    public TimeSpan TimeOffset { get; init; } = TimeSpan.Zero;
 }
 
 /// <summary>
