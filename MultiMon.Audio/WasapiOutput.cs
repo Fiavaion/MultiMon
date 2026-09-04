@@ -237,7 +237,8 @@ public sealed unsafe class WasapiOutput : IDisposable
             if (_stop) return;
             _client!.Start();
             RenderLoop();
-            try { _client!.Stop(); } catch { /* stopping a lost device is fine */ }
+            // _client is null if the loop ended on a failed rebuild (ReleaseClient ran, ActivateClient didn't).
+            try { _client?.Stop(); } catch { /* stopping a lost device is fine */ }
         }
         catch (Exception ex)
         {
@@ -330,13 +331,16 @@ public sealed unsafe class WasapiOutput : IDisposable
             _audioEvent.WaitOne(200);
             if (_stop) break;
 
-            _client!.GetCurrentPadding(out var padding);
-            var framesToWrite = _bufferFrames - padding;
-            if (framesToWrite == 0)
-                continue;
-
+            // The WHOLE iteration (padding query + fill) sits inside the try: GetCurrentPadding is the first
+            // call to fail with AUDCLNT_E_DEVICE_INVALIDATED after a device pull, and outside the try it
+            // killed the render thread before the D-005 rebuild ever ran.
             try
             {
+                _client!.GetCurrentPadding(out var padding);
+                var framesToWrite = _bufferFrames - padding;
+                if (framesToWrite == 0)
+                    continue;
+
                 FillBuffer(framesToWrite, ref primed);
             }
             catch (COMException ex)
@@ -348,7 +352,8 @@ public sealed unsafe class WasapiOutput : IDisposable
                 _log.Error("Audio", $"WASAPI device error 0x{ex.HResult:X8}; rebuilding the endpoint.");
                 if (!TryRebuild())
                 {
-                    _log.Error("Audio", "WASAPI endpoint rebuild failed after retries; stopping this output (audio ends, app continues).");
+                    if (!_stop)
+                        _log.Error("Audio", "WASAPI endpoint rebuild failed after retries; stopping this output (audio ends, app continues).");
                     break;
                 }
                 primed = false; // re-prime against the rebuilt endpoint before counting underruns
