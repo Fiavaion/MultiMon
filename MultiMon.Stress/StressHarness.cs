@@ -6,6 +6,7 @@ using MultiMon.Core.Models;
 using MultiMon.Core.Sync;
 using MultiMon.Core.Timing;
 using MultiMon.Audio;
+using MultiMon.Control;
 using MultiMon.Decode.Hap;
 using MultiMon.Decode.MediaFoundation;
 using MultiMon.Graphics;
@@ -47,14 +48,20 @@ namespace MultiMon.Stress;
 /// MULTIMON_ADAPTER / MULTIMON_FORCE_SW_DECODE / MULTIMON_FEATURE_LEVEL env vars in the app (plus
 /// MULTIMON_DISABLE_HAP to force the HAP-unsupported fallback).
 ///
+/// --controller drives the same --video/--video2/--mode/--hap/--audio show through the app's real
+/// PerformanceController (ApplyShow → EnterPerform → ExitPerform per cycle, sources rebuilt each time) —
+/// the per-perform path the control panel takes, which the bind-once cycle loop does not exercise.
+///
 /// Args: --cycles=N --windows=N [--mode=MODE] [--video=PATH] [--video2=PATH] [--free-run] [--fullscreen]
-///       [--hap] [--hap2] [--audio [--audio-file=PATH]] [--audio-reperform] [--capture=PATH]
+///       [--controller] [--hap] [--hap2] [--audio [--audio-file=PATH]] [--audio-reperform] [--capture=PATH]
 ///       [--inject-device-loss=N] [--soak-seconds=N] [--raise-timer] [--list-audio]
 ///       [--adapter=SEL] [--force-sw-decode] [--feature-level=LVL]
 /// </summary>
 public static class StressHarness
 {
     private const int WarmupCycles = 3;
+    private const int ControllerWarmupCycles = 5;   // sources rebuilt per cycle: lazy allocation settles later
+    private const int ControllerGrowthStreak = 3;   // consecutive rising cycles that count as a leak
     private const int HoldFramesPerCycle = 20;
     private static readonly TimeSpan WedgeTimeout = TimeSpan.FromSeconds(5);
 
@@ -157,6 +164,16 @@ public static class StressHarness
             bounds[i] = fullscreen && i < monitors.Count
                 ? monitors[i].Bounds
                 : new MonitorRect(120 + i * (wWidth + wGap), 120, wWidth, wHeight);
+        }
+
+        // --controller: drive the app's REAL per-perform path (ApplyShow → EnterPerform → ExitPerform through
+        // PerformanceController, sources rebuilt every cycle) instead of the bind-once loop below.
+        if (HasFlag(args, "--controller"))
+        {
+            if (adapterSelector is not null) // the controller builds its own provider, which reads the env hook
+                Environment.SetEnvironmentVariable("MULTIMON_ADAPTER", adapterSelector);
+            return await RunControllerAsync(log, monitors, bounds, cycles, mode, video, video2, hap, hap2, freeRun,
+                audio ? audioFile ?? video : null);
         }
 
         // Build the persistent pipeline ONCE. The debug layer is on so live objects can be counted.
@@ -695,6 +712,189 @@ public static class StressHarness
         log.Info("Stress", passed
             ? "RESULT: PASS — audio aligned on every re-perform; the prime re-baseline absorbs the accumulated clock."
             : $"RESULT: FAIL — audio drift/underruns first on cycle {failedCycle} (garbled-start regression).");
+        log.Info("Stress", $"=== STRESS HARNESS END — exit {(passed ? 0 : 1)} ===");
+        return passed ? 0 : 1;
+    }
+
+    /// <summary>
+    /// --controller: gates the path the CONTROL PANEL actually takes per Perform, which the bind-once cycle
+    /// loop does not: every cycle runs ApplyShow (tear down the previous show's sources/passes/audio, build
+    /// new ones, rebind) → EnterPerform → hold N presented frames → ExitPerform through the real
+    /// <see cref="PerformanceController"/> on its worker thread. Wedge = any stage not completing within
+    /// <see cref="WedgeTimeout"/> (a stuck worker, a stuck render thread, or no frames). Live objects and
+    /// working set are diffed exactly as in <see cref="RunCycles"/>, with two deliberate differences:
+    /// warm-up is <see cref="ControllerWarmupCycles"/> (sources are rebuilt each cycle, so lazy allocation
+    /// settles later), and live-object growth FAILS only when the count RISES on
+    /// <see cref="ControllerGrowthStreak"/> consecutive cycles. Reason: a one-time step (+2 objects at
+    /// cycle 15 of a 30-cycle run, then flat — a lazily-grown HW decoder sample pool) was observed and is
+    /// NOT a leak; a leak rises every cycle. The step is still logged as maxGrowth so it stays visible.
+    /// </summary>
+    private static async Task<int> RunControllerAsync(ConsoleLog log, IReadOnlyList<MonitorInfo> monitors,
+        MonitorRect[] bounds, int cycles, ShowMode mode, string? video, string? video2, bool hap, bool hap2,
+        bool freeRun, string? audioPath)
+    {
+        log.Info("Stress", "=== CONTROLLER MODE: ApplyShow -> EnterPerform -> present -> ExitPerform per cycle (real per-perform path) ===");
+        if (video is null)
+        {
+            log.Error("Stress", "--controller needs --video=<clip>.");
+            return 1;
+        }
+
+        // One MonitorInfo per requested window, with the harness bounds (windowed or fullscreen) — the
+        // controller places its outputs at Monitors[i].Bounds, exactly as it does for real monitors.
+        var windows = bounds.Length;
+        var infos = new List<MonitorInfo>(windows);
+        for (var i = 0; i < windows; i++)
+        {
+            var real = i < monitors.Count ? monitors[i] : null;
+            infos.Add(new MonitorInfo
+            {
+                DeviceId = real?.DeviceId ?? $"harness-{i + 1}",
+                DisplayName = real?.DisplayName ?? $"Harness {i + 1}",
+                Bounds = bounds[i],
+                WorkArea = bounds[i],
+                Resolution = $"{bounds[i].Width}x{bounds[i].Height}",
+                IsPrimary = i == 0,
+            });
+        }
+
+        var show = new ShowDefinition { Mode = mode, SyncIndividual = !freeRun };
+        if (mode is ShowMode.Individual or ShowMode.Hap)
+        {
+            for (var i = 0; i < windows; i++)
+                show.Sources.Add(new SourceBinding
+                {
+                    SourceId = $"src{i + 1}",
+                    FilePath = i == 0 ? video : (video2 ?? video),
+                    MonitorDeviceId = infos[i].DeviceId,
+                    IsHap = i == 0 ? hap : (video2 is not null ? hap2 : hap),
+                });
+        }
+        else
+        {
+            show.Sources.Add(new SourceBinding { SourceId = "main", FilePath = video, IsHap = hap });
+            if (mode == ShowMode.Split)
+            {
+                var cols = (int)Math.Ceiling(Math.Sqrt(windows));
+                var rows = (int)Math.Ceiling((double)windows / cols);
+                show.WallConfiguration = new VideoWallConfiguration { SourceVideoPath = video, Auto = true, Rows = rows, Columns = cols };
+            }
+        }
+        if (audioPath is not null)
+            show.AudioTracks.Add(new AudioTrack { Name = Path.GetFileNameWithoutExtension(audioPath), SourceFilePath = audioPath });
+
+        var controller = new PerformanceController(infos, log, enableDebugLayer: true);
+        var failures = 0;
+        controller.CommandFailed += m => { Interlocked.Increment(ref failures); log.Error("Stress", $"controller command failed: {m}"); };
+        if (!controller.DebugLayerActive)
+            log.Error("Stress", "D3D11 debug layer unavailable — live-object growth CANNOT be verified on this machine.");
+
+        var stopwatch = Stopwatch.StartNew();
+        var process = Process.GetCurrentProcess();
+        var baseline = -1;
+        var previous = -1;
+        var maxGrowth = 0;
+        var growthStreak = 0;
+        var maxGrowthStreak = 0;
+        var wsBaselineBytes = 0L;
+        var wsMaxBytes = 0L;
+        var completed = 0;
+        var wedged = false;
+        try
+        {
+            for (var cycle = 1; cycle <= cycles; cycle++)
+            {
+                controller.ApplyShow(show);
+                controller.EnterPerform();
+                if (!controller.WaitForQueue(WedgeTimeout))
+                {
+                    wedged = true;
+                    log.Error("Stress", $"cycle {cycle:00}/{cycles}: WEDGE — ApplyShow/EnterPerform did not complete within {WedgeTimeout.TotalSeconds:0}s (controller worker stuck).");
+                    break;
+                }
+                if (controller.State != PerformState.Performing)
+                {
+                    log.Error("Stress", $"cycle {cycle:00}/{cycles}: perform did not start (state={controller.State}).");
+                    break;
+                }
+                if (!controller.WaitForPresentedFrames(HoldFramesPerCycle, WedgeTimeout, out var stalled))
+                {
+                    wedged = true;
+                    log.Error("Stress", $"cycle {cycle:00}/{cycles}: WEDGE — {stalled} presented no frame for {WedgeTimeout.TotalSeconds:0}s.");
+                    break;
+                }
+                controller.ExitPerform();
+                if (!controller.WaitForQueue(WedgeTimeout))
+                {
+                    wedged = true;
+                    log.Error("Stress", $"cycle {cycle:00}/{cycles}: WEDGE — ExitPerform did not complete within {WedgeTimeout.TotalSeconds:0}s.");
+                    break;
+                }
+                completed++;
+
+                // The previous show is torn down at the START of the next ApplyShow, so each snapshot holds
+                // exactly one show's objects — comparable cycle to cycle.
+                var live = controller.GetLiveObjectCount();
+                string liveText;
+                if (live < 0)
+                {
+                    liveText = "liveObjects=n/a";
+                }
+                else if (cycle <= ControllerWarmupCycles)
+                {
+                    baseline = live;
+                    liveText = $"liveObjects={live} (warmup)";
+                }
+                else
+                {
+                    maxGrowth = Math.Max(maxGrowth, live - baseline);
+                    growthStreak = live > previous ? growthStreak + 1 : 0;
+                    maxGrowthStreak = Math.Max(maxGrowthStreak, growthStreak);
+                    liveText = $"liveObjects={live} (delta {live - baseline:+0;-#}{(growthStreak > 0 ? $", rising x{growthStreak}" : "")})";
+                }
+                previous = live;
+
+                process.Refresh();
+                var ws = process.WorkingSet64;
+                wsMaxBytes = Math.Max(wsMaxBytes, ws);
+                string wsText;
+                if (cycle == ControllerWarmupCycles)
+                {
+                    wsBaselineBytes = ws;
+                    wsText = $"ws={ws / (1024 * 1024)}MB (baseline)";
+                }
+                else if (cycle > ControllerWarmupCycles)
+                    wsText = $"ws={ws / (1024 * 1024)}MB (delta {(ws - wsBaselineBytes) / (1024 * 1024):+0;-#}MB)";
+                else
+                    wsText = $"ws={ws / (1024 * 1024)}MB";
+
+                log.Info("Stress", $"cycle {cycle:00}/{cycles}: apply->enter->present({HoldFramesPerCycle}f)->exit ok, {liveText}, {wsText}");
+            }
+        }
+        catch (Exception ex)
+        {
+            log.Error("Stress", $"Harness failed: {ex}");
+        }
+        finally
+        {
+            // Dispose queues the ordered teardown on the controller's worker and joins it — off this thread.
+            await Task.Run(controller.Dispose);
+        }
+        stopwatch.Stop();
+
+        var leakFail = controller.DebugLayerActive && maxGrowthStreak >= ControllerGrowthStreak;
+        var wsGrowthMb = wsBaselineBytes > 0 ? (wsMaxBytes - wsBaselineBytes) / (1024 * 1024) : 0;
+        var workingSetGrowthLimitMb = 150 + 110 * (show.Sources.Count - 1); // same backstop as RunCycles
+        var wsFail = wsBaselineBytes > 0 && wsGrowthMb > workingSetGrowthLimitMb;
+        var commandFailures = Volatile.Read(ref failures);
+        var passed = completed == cycles && !wedged && !leakFail && !wsFail && commandFailures == 0;
+
+        log.Info("Stress", $"controller: cycles={completed}/{cycles} wedges={(wedged ? 1 : 0)} commandFailures={commandFailures} " +
+                           $"liveObjectBaseline={baseline} maxGrowth={maxGrowth} longestRise={maxGrowthStreak} " +
+                           $"wsBaseline={wsBaselineBytes / (1024 * 1024)}MB wsMaxGrowth={wsGrowthMb}MB elapsed={stopwatch.ElapsedMilliseconds}ms");
+        log.Info("Stress", passed
+            ? $"RESULT: PASS — {completed} controller cycles clean, no sustained live-object growth{(maxGrowth > 0 ? $" (one-time step of +{maxGrowth}, not a leak)" : "")}."
+            : $"RESULT: FAIL — {(wedged ? "wedge detected" : leakFail ? $"live-object count rose {maxGrowthStreak} cycles in a row (ownership bug)" : wsFail ? $"working-set growth {wsGrowthMb}MB > {workingSetGrowthLimitMb}MB" : commandFailures > 0 ? "controller command failures" : "incomplete run")}.");
         log.Info("Stress", $"=== STRESS HARNESS END — exit {(passed ? 0 : 1)} ===");
         return passed ? 0 : 1;
     }

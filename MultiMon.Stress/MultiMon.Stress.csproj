@@ -6,6 +6,8 @@
     <ProjectReference Include="..\MultiMon.Graphics\MultiMon.Graphics.csproj" />
     <ProjectReference Include="..\MultiMon.Decode\MultiMon.Decode.csproj" />
     <ProjectReference Include="..\MultiMon.Audio\MultiMon.Audio.csproj" />
+    <!-- The controller flag drives the app's real PerformanceController (the per-perform path the UI takes). -->
+    <ProjectReference Include="..\MultiMon.Control\MultiMon.Control.csproj" />
   </ItemGroup>
 
   <ItemGroup>
