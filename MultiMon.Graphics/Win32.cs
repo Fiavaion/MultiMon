@@ -25,8 +25,10 @@ internal static class Win32
     public const uint PM_REMOVE = 0x0001;
     public const uint WM_CLOSE = 0x0010;
 
+    public const uint WAIT_OBJECT_0 = 0x00000000;
     public const uint WAIT_TIMEOUT = 0x00000102;
     public const uint WAIT_FAILED = 0xFFFFFFFF;
+    public const int MAXIMUM_WAIT_OBJECTS = 64;
 
     public delegate IntPtr WndProc(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
 
@@ -108,4 +110,13 @@ internal static class Win32
     // the system timer is at 1ms (ADR 0002 D3). Bounded timeout → the present path can never freeze.
     [DllImport("kernel32.dll")]
     public static extern uint WaitForMultipleObjects(uint count, IntPtr[] handles, bool waitAll, uint milliseconds);
+
+    // Zero-timeout probe of ONE frame-latency object after a waitAll timeout: tells the outputs that are
+    // ready (and consumes their signal, as the waitAll would have) from the one holding everyone up.
+    [DllImport("kernel32.dll")]
+    public static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
+
+    // GetFrameLatencyWaitableObject hands out a handle the caller owns; it is closed with the swapchain.
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool CloseHandle(IntPtr handle);
 }
