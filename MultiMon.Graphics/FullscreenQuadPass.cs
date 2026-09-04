@@ -1,6 +1,5 @@
 using System.Runtime.InteropServices;
 using MultiMon.Core.Models;
-using Vortice.D3DCompiler;
 using Vortice.Direct3D;
 using Vortice.Direct3D11;
 using Vortice.DXGI;
@@ -11,13 +10,15 @@ namespace MultiMon.Graphics;
 /// <summary>
 /// The one fullscreen pass: a vertex-ID-generated fullscreen triangle that draws EITHER the
 /// Milestone 1 animated test pattern (no source bound) OR a decoded source texture sampled with UV
-/// passthrough (Milestone 2). Shaders, constant buffer, rasterizer state, sampler, and — once a
-/// source is bound — the persistent shader-resource texture are created ONCE and reused for the whole
-/// session; nothing here is built per cycle (LESSON-ARCH-002).
+/// passthrough (Milestone 2). Shaders, constant buffers, rasterizer state and sampler are NOT owned
+/// here — they are the device-wide <see cref="QuadPipeline"/> built once per device by
+/// <see cref="GraphicsDeviceProvider"/>. A pass owns only its persistent source texture + SRV
+/// (created once in <see cref="BindSource"/>, sized to the video); nothing is built per cycle
+/// (LESSON-ARCH-002), and constructing a pass creates no device objects at all.
 ///
 /// Threading: the constructor, <see cref="BindSource"/>, and <see cref="Dispose"/> only touch the
 /// device (free-threaded) and are safe off the render thread; <see cref="Draw"/> touches the
-/// immediate context (including the per-frame copy of the latest decoded frame into the source
+/// immediate context (including the per-frame copy of the selected decoded frame into the source
 /// texture) and is called EXCLUSIVELY by the render thread.
 /// </summary>
 public sealed class FullscreenQuadPass : IDisposable
@@ -38,16 +39,8 @@ public sealed class FullscreenQuadPass : IDisposable
     }
 
     // The device is mutable: device-removed recovery (RecreateDeviceResources) re-points it at the new
-    // device before rebuilding the GPU objects below. All fields are assigned in BuildDeviceResources.
+    // device before rebuilding the source texture.
     private ID3D11Device _device;
-    private ID3D11VertexShader _vertexShader = null!;
-    private ID3D11PixelShader _patternShader = null!;
-    private ID3D11PixelShader _sampleShader = null!;
-    private ID3D11PixelShader _ycocgShader = null!;
-    private ID3D11Buffer _timeBuffer = null!;
-    private ID3D11Buffer _uvBuffer = null!;   // b1: per-output UV sub-rect, written per Draw (M7)
-    private ID3D11RasterizerState _rasterizerState = null!;
-    private ID3D11SamplerState _sampler = null!;
 
     // Source-sampling state (M2 + M3 + M5). _source/dims/format persist across a device-removed recreate
     // (the FrameTimeline is owned by the source and is re-armed, not replaced); only the GPU texture+view
@@ -61,29 +54,20 @@ public sealed class FullscreenQuadPass : IDisposable
     private ID3D11ShaderResourceView? _sourceView;
     private bool _hasContent; // a frame has been copied into _sourceTexture at least once
 
+    // The frame most recently copied into _sourceTexture, by IDENTITY only — never dereferenced. A pass
+    // shared by N outputs (Span/Split) is drawn N times per loop iteration against the same clock sample,
+    // and the same frame is re-selected on every iteration until the clock passes it; without this the
+    // full frame was re-copied on every Draw (N × per-iteration for 4K sources). Frames are immutable once
+    // published and DecodedFrame objects are never reused, so "same reference" ⇒ "same pixels already in
+    // the texture". Cleared whenever the texture is (re)built.
+    private DecodedFrame? _lastCopied;
+
+    /// <summary>Creates a pass. Creates NO device objects: the shared pipeline is the provider's, and the
+    /// source texture is built by <see cref="BindSource"/>. <paramref name="device"/> is where that texture
+    /// (and the format-support check) will go.</summary>
     public FullscreenQuadPass(ID3D11Device device)
     {
         _device = device;
-        BuildDeviceResources();
-    }
-
-    /// <summary>Compiles the shaders and creates the constant buffer, rasterizer state, and sampler on <see cref="_device"/>.</summary>
-    private void BuildDeviceResources()
-    {
-        var source = LoadShaderSource();
-        var vsBytecode = Compile(source, "VSMain", "vs_5_0");
-        var patternBytecode = Compile(source, "PSMain", "ps_5_0");
-        var sampleBytecode = Compile(source, "PSSample", "ps_5_0");
-        var ycocgBytecode = Compile(source, "PSSampleYCoCg", "ps_5_0");
-
-        _vertexShader = _device.CreateVertexShader(vsBytecode);
-        _patternShader = _device.CreatePixelShader(patternBytecode);
-        _sampleShader = _device.CreatePixelShader(sampleBytecode);
-        _ycocgShader = _device.CreatePixelShader(ycocgBytecode);
-        _timeBuffer = _device.CreateBuffer(new BufferDescription(16, BindFlags.ConstantBuffer));
-        _uvBuffer = _device.CreateBuffer(new BufferDescription(16, BindFlags.ConstantBuffer));
-        _rasterizerState = _device.CreateRasterizerState(RasterizerDescription.CullNone);
-        _sampler = _device.CreateSamplerState(SamplerDescription.LinearClamp);
     }
 
     /// <summary>
@@ -92,7 +76,8 @@ public sealed class FullscreenQuadPass : IDisposable
     /// upload format (MF RGB32 → B8G8R8X8_UNorm; HAP → a BCn format) and <paramref name="useYCoCg"/>
     /// selects the HapQ YCoCg→RGB shader. Called ONCE, off the render thread, before the pass is shown —
     /// device resource creation is free-threaded. Idempotent guard: a second bind is rejected so the
-    /// persistent texture is never rebuilt.
+    /// persistent texture is never rebuilt. A throwing bind (e.g. unsupported format) leaves the pass
+    /// unbound with no device objects, so the caller may retry with another format/source.
     /// </summary>
     public void BindSource(FrameTimeline source, int width, int height,
         Format textureFormat = Format.B8G8R8X8_UNorm, bool useYCoCg = false)
@@ -114,6 +99,7 @@ public sealed class FullscreenQuadPass : IDisposable
     /// (e.g. BC3 for Hap/HapQ) whose CPU bytes the decode thread uploads directly. The copy source and
     /// dest MUST share a DXGI typeless family or CopySubresourceRegion silently no-ops, so the MF path's
     /// B8G8R8X8 dest matches its BGRX frames; the HAP path uploads compressed bytes via UpdateSubresource.
+    /// On failure nothing is left half-built: any texture created before the SRV failed is released.
     /// </summary>
     private void CreateSourceTexture()
     {
@@ -136,32 +122,38 @@ public sealed class FullscreenQuadPass : IDisposable
             CPUAccessFlags = CpuAccessFlags.None,
             MiscFlags = ResourceOptionFlags.None
         };
-        _sourceTexture = _device.CreateTexture2D(description);
-        _sourceView = _device.CreateShaderResourceView(_sourceTexture);
-        _hasContent = false; // the new texture is empty until the next frame is copied in
+
+        ReleaseSourceTexture(); // never overwrite a live texture/view (a failed earlier bind, or recreate)
+        var texture = _device.CreateTexture2D(description);
+        try
+        {
+            _sourceView = _device.CreateShaderResourceView(texture);
+        }
+        catch
+        {
+            texture.Dispose();
+            throw;
+        }
+        _sourceTexture = texture;
     }
 
-    /// <summary>
-    /// Device-removed recovery, render thread only. Releases every device-bound GPU object (shaders,
-    /// state, constant buffer, and the source texture+view). The <see cref="_source"/> binding and its
-    /// dimensions are kept so <see cref="RecreateDeviceResources"/> can rebuild on the new device.
-    /// </summary>
-    internal void ReleaseDeviceResources()
+    private void ReleaseSourceTexture()
     {
         _sourceView?.Dispose();
         _sourceView = null;
         _sourceTexture?.Dispose();
         _sourceTexture = null;
-        _sampler?.Dispose();
-        _rasterizerState?.Dispose();
-        _uvBuffer?.Dispose();
-        _timeBuffer?.Dispose();
-        _ycocgShader?.Dispose();
-        _sampleShader?.Dispose();
-        _patternShader?.Dispose();
-        _vertexShader?.Dispose();
-        _hasContent = false;
+        _hasContent = false;   // a new/absent texture holds no frame
+        _lastCopied = null;
     }
+
+    /// <summary>
+    /// Device-removed recovery, render thread only. Releases the pass's device-bound GPU objects (the
+    /// source texture+view; the shared pipeline is the provider's and is released with the device graph).
+    /// The <see cref="_source"/> binding and its dimensions are kept so <see cref="RecreateDeviceResources"/>
+    /// can rebuild on the new device.
+    /// </summary>
+    internal void ReleaseDeviceResources() => ReleaseSourceTexture();
 
     /// <summary>
     /// Device-removed recovery, render thread only. Rebuilds the pass's GPU resources on the provider's
@@ -171,48 +163,53 @@ public sealed class FullscreenQuadPass : IDisposable
     internal void RecreateDeviceResources(ID3D11Device device)
     {
         _device = device;
-        BuildDeviceResources();
         if (_source is not null)
             CreateSourceTexture();
     }
 
     /// <summary>
-    /// Renders into <paramref name="renderTarget"/>. Render thread ONLY. <paramref name="mediaTime"/>
-    /// is the MasterClock time: the source path selects the frame matching it (so all outputs sharing
-    /// this pass show the same frame); the test-pattern path animates by its seconds.
+    /// Renders into <paramref name="renderTarget"/> using the device's shared <paramref name="pipeline"/>.
+    /// Render thread ONLY. <paramref name="mediaTime"/> is the MasterClock time: the source path selects
+    /// the frame matching it (so all outputs sharing this pass show the same frame); the test-pattern path
+    /// animates by its seconds.
     /// </summary>
-    internal void Draw(ID3D11DeviceContext context, ID3D11RenderTargetView renderTarget, int width, int height, TimeSpan mediaTime, UvRect uv)
+    internal void Draw(ID3D11DeviceContext context, QuadPipeline pipeline, ID3D11RenderTargetView renderTarget,
+        int width, int height, TimeSpan mediaTime, UvRect uv)
     {
         if (_source is not null)
         {
-            DrawSource(context, renderTarget, width, height, mediaTime, uv);
+            DrawSource(context, pipeline, renderTarget, width, height, mediaTime, uv);
             return;
         }
 
         var constants = new TimeConstants { Time = (float)mediaTime.TotalSeconds };
-        context.UpdateSubresource(constants, _timeBuffer);
+        context.UpdateSubresource(constants, pipeline.TimeBuffer);
 
         context.OMSetRenderTargets(renderTarget);
         context.RSSetViewport(0, 0, width, height);
-        context.RSSetState(_rasterizerState);
+        context.RSSetState(pipeline.RasterizerState);
         context.IASetInputLayout(null);
         context.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
-        context.VSSetShader(_vertexShader);
-        context.PSSetShader(_patternShader);
-        context.PSSetConstantBuffer(0, _timeBuffer);
+        context.VSSetShader(pipeline.VertexShader);
+        context.PSSetShader(pipeline.PatternShader);
+        context.PSSetConstantBuffer(0, pipeline.TimeBuffer);
         context.Draw(3, 0);
     }
 
-    private void DrawSource(ID3D11DeviceContext context, ID3D11RenderTargetView renderTarget, int width, int height, TimeSpan mediaTime, UvRect uv)
+    private void DrawSource(ID3D11DeviceContext context, QuadPipeline pipeline, ID3D11RenderTargetView renderTarget,
+        int width, int height, TimeSpan mediaTime, UvRect uv)
     {
         // Unbind the source view before the copy so the texture is never a copy dest and an SRV at
         // once (a debug-layer hazard); rebind it for the draw below. null marshals to a null SRV =
         // "clear slot 0" (Vortice's parameter is non-nullable, hence null!).
         context.PSSetShaderResource(0, null!);
 
-        // Select the frame for the MasterClock time and copy it into the persistent texture; passed
-        // frames are pruned inside SelectInto. The copy runs on the render thread (immediate context).
-        if (_source!.SelectInto(mediaTime, frame => CopyFrame(context, frame)))
+        // Select the frame for the MasterClock time and copy it into the persistent texture — unless it
+        // is the frame already there (see _lastCopied); passed frames are pruned inside SelectInto. The
+        // copy runs on the render thread (immediate context). Lifetime: SelectInto hands us the frame
+        // while it is still buffered in the timeline (only PASSED frames are disposed, after the callback
+        // returns), so the copy source is alive for the whole copy; we keep only its reference afterwards.
+        if (_source!.SelectInto(mediaTime, frame => CopyFrameIfNew(context, frame)))
             _hasContent = true;
 
         context.OMSetRenderTargets(renderTarget);
@@ -228,50 +225,31 @@ public sealed class FullscreenQuadPass : IDisposable
         // This output's UV sub-rect (M7). Written per Draw because the pass is shared across outputs in
         // spanning/quad-split — each output samples a different slice of the one source texture.
         var uvConstants = new UvConstants { U0 = uv.U0, V0 = uv.V0, U1 = uv.U1, V1 = uv.V1 };
-        context.UpdateSubresource(uvConstants, _uvBuffer);
+        context.UpdateSubresource(uvConstants, pipeline.UvBuffer);
 
-        context.RSSetState(_rasterizerState);
+        context.RSSetState(pipeline.RasterizerState);
         context.IASetInputLayout(null);
         context.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
-        context.VSSetShader(_vertexShader);
-        context.PSSetShader(_useYCoCg ? _ycocgShader : _sampleShader); // HapQ needs YCoCg→RGB; others passthrough
-        context.PSSetConstantBuffer(1, _uvBuffer);
+        context.VSSetShader(pipeline.VertexShader);
+        context.PSSetShader(_useYCoCg ? pipeline.YCoCgShader : pipeline.SampleShader); // HapQ needs YCoCg→RGB; others passthrough
+        context.PSSetConstantBuffer(1, pipeline.UvBuffer);
         context.PSSetShaderResource(0, _sourceView!); // non-null whenever _source is bound (_hasContent)
-        context.PSSetSampler(0, _sampler);
+        context.PSSetSampler(0, pipeline.Sampler);
         context.Draw(3, 0);
     }
 
-    /// <summary>Copies one decoded frame into the persistent source texture. Render thread (immediate context).</summary>
-    private void CopyFrame(ID3D11DeviceContext context, DecodedFrame frame)
+    /// <summary>Copies one decoded frame into the persistent source texture unless it is already the frame
+    /// there. Render thread (immediate context).</summary>
+    private void CopyFrameIfNew(ID3D11DeviceContext context, DecodedFrame frame)
     {
+        if (ReferenceEquals(frame, _lastCopied))
+            return;
         if (frame.Texture is not null)
             context.CopySubresourceRegion(_sourceTexture!, 0, 0, 0, 0, frame.Texture, frame.Subresource, null);
         else
             context.UpdateSubresource<byte>(frame.Pixels.Span, _sourceTexture!, 0, (uint)frame.RowPitch, 0, null);
+        _lastCopied = frame;
     }
 
-    public void Dispose() => ReleaseDeviceResources();
-
-    private static string LoadShaderSource()
-    {
-        const string resourceName = "MultiMon.Graphics.Shaders.Quad.hlsl";
-        using var stream = typeof(FullscreenQuadPass).Assembly.GetManifestResourceStream(resourceName)
-            ?? throw new InvalidOperationException($"Embedded shader '{resourceName}' not found.");
-        using var reader = new StreamReader(stream);
-        return reader.ReadToEnd();
-    }
-
-    private static byte[] Compile(string source, string entryPoint, string profile)
-    {
-        var result = Compiler.Compile(source, entryPoint, "Quad.hlsl", profile, out var bytecode, out var errors);
-        using (errors)
-        {
-            if (result.Failure)
-                throw new InvalidOperationException($"Shader compile failed ({entryPoint}/{profile}): {errors?.AsString()}");
-        }
-        using (bytecode)
-        {
-            return bytecode.AsBytes();
-        }
-    }
+    public void Dispose() => ReleaseSourceTexture();
 }

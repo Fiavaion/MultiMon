@@ -262,7 +262,7 @@ public sealed class OutputWindow
         _renderPhase = "draw";
         if (Content is { } pass)
         {
-            pass.Draw(context, _renderTargetView, _width, _height, time, _uv);
+            pass.Draw(context, _provider.QuadPipeline, _renderTargetView, _width, _height, time, _uv);
         }
         else
         {

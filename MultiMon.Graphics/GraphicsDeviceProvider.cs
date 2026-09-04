@@ -42,6 +42,7 @@ public sealed class GraphicsDeviceProvider : IGraphicsDeviceProvider
     private ID3D11DeviceContext? _immediateContext;
     private ID3D11Debug? _debug;
     private ID3D11InfoQueue? _infoQueue;
+    private QuadPipeline? _quadPipeline;
 
     public GraphicsDeviceProvider(ILog log, bool? enableDebugLayer = null, string? adapterSelector = null)
     {
@@ -64,6 +65,14 @@ public sealed class GraphicsDeviceProvider : IGraphicsDeviceProvider
     /// <summary>The DXGI factory, used by <see cref="OutputWindow"/> to create its persistent swapchain.</summary>
     public IDXGIFactory2 Factory => _factory ?? throw new InvalidOperationException(
         "DXGI factory not available — call Acquire() first.");
+
+    /// <summary>
+    /// The device-wide fullscreen-quad shaders + pipeline state shared by every <see cref="FullscreenQuadPass"/>:
+    /// built once with the device, released with the device graph, rebuilt on <see cref="Recreate"/>. Read by
+    /// the render thread per draw (the same thread that runs Recreate, so it never observes a stale one).
+    /// </summary>
+    internal QuadPipeline QuadPipeline => _quadPipeline ?? throw new InvalidOperationException(
+        "Quad pipeline not available — call Acquire() first.");
 
     /// <summary>
     /// True if the device supports the given DXGI format as a 2D texture. Wraps
@@ -292,6 +301,10 @@ public sealed class GraphicsDeviceProvider : IGraphicsDeviceProvider
             ?? (driverType == DriverType.Warp ? "(WARP software rasterizer)" : "(default hardware adapter)");
         DeviceAdapterName = adapterName;
         _log.Info("Graphics", $"D3D11 device created on '{adapterName}', driverType={driverType}, feature level {achieved}, debugLayer={_infoQueue is not null}");
+
+        // Shaders + pipeline state: once per device, here — never per pass (LESSON-ARCH-002). A failure
+        // here propagates to the caller, which tears down the partial graph.
+        _quadPipeline = new QuadPipeline(_device!);
     }
 
     /// <summary>
@@ -394,6 +407,10 @@ public sealed class GraphicsDeviceProvider : IGraphicsDeviceProvider
     /// <summary>Disposes the device, context, factory, and debug interfaces. Shared by final release and recreate.</summary>
     private void TeardownDeviceGraph()
     {
+        // Device children first (they would otherwise be the "residual live objects" the debug report shows).
+        _quadPipeline?.Dispose();
+        _quadPipeline = null;
+
         _infoQueue?.Dispose();
         _infoQueue = null;
 
