@@ -304,17 +304,17 @@ public sealed class PerformanceController : IPerformanceController
     /// unsupported clip. HAP is an ENHANCEMENT (hap-playback.md): if it's gated off on this GPU (blacklist
     /// or the clip's BCn format isn't supported) or the clip can't open, fall back to Media Foundation; if
     /// MF can't open it either, SKIP the source (that output stays black) — NEVER crash (the success
-    /// metric). The ladder is symmetric: a HAP clip assigned in a non-HAP mode (Individual/Span/Split)
-    /// fails in MF (no HAP MFT exists) and is then tried on the HAP path, so a HAP .mov plays wherever
-    /// the GPU allows it. Returns the bound pass, or null when no decode path could open the clip.
+    /// metric). HAP only ever ships in a QuickTime container, so a .mov in a non-HAP mode
+    /// (Individual/Span/Split) is probed on the HAP path FIRST — a plain H.264 .mov fails the HAP demux
+    /// instantly and proceeds to MF, while a HAP .mov plays wherever the GPU allows it instead of going
+    /// black behind an MF "codec not found". Returns the bound pass, or null when nothing could open the clip.
     /// </summary>
     private FullscreenQuadPass? BuildSource(PlannedSource planned)
     {
         var pass = new FullscreenQuadPass(_provider.Device);
-        ISource? source = planned.PreferHap ? TryBuildHapSource(planned, pass) : null;
+        var probeHap = planned.PreferHap || planned.FilePath.EndsWith(".mov", StringComparison.OrdinalIgnoreCase);
+        ISource? source = probeHap ? TryBuildHapSource(planned, pass, expected: planned.PreferHap) : null;
         source ??= TryBuildMfSource(planned, pass);
-        if (source is null && !planned.PreferHap)
-            source = TryBuildHapSource(planned, pass);
         if (source is null)
         {
             pass.Dispose();
@@ -329,7 +329,7 @@ public sealed class PerformanceController : IPerformanceController
     /// <summary>Try the HAP path, GATED on GPU capability (G1). Returns the bound source, or null to fall
     /// back to Media Foundation: HAP gated off (blacklist), the clip's BCn format unsupported on this GPU,
     /// or the clip won't open. Never throws — HAP is never a hard requirement.</summary>
-    private HapSource? TryBuildHapSource(PlannedSource planned, FullscreenQuadPass pass)
+    private HapSource? TryBuildHapSource(PlannedSource planned, FullscreenQuadPass pass, bool expected)
     {
         if (!GpuCapabilityService.SupportsHap)
         {
@@ -353,7 +353,10 @@ public sealed class PerformanceController : IPerformanceController
         }
         catch (Exception ex)
         {
-            _log.Error("Control", $"HAP open failed for '{planned.FilePath}' ({ex.Message}); falling back to Media Foundation.");
+            // A non-HAP .mov probed in a non-HAP mode is expected to land here; only a mode that asked for
+            // HAP gets an error line.
+            var line = $"HAP open failed for '{planned.FilePath}' ({ex.Message}); falling back to Media Foundation.";
+            if (expected) _log.Error("Control", line); else _log.Info("Control", line);
             hap?.Dispose();
             return null;
         }
