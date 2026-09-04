@@ -6,8 +6,12 @@ namespace MultiMon.Decode.Hap;
 /// Decodes ONE HAP frame (a single MOV sample's bytes) into its raw BCn texture payload, from scratch
 /// per the HAP spec — no third-party dependency. Handles the three second-stage compressors: None,
 /// Snappy, and Complex (a Decode-Instructions Container describing N Snappy/raw chunks that concatenate
-/// into the texture). Pure + allocation-bounded; the GPU upload lives in HapSource. The returned
-/// <see cref="Data"/> is exactly the compressed-texture bytes a BCn D3D11 texture expects.
+/// into the texture). Pure + allocation-bounded; the GPU upload lives in HapSource. The output is exactly
+/// the compressed-texture bytes a BCn D3D11 texture expects, written into a caller-owned destination so
+/// the per-frame buffer can be pooled (no fresh LOH array per frame).
+///
+/// Single-section frames only: HapM / Hap Q Alpha frames carry a multi-section top-level container
+/// (a colour texture plus an alpha texture) and are rejected by <see cref="MovHapDemuxer"/> up front.
 /// </summary>
 public static class HapFrameDecoder
 {
@@ -25,26 +29,101 @@ public static class HapFrameDecoder
 
     public readonly record struct Result(HapTextureFormat Format, byte[] Data);
 
-    /// <summary>Decodes the frame. Throws <see cref="InvalidDataException"/> on a malformed frame.</summary>
+    /// <summary>One chunk of a Complex frame: its compressor and byte range within the chunk region.</summary>
+    private readonly record struct Chunk(byte Compressor, int Offset, int Size);
+
+    /// <summary>Convenience: decodes the frame into a fresh array (tests / one-off use).</summary>
     public static Result Decode(ReadOnlySpan<byte> frame)
     {
-        var (payloadOffset, payloadSize, type) = ReadSectionHeader(frame, 0);
-        var format = (HapTextureFormat)(type & 0x0F);
-        var compressor = (byte)((type >> 4) & 0x0F);
-        var payload = frame.Slice(payloadOffset, payloadSize);
-
-        var data = compressor switch
-        {
-            CompressorNone => payload.ToArray(),
-            CompressorSnappy => SnappyDecoder.Decompress(payload),
-            CompressorComplex => DecodeComplex(payload),
-            _ => throw new InvalidDataException($"HAP: unknown second-stage compressor 0x{compressor:X}.")
-        };
+        var data = new byte[DecodedLength(frame)];
+        Decode(frame, data, out var format);
         return new Result(format, data);
     }
 
-    /// <summary>Complex: a Decode-Instructions Container then N chunks (each None/Snappy) concatenated in order.</summary>
-    private static byte[] DecodeComplex(ReadOnlySpan<byte> payload)
+    /// <summary>The frame's decoded texture size in bytes, without decoding it. Throws <see cref="InvalidDataException"/> on a malformed frame.</summary>
+    public static int DecodedLength(ReadOnlySpan<byte> frame)
+    {
+        var (payloadOffset, payloadSize, type) = ReadSectionHeader(frame, 0);
+        var payload = frame.Slice(payloadOffset, payloadSize);
+        switch ((byte)((type >> 4) & 0x0F))
+        {
+            case CompressorNone:
+                return payloadSize;
+            case CompressorSnappy:
+                return SnappyDecoder.DecodedLength(payload);
+            case CompressorComplex:
+            {
+                var chunks = ParseComplex(payload, out var chunkRegion);
+                long total = 0;
+                foreach (var chunk in chunks)
+                {
+                    var bytes = chunkRegion.Slice(chunk.Offset, chunk.Size);
+                    total += chunk.Compressor == CompressorSnappy ? SnappyDecoder.DecodedLength(bytes) : bytes.Length;
+                }
+                if (total > HapLimits.MaxDecodedBytes)
+                    throw new InvalidDataException($"HAP complex: implausible decoded size ({total} bytes).");
+                return (int)total;
+            }
+            default:
+                throw new InvalidDataException($"HAP: unknown second-stage compressor 0x{(type >> 4) & 0x0F:X}.");
+        }
+    }
+
+    /// <summary>
+    /// Decodes the frame into <paramref name="destination"/> and returns the byte count written. Throws
+    /// <see cref="InvalidDataException"/> on a malformed frame or when the decoded texture would exceed
+    /// <paramref name="destination"/> (the caller sizes it from the clip's declared dimensions).
+    /// </summary>
+    public static int Decode(ReadOnlySpan<byte> frame, Span<byte> destination, out HapTextureFormat format)
+    {
+        var (payloadOffset, payloadSize, type) = ReadSectionHeader(frame, 0);
+        format = (HapTextureFormat)(type & 0x0F);
+        var compressor = (byte)((type >> 4) & 0x0F);
+        var payload = frame.Slice(payloadOffset, payloadSize);
+
+        switch (compressor)
+        {
+            case CompressorNone:
+                return CopyRaw(payload, destination);
+            case CompressorSnappy:
+                return SnappyDecoder.Decompress(payload, destination);
+            case CompressorComplex:
+            {
+                var chunks = ParseComplex(payload, out var chunkRegion);
+                var written = 0;
+                for (var i = 0; i < chunks.Length; i++)
+                {
+                    var chunk = chunks[i];
+                    var bytes = chunkRegion.Slice(chunk.Offset, chunk.Size);
+                    var target = destination[written..];
+                    written += chunk.Compressor switch
+                    {
+                        CompressorNone => CopyRaw(bytes, target),
+                        CompressorSnappy => SnappyDecoder.Decompress(bytes, target),
+                        _ => throw new InvalidDataException($"HAP complex: chunk {i} has unsupported compressor 0x{chunk.Compressor:X}.")
+                    };
+                }
+                return written;
+            }
+            default:
+                throw new InvalidDataException($"HAP: unknown second-stage compressor 0x{compressor:X}.");
+        }
+    }
+
+    private static int CopyRaw(ReadOnlySpan<byte> source, Span<byte> destination)
+    {
+        if (source.Length > destination.Length)
+            throw new InvalidDataException($"HAP: raw payload ({source.Length}B) exceeds the {destination.Length}-byte destination.");
+        source.CopyTo(destination);
+        return source.Length;
+    }
+
+    /// <summary>
+    /// Complex: a Decode-Instructions Container then N chunks (each None/Snappy) concatenated in order.
+    /// Returns each chunk's compressor + range within <paramref name="chunkRegion"/> (the bytes after the
+    /// container), range-checked against the region.
+    /// </summary>
+    private static Chunk[] ParseComplex(ReadOnlySpan<byte> payload, out ReadOnlySpan<byte> chunkRegion)
     {
         var (dicOffset, dicSize, dicType) = ReadSectionHeader(payload, 0);
         if (dicType != SectionDecodeInstructions)
@@ -76,23 +155,19 @@ public static class HapFrameDecoder
             throw new InvalidDataException("HAP complex: chunk table lengths disagree.");
 
         // Chunk data follows the decode-instructions container within the same top-level payload.
-        var chunkRegion = payload[(dicOffset + dicSize)..];
-        using var output = new MemoryStream();
-        var running = 0;
-        for (var i = 0; i < compressors.Length; i++)
+        chunkRegion = payload[(dicOffset + dicSize)..];
+        var chunks = new Chunk[compressors.Length];
+        long running = 0;
+        for (var i = 0; i < chunks.Length; i++)
         {
-            var chunkStart = offsets is not null ? (int)offsets[i] : running;
-            var chunk = chunkRegion.Slice(chunkStart, (int)sizes[i]);
-            var decoded = compressors[i] switch
-            {
-                CompressorNone => chunk.ToArray(),
-                CompressorSnappy => SnappyDecoder.Decompress(chunk),
-                _ => throw new InvalidDataException($"HAP complex: chunk {i} has unsupported compressor 0x{compressors[i]:X}.")
-            };
-            output.Write(decoded, 0, decoded.Length);
-            running += (int)sizes[i];
+            long start = offsets is not null ? offsets[i] : running;
+            long size = sizes[i];
+            if (start + size > chunkRegion.Length)
+                throw new InvalidDataException($"HAP complex: chunk {i} ({start}+{size}) exceeds the frame.");
+            chunks[i] = new Chunk(compressors[i], (int)start, (int)size);
+            running += size;
         }
-        return output.ToArray();
+        return chunks;
     }
 
     /// <summary>
