@@ -2,6 +2,7 @@ using System.Buffers;
 using MultiMon.Core.Abstractions;
 using MultiMon.Core.Diagnostics;
 using MultiMon.Graphics;
+using MultiMon.Hap;
 using Vortice.DXGI;
 
 namespace MultiMon.Decode.Hap;

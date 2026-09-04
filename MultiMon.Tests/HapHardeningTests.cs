@@ -1,6 +1,6 @@
 using System.Buffers.Binary;
-using MultiMon.Decode.Hap;
-using MultiMon.Decode.Hap.Snappy;
+using MultiMon.Hap;
+using MultiMon.Hap.Snappy;
 
 namespace MultiMon.Tests;
 

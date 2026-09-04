@@ -1,4 +1,4 @@
-namespace MultiMon.Decode.Hap;
+namespace MultiMon.Hap;
 
 /// <summary>
 /// The compressed texture format a HAP frame decodes to — the low nibble of the HAP section type

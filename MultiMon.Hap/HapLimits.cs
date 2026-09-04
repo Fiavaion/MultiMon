@@ -1,4 +1,4 @@
-namespace MultiMon.Decode.Hap;
+namespace MultiMon.Hap;
 
 /// <summary>
 /// Allocation ceilings for parsing UNTRUSTED .mov/HAP input. The threat: a crafted file whose header
