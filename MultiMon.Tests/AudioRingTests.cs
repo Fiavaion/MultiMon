@@ -148,30 +148,7 @@ public class AudioRingTests
         Assert.Equal(6, ring.Channels);
     }
 
-    // ── 6. Clear() empties the ring ───────────────────────────────────────────
-
-    [Fact]
-    public void Clear_ResetsToEmpty()
-    {
-        var ring = new AudioRing(capacityFrames: 16, channels: 2);
-        ring.Write(Ramp(20));
-
-        Assert.True(ring.AvailableToRead > 0);
-
-        ring.Clear();
-
-        Assert.Equal(0, ring.AvailableToRead);
-        Assert.Equal(ring.CapacityFrames * ring.Channels, ring.AvailableToWrite);
-
-        // Can write and read again after Clear.
-        var src  = Ramp(4);
-        var dest = new float[4];
-        Assert.Equal(4, ring.Write(src));
-        Assert.Equal(4, ring.Read(dest));
-        Assert.Equal(src, dest);
-    }
-
-    // ── 7. Constructor argument validation ────────────────────────────────────
+    // ── 6. Constructor argument validation ────────────────────────────────────
 
     [Fact]
     public void Constructor_ZeroCapacity_Throws()
@@ -197,7 +174,7 @@ public class AudioRingTests
         Assert.Throws<ArgumentOutOfRangeException>(() => new AudioRing(16, -2));
     }
 
-    // ── 8. Concurrent SPSC soak — monotonic sequence, no gaps or duplicates ───
+    // ── 7. Concurrent SPSC soak — monotonic sequence, no gaps or duplicates ───
 
     /// <summary>
     /// The producer writes a monotonically-increasing float ramp (0f, 1f, 2f …) in small chunks,

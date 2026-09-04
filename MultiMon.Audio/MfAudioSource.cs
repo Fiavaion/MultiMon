@@ -30,6 +30,7 @@ public sealed class MfAudioSource : IDisposable
     private Thread? _thread;
     private volatile bool _stop;
     private bool _started;
+    private int _disposed;                       // Interlocked: Dispose runs its MFShutdown decrement exactly once
     private AudioRing _ring = null!;             // bound in Start, before the decode thread runs
     private AutoResetEvent? _spaceAvailable;     // consumer pulses this when it frees ring space (set in Start)
     private int _channels;
@@ -335,8 +336,12 @@ public sealed class MfAudioSource : IDisposable
         }
     }
 
+    /// <summary>Idempotent: a second Dispose is a no-op, so it can never decrement the shared MFStartup
+    /// ref-count twice (which would strand a live sibling with MFShutdown already called).</summary>
     public void Dispose()
     {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            return;
         Stop();
         _reader?.Dispose();
         _reader = null;

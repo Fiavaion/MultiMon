@@ -10,10 +10,11 @@ using Windows.Win32.System.Com;
 namespace MultiMon.Audio;
 
 /// <summary>
-/// One shared-mode WASAPI render endpoint and the single thread that feeds it (REBUILD_ARCHITECTURE
-/// §2.2 — one WASAPI render thread per output device). The render thread is event-driven: the audio
-/// engine signals it each time the device wants more frames; it pulls PCM from an <see cref="AudioRing"/>
-/// (written by the decode thread), applies gain, and writes it into the endpoint buffer.
+/// One shared-mode WASAPI client on a render endpoint and the single thread that feeds it. The
+/// <see cref="AudioEngine"/> creates one of these per TRACK (several may share an endpoint — shared-mode
+/// WASAPI mixes them in Windows' audio engine; see the AudioEngine remarks). The render thread is
+/// event-driven: WASAPI signals it each time the device wants more frames; it pulls PCM from an
+/// <see cref="AudioRing"/> (written by the decode thread), applies gain, and writes it into the endpoint buffer.
 ///
 /// <para><b>Format:</b> the client is initialised in the DECODER's native float format and WASAPI's
 /// <c>AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM</c> resamples / remixes to the device mix format. So the decoder
@@ -237,7 +238,8 @@ public sealed unsafe class WasapiOutput : IDisposable
             if (_stop) return;
             _client!.Start();
             RenderLoop();
-            try { _client!.Stop(); } catch { /* stopping a lost device is fine */ }
+            // _client is null if the loop ended on a failed rebuild (ReleaseClient ran, ActivateClient didn't).
+            try { _client?.Stop(); } catch { /* stopping a lost device is fine */ }
         }
         catch (Exception ex)
         {
@@ -330,13 +332,16 @@ public sealed unsafe class WasapiOutput : IDisposable
             _audioEvent.WaitOne(200);
             if (_stop) break;
 
-            _client!.GetCurrentPadding(out var padding);
-            var framesToWrite = _bufferFrames - padding;
-            if (framesToWrite == 0)
-                continue;
-
+            // The WHOLE iteration (padding query + fill) sits inside the try: GetCurrentPadding is the first
+            // call to fail with AUDCLNT_E_DEVICE_INVALIDATED after a device pull, and outside the try it
+            // killed the render thread before the D-005 rebuild ever ran.
             try
             {
+                _client!.GetCurrentPadding(out var padding);
+                var framesToWrite = _bufferFrames - padding;
+                if (framesToWrite == 0)
+                    continue;
+
                 FillBuffer(framesToWrite, ref primed);
             }
             catch (COMException ex)
@@ -348,7 +353,8 @@ public sealed unsafe class WasapiOutput : IDisposable
                 _log.Error("Audio", $"WASAPI device error 0x{ex.HResult:X8}; rebuilding the endpoint.");
                 if (!TryRebuild())
                 {
-                    _log.Error("Audio", "WASAPI endpoint rebuild failed after retries; stopping this output (audio ends, app continues).");
+                    if (!_stop)
+                        _log.Error("Audio", "WASAPI endpoint rebuild failed after retries; stopping this output (audio ends, app continues).");
                     break;
                 }
                 primed = false; // re-prime against the rebuilt endpoint before counting underruns
