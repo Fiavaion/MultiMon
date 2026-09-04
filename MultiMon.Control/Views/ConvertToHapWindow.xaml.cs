@@ -32,6 +32,9 @@ public partial class ConvertToHapWindow : Window
         DataContext = _vm;
 
         SourceInitialized += (_, _) => Theme.DarkTitleBar.Apply(new WindowInteropHelper(this).Handle);
+        // Closing mid-conversion cancels it (the converter kills ffmpeg on cancellation) so the process is
+        // never orphaned behind a closed dialog. No-op when nothing is running.
+        Closing += (_, _) => _vm.Cancel();
 
         // When the view-model updates OutputPath (default-path recompute), keep _suppressOutputChanged
         // set so the TextChanged handler doesn't flag it as user-edited.

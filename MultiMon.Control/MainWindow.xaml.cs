@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Text.RegularExpressions;
 using System.Windows;
 using System.Windows.Interop;
 using Microsoft.Win32;
@@ -202,10 +203,9 @@ public partial class MainWindow : Window
     /// is unaffected). Diagnostics gathering is best-effort: any failure falls back to the plain form URL.</summary>
     private void ReportBug_Click(object sender, RoutedEventArgs e)
     {
-        const string fallback = "https://github.com/Fiavaion/MultiMon/issues/new?template=bug_report.yml";
         string url;
         try { url = BuildBugReportUrl(); }
-        catch { url = fallback; }
+        catch { url = IssueFormBase; }
         try
         {
             Process.Start(new ProcessStartInfo(url) { UseShellExecute = true });
@@ -280,16 +280,15 @@ public partial class MainWindow : Window
 
     private string DescribeMonitors()
     {
-        var mons = _vm.Monitors;
-        if (mons is null) return "unknown";
-        var list = mons
+        var list = _vm.Monitors
             .Select(m => $"{m.Resolution}@{m.RefreshRate:0}Hz{(m.IsPrimary ? " (primary)" : "")}")
             .ToList();
         return list.Count == 0 ? "none detected" : $"{list.Count} — {string.Join(", ", list)}";
     }
 
-    /// <summary>Reads the newest MultiMon log and returns the startup banner + any error/crash lines + the
-    /// tail, capped in length. Best-effort — never throws into the caller.</summary>
+    /// <summary>Reads the newest MultiMon log and returns the startup banner + any error lines (crashes are
+    /// logged as "[ERROR] CRASH:") + the tail, PII-scrubbed and capped in length — this text lands in a
+    /// PUBLIC GitHub issue URL. Best-effort — never throws into the caller.</summary>
     private static string ReadLogExcerpt()
     {
         try
@@ -300,11 +299,14 @@ public partial class MainWindow : Window
                 .OrderByDescending(f => f.Name).FirstOrDefault();
             if (newest is null) return "(no log file found)";
 
-            var lines = File.ReadAllLines(newest.FullName);
+            var lines = File.ReadAllLines(newest.FullName)
+                .Where(l => !l.Contains("machine=") && !l.Contains("appDir=")) // machine name / install path
+                .Select(ScrubLine)
+                .ToArray();
             var banner = lines.Where(l =>
                 l.Contains("Env:") || l.Contains("Gpu:") || l.Contains("Monitor") || l.Contains("feature level"))
                 .Take(14);
-            var errors = lines.Where(l => l.Contains("[ERROR]") || l.Contains("[CRASH]")).Reverse().Take(8).Reverse();
+            var errors = lines.Where(l => l.Contains("[ERROR]")).Reverse().Take(8).Reverse();
             var tail = lines.Reverse().Take(10).Reverse();
             var text = string.Join("\n", banner.Concat(errors).Concat(tail).Distinct());
             return text.Length > 2500 ? text[..2500] + "\n...(truncated)" : text;
@@ -313,5 +315,24 @@ public partial class MainWindow : Window
         {
             return $"(could not read log: {ex.Message})";
         }
+    }
+
+    // A quoted absolute Windows path, as the controller logs clip paths ('D:\clips\show.mp4').
+    private static readonly Regex QuotedPath = new(@"'([A-Za-z]:\\[^']+)'", RegexOptions.Compiled);
+
+    /// <summary>Drops the user's profile path and account name (as a path segment, so a short name can't
+    /// mangle ordinary words); error lines keep only a clip's file name (the directory tree can identify a
+    /// person or a client).</summary>
+    private static string ScrubLine(string line)
+    {
+        var profile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        if (!string.IsNullOrEmpty(profile))
+            line = line.Replace(profile, "<user>", StringComparison.OrdinalIgnoreCase);
+        var user = Environment.UserName;
+        if (!string.IsNullOrEmpty(user))
+            line = Regex.Replace(line, @"(?<=\\)" + Regex.Escape(user) + @"(?=\\|$|\s)", "<user>", RegexOptions.IgnoreCase);
+        if (line.Contains("[ERROR]"))
+            line = QuotedPath.Replace(line, m => $"'{Path.GetFileName(m.Groups[1].Value)}'");
+        return line;
     }
 }
