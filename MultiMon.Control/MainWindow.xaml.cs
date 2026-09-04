@@ -9,6 +9,7 @@ using System.Windows.Interop;
 using Microsoft.Win32;
 using MultiMon.Control.ViewModels;
 using MultiMon.Control.Views;
+using MultiMon.Core.Diagnostics;
 using MultiMon.Core.Models;
 using MultiMon.Platform;
 
@@ -48,10 +49,13 @@ public partial class MainWindow : Window
     private IntPtr _hwnd;
     private bool _performHotkeysRegistered;
 
-    public MainWindow(MainViewModel viewModel)
+    private readonly ILog _log;
+
+    public MainWindow(MainViewModel viewModel, ILog log)
     {
         InitializeComponent();
         _vm = viewModel;
+        _log = log;
         DataContext = viewModel;
 
         GpuText.Text = $"GPU: {GpuCapabilityService.DetectedGpuName}   ·   " +
@@ -195,7 +199,7 @@ public partial class MainWindow : Window
     }
 
     private void ConvertHap_Click(object sender, RoutedEventArgs e)
-        => new ConvertToHapWindow { Owner = this }.ShowDialog();
+        => new ConvertToHapWindow(_log) { Owner = this }.ShowDialog();
 
     /// <summary>Open the MultiMon issue tracker, pre-filling the bug form with real runtime diagnostics
     /// (version, GPU, monitors, OS/.NET, and a recent log excerpt) so reports carry accurate data instead

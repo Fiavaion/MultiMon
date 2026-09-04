@@ -469,8 +469,11 @@ public sealed class MainViewModel : INotifyPropertyChanged
         }
         try
         {
-            FromProject(ProjectService.Load(path));
-            Status = $"Loaded {Path.GetFileName(path)}.";
+            var project = ProjectService.Load(path, _log);
+            FromProject(project);
+            Status = project.LoadWarnings.Count == 0
+                ? $"Loaded {Path.GetFileName(path)}."
+                : $"Loaded {Path.GetFileName(path)} with {project.LoadWarnings.Count} repair(s) — see the log.";
         }
         catch (Exception ex)
         {

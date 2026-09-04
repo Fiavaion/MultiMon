@@ -4,6 +4,7 @@ using System.Windows;
 using System.Windows.Data;
 using System.Windows.Interop;
 using Microsoft.Win32;
+using MultiMon.Core.Diagnostics;
 using MultiMon.Control.ViewModels;
 using MultiMon.Platform.Conversion;
 
@@ -25,10 +26,10 @@ public partial class ConvertToHapWindow : Window
     // TextChanged handler from marking the path as "user-edited" on programmatic changes.
     private bool _suppressOutputChanged;
 
-    public ConvertToHapWindow()
+    public ConvertToHapWindow(ILog log)
     {
         InitializeComponent();
-        _vm = new ConvertToHapViewModel(new FfmpegHapConverter());
+        _vm = new ConvertToHapViewModel(new FfmpegHapConverter(log));
         DataContext = _vm;
 
         SourceInitialized += (_, _) => Theme.DarkTitleBar.Apply(new WindowInteropHelper(this).Handle);
