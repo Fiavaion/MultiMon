@@ -1,3 +1,4 @@
+using System.Text.Json;
 using MultiMon.Core;
 using MultiMon.Core.Models;
 
@@ -134,5 +135,135 @@ public class ProjectServiceTests
     {
         Assert.Throws<ArgumentException>(() => ProjectService.Deserialize(""));
         Assert.Throws<ArgumentException>(() => ProjectService.Deserialize("   "));
+    }
+
+    // ── Load warnings: repaired, never silent ────────────────────────────────
+
+    [Fact]
+    public void Load_KnownModes_ProduceNoWarnings()
+    {
+        foreach (var name in new[] { "Span", "individual", "Hap", "Split", "QuadSplit", "Quad" })
+        {
+            var loaded = ProjectService.Deserialize($$"""{ "Mode": "{{name}}" }""");
+            Assert.Empty(loaded.LoadWarnings);
+        }
+        Assert.Empty(ProjectService.Deserialize(ProjectService.Serialize(SampleProject())).LoadWarnings);
+    }
+
+    [Fact]
+    public void Load_UnknownMode_FallsBackToSpan_AndWarns()
+    {
+        var loaded = ProjectService.Deserialize("""{ "ProjectName": "X", "Mode": "Mosaic" }""");
+
+        Assert.Equal(ShowMode.Span, loaded.Mode);
+        var warning = Assert.Single(loaded.LoadWarnings);
+        Assert.Contains("Mosaic", warning);
+        Assert.Contains("Span", warning);
+    }
+
+    [Fact]
+    public void Load_NonStringMode_FallsBackToSpan_AndWarns()
+    {
+        var loaded = ProjectService.Deserialize("""{ "Mode": 7 }""");
+        Assert.Equal(ShowMode.Span, loaded.Mode);
+        Assert.Contains(loaded.LoadWarnings, w => w.Contains("7"));
+    }
+
+    [Fact]
+    public void Load_UnknownMode_IsLogged()
+    {
+        var log = new CapturingLog();
+        ProjectService.Deserialize("""{ "Mode": "Mosaic" }""", log);
+        Assert.Contains(log.Lines, l => l.Contains("Mosaic"));
+    }
+
+    [Fact]
+    public void Load_NullLists_TreatedAsEmpty_AndWarned()
+    {
+        var loaded = ProjectService.Deserialize("""{ "VideoAssignments": null, "AudioTracks": null }""");
+
+        Assert.NotNull(loaded.VideoAssignments);
+        Assert.Empty(loaded.VideoAssignments);
+        Assert.NotNull(loaded.AudioTracks);
+        Assert.Empty(loaded.AudioTracks);
+        Assert.Equal(2, loaded.LoadWarnings.Count);
+    }
+
+    [Fact]
+    public void Load_NullListEntries_Dropped_AndWarned()
+    {
+        var loaded = ProjectService.Deserialize("""
+        { "VideoAssignments": [ null, { "MonitorDeviceId": "m1", "VideoFilePath": "a.mp4" }, null ],
+          "AudioTracks": [ null ] }
+        """);
+
+        var a = Assert.Single(loaded.VideoAssignments);
+        Assert.Equal("m1", a.MonitorDeviceId);
+        Assert.Empty(loaded.AudioTracks);
+        Assert.Equal(2, loaded.LoadWarnings.Count);
+    }
+
+    [Fact]
+    public void LoadWarnings_AreNeverSerialized()
+    {
+        var project = SampleProject();
+        project.LoadWarnings.Add("stale");
+        Assert.DoesNotContain("LoadWarnings", ProjectService.Serialize(project));
+    }
+
+    // ── Hostile input stays bounded ──────────────────────────────────────────
+
+    [Fact]
+    public void Deserialize_DeeplyNested_ThrowsJsonException_NotStackOverflow()
+    {
+        const int depth = 10_000;
+        var json = "{ \"VideoWall\": " + new string('[', depth) + new string(']', depth) + " }";
+        Assert.ThrowsAny<JsonException>(() => ProjectService.Deserialize(json)); // JsonReaderException derives from it
+    }
+
+    [Fact]
+    public void Deserialize_NonObjectRoot_Refused()
+    {
+        Assert.Throws<InvalidDataException>(() => ProjectService.Deserialize("[1, 2, 3]"));
+        Assert.Throws<InvalidDataException>(() => ProjectService.Deserialize("\"just a string\""));
+    }
+
+    [Fact]
+    public void Deserialize_HugeString_WithinCap_Loads_Intact()
+    {
+        var name = new string('n', 1 << 20); // 1 MiB project name: absurd but under the cap → loads verbatim
+        var loaded = ProjectService.Deserialize($$"""{ "ProjectName": "{{name}}" }""");
+        Assert.Equal(name.Length, loaded.ProjectName.Length);
+    }
+
+    [Fact]
+    public void Deserialize_OverCap_RefusedBeforeParsing()
+    {
+        var json = "{ \"ProjectName\": \"" + new string('n', (int)ProjectService.MaxProjectBytes) + "\" }";
+        Assert.Throws<InvalidDataException>(() => ProjectService.Deserialize(json));
+    }
+
+    [Fact]
+    public void Load_OversizedFile_RefusedBeforeReading()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"mmtest_{Guid.NewGuid():N}.mmproj");
+        try
+        {
+            using (var f = File.Create(path))
+                f.SetLength(ProjectService.MaxProjectBytes + 1); // sparse: no actual bytes written
+            Assert.Throws<InvalidDataException>(() => ProjectService.Load(path));
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    private sealed class CapturingLog : MultiMon.Core.Diagnostics.ILog
+    {
+        public List<string> Lines { get; } = new();
+        public void Info(string source, string message)  => Lines.Add(message);
+        public void Debug(string source, string message) => Lines.Add(message);
+        public void Error(string source, string message) => Lines.Add(message);
     }
 }

@@ -1,3 +1,5 @@
+using System.Text.Json.Serialization;
+
 namespace MultiMon.Core.Models;
 
 /// <summary>
@@ -38,6 +40,11 @@ public sealed class ProjectConfiguration
     /// <summary>Master mixer volume (0–1) and mute.</summary>
     public double MasterVolume { get; set; } = 1.0;
     public bool MasterMuted { get; set; }
+
+    /// <summary>Non-fatal repairs made while loading (unknown mode name, null lists) — the load succeeded
+    /// but not verbatim, and the user should be told. Filled by <c>ProjectService</c>; never serialized.</summary>
+    [JsonIgnore]
+    public List<string> LoadWarnings { get; } = new();
 
     public override string ToString()
         => $"{ProjectName} [{Mode}] ({VideoAssignments.Count} assignments, schema v{SchemaVersion})";
