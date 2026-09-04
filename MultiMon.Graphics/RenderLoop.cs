@@ -119,33 +119,59 @@ public sealed class RenderLoop
             var window = new OutputWindow(_provider, this, _log, name, initialBounds);
             _windows.Add(window);
             return window;
-        });
+        }) ?? throw new InvalidOperationException("RenderLoop is not running — cannot create an output window.");
 
-    /// <summary>Runs <paramref name="action"/> on the render thread and blocks until it completed.</summary>
-    public void Invoke(Action action)
+    /// <summary>
+    /// Runs <paramref name="action"/> on the render thread and blocks until it completed; returns true when
+    /// it ran. Returns false — logged once, never thrown — when the render thread is not alive (never
+    /// started, already stopped, or died on an unrecoverable error): the command cannot run, and a caller
+    /// mid-teardown (controller Dispose → SetContent(null)/Hide → Stop → Release) must still reach
+    /// Stop/Release instead of being thrown out of its ordered teardown. A command that DID run and threw
+    /// still surfaces as an exception — that is a real error, not a dead thread.
+    /// </summary>
+    public bool Invoke(Action action)
     {
         if (Environment.CurrentManagedThreadId == _renderThreadId)
         {
             action();
-            return;
+            return true;
         }
-        if (_thread is null)
-            throw new InvalidOperationException("RenderLoop is not running.");
+        if (_thread is null || _threadExited)
+            return LogDeadThreadOnce();
 
         var command = new Command { Action = action };
         _commands.Enqueue(command);
         _wake.Set();
         // Re-check the exited flag while waiting: if the render thread died between our enqueue and
-        // its final command drain, the command will never run — fail loudly instead of wedging.
+        // its final command drain, the command will never run — return false instead of wedging.
         while (!command.Done.Wait(100))
         {
             if (_threadExited)
-                throw new InvalidOperationException("Render thread exited before the command ran.");
+                return LogDeadThreadOnce();
         }
+        if (command.Error is RenderLoopStoppedException)
+            return LogDeadThreadOnce(); // failed by the exiting thread's final drain, not by the action
         if (command.Error is not null)
             throw new InvalidOperationException($"Render-thread command failed: {command.Error.Message}", command.Error);
+        return true;
     }
 
+    /// <summary>Marker the exiting render thread puts on commands it could not run (see <see cref="Invoke(Action)"/>).</summary>
+    private sealed class RenderLoopStoppedException : InvalidOperationException
+    {
+        public RenderLoopStoppedException() : base("RenderLoop stopped before the command ran.") { }
+    }
+
+    private int _deadThreadLogged;
+
+    private bool LogDeadThreadOnce()
+    {
+        if (Interlocked.Exchange(ref _deadThreadLogged, 1) == 0)
+            _log.Error("Graphics", "RenderLoop.Invoke with no live render thread (not started, stopped, or died) — command skipped; further skips are not logged.");
+        return false;
+    }
+
+    /// <summary>Func variant of <see cref="Invoke(Action)"/>; returns <c>default</c> when the render thread is not alive.</summary>
     public T Invoke<T>(Func<T> func)
     {
         T result = default!;
@@ -231,7 +257,7 @@ public sealed class RenderLoop
             // Never leave an Invoke caller blocked forever.
             while (_commands.TryDequeue(out var command))
             {
-                command.Error = new InvalidOperationException("RenderLoop stopped before the command ran.");
+                command.Error = new RenderLoopStoppedException();
                 command.Done.Set();
             }
             _threadExited = true; // Invoke waiters racing the drain above see this and bail
