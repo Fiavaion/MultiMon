@@ -1,4 +1,5 @@
 using MultiMon.Core.Diagnostics;
+using Vortice;
 using Vortice.DXGI;
 
 namespace MultiMon.Graphics;
@@ -9,11 +10,38 @@ namespace MultiMon.Graphics;
 /// composition (a single device serves every monitor; the per-adapter-device split stays deferred
 /// until Checkpoint B proves it necessary). This is diagnostic: it surfaces, per run, exactly which
 /// monitors are cross-adapter so a garbage/perf failure there is immediately attributable.
+/// Adapters are identified by LUID — descriptions are not unique (two identical cards share a string).
 /// </summary>
 public static class AdapterMap
 {
-    /// <summary>Logs the adapter→outputs map and returns the number of cross-adapter (non-device) outputs.</summary>
+    /// <summary>Logs the adapter→outputs map for <paramref name="provider"/>'s device and returns the number of
+    /// cross-adapter (non-device) outputs.</summary>
+    public static int LogTopology(GraphicsDeviceProvider provider, ILog log)
+        => LogTopology(provider.Factory, provider.DeviceAdapterLuid, log);
+
+    /// <summary>Logs the adapter→outputs map and returns the number of cross-adapter (non-device) outputs.
+    /// <paramref name="deviceAdapterName"/> is resolved to a LUID by description (first match) — prefer the
+    /// <see cref="LogTopology(GraphicsDeviceProvider, ILog)"/> overload, which uses the device's LUID directly.</summary>
     public static int LogTopology(IDXGIFactory2 factory, string? deviceAdapterName, ILog log)
+    {
+        var luid = default(Luid);
+        for (uint i = 0; factory.EnumAdapters1(i, out var adapter).Success; i++)
+        {
+            using (adapter)
+            {
+                var desc = adapter.Description1;
+                if (desc.Description == deviceAdapterName)
+                {
+                    luid = desc.Luid;
+                    break;
+                }
+            }
+        }
+        return LogTopology(factory, luid, log);
+    }
+
+    /// <summary>Logs the adapter→outputs map and returns the number of cross-adapter (non-device) outputs.</summary>
+    public static int LogTopology(IDXGIFactory2 factory, Luid deviceAdapterLuid, ILog log)
     {
         var crossAdapterOutputs = 0;
 
@@ -21,8 +49,8 @@ public static class AdapterMap
         {
             using (adapter)
             {
-                var name = adapter.Description1.Description;
-                var isDeviceAdapter = name == deviceAdapterName;
+                var desc = adapter.Description1;
+                var isDeviceAdapter = desc.Luid == deviceAdapterLuid;
 
                 var outputs = new List<string>();
                 for (uint j = 0; adapter.EnumOutputs(j, out var output).Success; j++)
@@ -40,7 +68,7 @@ public static class AdapterMap
                 var tag = isDeviceAdapter ? "DEVICE adapter"
                     : outputs.Count > 0 ? "CROSS-ADAPTER (DWM-composited)"
                     : "inactive";
-                log.Info("Graphics", $"Adapter '{name}' [{tag}] drives {outputs.Count} output(s): {string.Join(" ", outputs)}");
+                log.Info("Graphics", $"Adapter '{desc.Description}' (luid={desc.Luid.LowPart:X8}) [{tag}] drives {outputs.Count} output(s): {string.Join(" ", outputs)}");
             }
         }
 
