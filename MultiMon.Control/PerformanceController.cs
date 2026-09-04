@@ -3,7 +3,7 @@ using MultiMon.Audio;
 using MultiMon.Core.Abstractions;
 using MultiMon.Core.Diagnostics;
 using MultiMon.Core.Models;
-using MultiMon.Core.Sync;
+using MultiMon.Core.Show;
 using MultiMon.Core.Timing;
 using MultiMon.Decode.Hap;
 using MultiMon.Decode.MediaFoundation;
@@ -265,22 +265,31 @@ public sealed class PerformanceController : IPerformanceController
 
     private void BuildShow(ShowDefinition show)
     {
-        switch (show.Mode)
+        // WHICH source feeds WHICH output through WHICH UV slice on WHICH clock is pure geometry, decided
+        // by ShowPlanner in Core (and unit-tested there without a device). All that is left here is turning
+        // that plan into native objects.
+        var plan = ShowPlanner.Plan(show, Monitors);
+        foreach (var warning in plan.Warnings)
+            _log.Error("Control", warning);
+
+        for (var i = 0; i < plan.Sources.Count; i++)
         {
-            case ShowMode.Individual:
-                // A clip per monitor. Free-run (own clock each) unless the user opts into shared-clock sync.
-                BuildPerMonitor(show, hap: false, freeRun: !show.SyncIndividual);
-                break;
-            case ShowMode.Hap:
-                // A HAP clip per monitor, tightly frame-synced (one shared clock).
-                BuildPerMonitor(show, hap: true, freeRun: false);
-                break;
-            case ShowMode.Split:
-                BuildSingleSource(show, split: true);
-                break;
-            default: // Span
-                BuildSingleSource(show, split: false);
-                break;
+            var pass = BuildSource(plan.Sources[i]);
+            if (pass is null)
+                continue; // clip unopenable on any path — its outputs stay black (logged), never crash
+
+            foreach (var binding in plan.Bindings)
+            {
+                if (binding.SourceIndex != i)
+                    continue;
+                MasterClock? clock = null;
+                if (binding.Clock == ShowClock.FreeRun)
+                {
+                    clock = new MasterClock();  // own timeline; started/stopped with the show
+                    _freeRunClocks.Add(clock);
+                }
+                BindOutput(binding.OutputIndex, pass, binding.Uv, clock);
+            }
         }
 
         BuildAudio(show);
@@ -290,85 +299,22 @@ public sealed class PerformanceController : IPerformanceController
             s.Start();
     }
 
-    /// <summary>Spanning / split: ONE source, ONE pass, shared by every participating output; the
-    /// per-output UV slice (from the mode) is what differs (ADR 0003 D1/D2).</summary>
-    private void BuildSingleSource(ShowDefinition show, bool split)
-    {
-        var binding = show.Sources.FirstOrDefault();
-        if (binding is null)
-            return; // nothing to play
-
-        var pass = BuildSource(binding, binding.IsHap);
-        if (pass is null)
-            return; // clip unopenable on any path — outputs stay black (logged), never crash
-
-        if (split)
-        {
-            var wall = show.WallConfiguration;
-            var rows = Math.Max(1, wall?.Rows ?? 2);
-            var cols = Math.Max(1, wall?.Columns ?? 2);
-            for (var i = 0; i < _outputs.Length; i++)
-            {
-                if (!TryGetCell(wall, Monitors[i].DeviceId, i, rows, cols, out var row, out var col))
-                    continue; // monitor not mapped to a cell → left black
-                BindOutput(i, pass, UvLayout.Quadrant(row, col, rows, cols));
-            }
-        }
-        else
-        {
-            // Equal share per screen (not per pixel): each output fills its cell of the layout-derived grid.
-            var bounds = Monitors.Select(m => m.Bounds).ToList();
-            for (var i = 0; i < _outputs.Length; i++)
-                BindOutput(i, pass, UvLayout.Spanning(i, bounds));
-        }
-    }
-
     /// <summary>
-    /// Individual / Hap: each binding gets its OWN source + pass, bound full-UV to its monitor's output.
-    /// <paramref name="hap"/> forces the HAP decode path (Hap mode); <paramref name="freeRun"/> gives each
-    /// source its own clock (Individual free-run) instead of the shared loop clock (synced / Hap).
+    /// Builds one (source + pass) for a planned source, choosing the decode path and surviving an
+    /// unsupported clip. HAP is an ENHANCEMENT (hap-playback.md): if it's gated off on this GPU (blacklist
+    /// or the clip's BCn format isn't supported) or the clip can't open, fall back to Media Foundation; if
+    /// MF can't open it either, SKIP the source (that output stays black) — NEVER crash (the success
+    /// metric). Returns the bound pass, or null when no decode path could open the clip.
     /// </summary>
-    private void BuildPerMonitor(ShowDefinition show, bool hap, bool freeRun)
-    {
-        foreach (var binding in show.Sources)
-        {
-            var index = IndexOfMonitor(binding.MonitorDeviceId);
-            if (index < 0)
-            {
-                _log.Error("Control", $"source '{binding.FilePath}' targets unknown monitor '{binding.MonitorDeviceId}'; skipping.");
-                continue;
-            }
-            var pass = BuildSource(binding, isHap: hap);
-            if (pass is null)
-                continue; // clip unopenable on any path — skip this monitor (logged), never crash
-
-            MasterClock? clock = null;
-            if (freeRun)
-            {
-                clock = new MasterClock();      // own timeline; started/stopped with the show
-                _freeRunClocks.Add(clock);
-            }
-            BindOutput(index, pass, UvRect.Full, clock);
-        }
-    }
-
-    /// <summary>
-    /// Builds one (source + pass) for a binding, choosing the decode path and surviving an unsupported clip.
-    /// HAP is an ENHANCEMENT (hap-playback.md): if it's gated off on this GPU (blacklist or the clip's BCn
-    /// format isn't supported) or the clip can't open, fall back to Media Foundation; if MF can't open it
-    /// either, SKIP the source (that output stays black) — NEVER crash (the success metric). Returns the
-    /// bound pass, or null when no decode path could open the clip. <paramref name="isHap"/> selects the
-    /// preferred path (mode-driven, not a per-file flag).
-    /// </summary>
-    private FullscreenQuadPass? BuildSource(SourceBinding binding, bool isHap)
+    private FullscreenQuadPass? BuildSource(PlannedSource planned)
     {
         var pass = new FullscreenQuadPass(_provider.Device);
-        ISource? source = isHap ? TryBuildHapSource(binding, pass) : null;
-        source ??= TryBuildMfSource(binding, pass);
+        ISource? source = planned.PreferHap ? TryBuildHapSource(planned, pass) : null;
+        source ??= TryBuildMfSource(planned, pass);
         if (source is null)
         {
             pass.Dispose();
-            _log.Error("Control", $"No decode path could open '{binding.FilePath}'; that output stays black.");
+            _log.Error("Control", $"No decode path could open '{planned.FilePath}'; that output stays black.");
             return null;
         }
         _sources.Add(source);
@@ -379,21 +325,21 @@ public sealed class PerformanceController : IPerformanceController
     /// <summary>Try the HAP path, GATED on GPU capability (G1). Returns the bound source, or null to fall
     /// back to Media Foundation: HAP gated off (blacklist), the clip's BCn format unsupported on this GPU,
     /// or the clip won't open. Never throws — HAP is never a hard requirement.</summary>
-    private HapSource? TryBuildHapSource(SourceBinding binding, FullscreenQuadPass pass)
+    private HapSource? TryBuildHapSource(PlannedSource planned, FullscreenQuadPass pass)
     {
         if (!GpuCapabilityService.SupportsHap)
         {
             _log.Info("Control", $"HAP gated off on this GPU ({GpuCapabilityService.DetectedGpuName}); " +
-                                 $"decoding '{binding.FilePath}' via Media Foundation.");
+                                 $"decoding '{planned.FilePath}' via Media Foundation.");
             return null;
         }
         HapSource? hap = null;
         try
         {
-            hap = new HapSource(binding.FilePath, _log, binding.SourceId);
+            hap = new HapSource(planned.FilePath, _log, planned.SourceId);
             if (!_provider.SupportsTextureFormat(hap.TextureFormat))
             {
-                _log.Info("Control", $"GPU does not support {hap.TextureFormat} for HAP '{binding.FilePath}'; " +
+                _log.Info("Control", $"GPU does not support {hap.TextureFormat} for HAP '{planned.FilePath}'; " +
                                      "falling back to Media Foundation.");
                 hap.Dispose();
                 return null;
@@ -403,7 +349,7 @@ public sealed class PerformanceController : IPerformanceController
         }
         catch (Exception ex)
         {
-            _log.Error("Control", $"HAP open failed for '{binding.FilePath}' ({ex.Message}); falling back to Media Foundation.");
+            _log.Error("Control", $"HAP open failed for '{planned.FilePath}' ({ex.Message}); falling back to Media Foundation.");
             hap?.Dispose();
             return null;
         }
@@ -411,20 +357,20 @@ public sealed class PerformanceController : IPerformanceController
 
     /// <summary>Try the Media Foundation path. Returns the bound source, or null if MF can't open the clip
     /// (e.g. a HAP-codec .mov that fell back here but has no MF-decodable track) — the output is then skipped.</summary>
-    private MediaFoundationSource? TryBuildMfSource(SourceBinding binding, FullscreenQuadPass pass)
+    private MediaFoundationSource? TryBuildMfSource(PlannedSource planned, FullscreenQuadPass pass)
     {
         MediaFoundationSource? src = null;
         try
         {
             _mf ??= new MfDeviceManager(_provider.Device, _log,
                 preferSoftwareDecode: GpuCapabilityService.PreferSoftwareDecode || !_provider.MultithreadProtected);
-            src = new MediaFoundationSource(_provider.Device, _mf, binding.FilePath, _log, binding.SourceId);
+            src = new MediaFoundationSource(_provider.Device, _mf, planned.FilePath, _log, planned.SourceId);
             pass.BindSource(src.Frames, src.Width, src.Height);
             return src;
         }
         catch (Exception ex)
         {
-            _log.Error("Control", $"Media Foundation could not open '{binding.FilePath}' ({ex.Message}).");
+            _log.Error("Control", $"Media Foundation could not open '{planned.FilePath}' ({ex.Message}).");
             src?.Dispose();
             return null;
         }
@@ -494,45 +440,6 @@ public sealed class PerformanceController : IPerformanceController
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────
-
-    private int IndexOfMonitor(string? deviceId)
-    {
-        if (string.IsNullOrEmpty(deviceId))
-            return -1;
-        for (var i = 0; i < Monitors.Count; i++)
-            if (string.Equals(Monitors[i].DeviceId, deviceId, StringComparison.OrdinalIgnoreCase))
-                return i;
-        return -1;
-    }
-
-    /// <summary>Resolves a monitor's split-grid cell from the wall mapping ("row,col"→deviceId);
-    /// falls back to row-major order by output index when the monitor isn't explicitly mapped.</summary>
-    private static bool TryGetCell(VideoWallConfiguration? wall, string deviceId, int outputIndex,
-        int rows, int cols, out int row, out int col)
-    {
-        if (wall is not null)
-        {
-            foreach (var (key, mappedId) in wall.GridToMonitorMapping)
-            {
-                if (!string.Equals(mappedId, deviceId, StringComparison.OrdinalIgnoreCase))
-                    continue;
-                var parts = key.Split(',');
-                if (parts.Length == 2 && int.TryParse(parts[0], out row) && int.TryParse(parts[1], out col)
-                    && row >= 0 && row < rows && col >= 0 && col < cols)
-                    return true;
-            }
-        }
-        // Fallback: assign cells row-major by output index (so an un-mapped 2-monitor split still shows
-        // two distinct cells rather than nothing).
-        if (outputIndex < rows * cols)
-        {
-            row = outputIndex / cols;
-            col = outputIndex % cols;
-            return true;
-        }
-        row = col = 0;
-        return false;
-    }
 
     private void SetState(PerformState state)
     {

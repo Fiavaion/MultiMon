@@ -6,6 +6,7 @@ using MultiMon.Core;
 using MultiMon.Core.Abstractions;
 using MultiMon.Core.Diagnostics;
 using MultiMon.Core.Models;
+using MultiMon.Core.Show;
 
 namespace MultiMon.Control.ViewModels;
 
@@ -247,17 +248,9 @@ public sealed class MainViewModel : INotifyPropertyChanged
     /// <summary>Derive a near-square grid from the screen count (4→2×2, 9→3×3, 16→4×4, 6→2×3).</summary>
     private void ApplyAutoGrid()
     {
-        var (rows, cols) = AutoGrid(_controller.Monitors.Count);
+        var (rows, cols) = ShowPlanner.AutoGrid(_controller.Monitors.Count);
         SplitRows = rows;
         SplitColumns = cols;
-    }
-
-    private static (int rows, int cols) AutoGrid(int screens)
-    {
-        var n = Math.Max(1, screens);
-        var cols = (int)Math.Ceiling(Math.Sqrt(n));
-        var rows = (int)Math.Ceiling((double)n / cols);
-        return (rows, cols);
     }
 
     /// <summary>Individual-mode sync toggle: free-run when off (default), shared-clock frame-lock when on.</summary>
@@ -526,7 +519,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
 
             if (SelectedMode == ShowMode.Split)
             {
-                var (rows, cols) = _splitAuto ? AutoGrid(_controller.Monitors.Count) : (_splitRows, _splitColumns);
+                var (rows, cols) = _splitAuto ? ShowPlanner.AutoGrid(_controller.Monitors.Count) : (_splitRows, _splitColumns);
                 // Empty grid mapping → the controller assigns cells row-major by output index.
                 show.WallConfiguration = new VideoWallConfiguration
                 {
