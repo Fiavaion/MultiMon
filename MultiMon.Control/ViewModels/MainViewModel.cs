@@ -118,9 +118,12 @@ public sealed class MainViewModel : INotifyPropertyChanged
 
     // Auto-loaded (linked) embedded-audio tracks, keyed by video slot (monitor DeviceId, or SingleSlotKey
     // for the one-source modes). _linkedSlotPaths tracks the path each linked track was probed against so a
-    // refresh only re-probes when a path actually changed. Bulk loads suppress the refresh until done.
+    // refresh only re-probes when a path actually changed; _probing holds the slot→path probes in flight
+    // (the probe is a full MF decode, so it runs on a Task and its result is applied back on the UI thread
+    // only if the slot still wants that path). Bulk loads suppress the refresh until done.
     private readonly Dictionary<string, AudioTrackRow> _linkedTracks = new();
     private readonly Dictionary<string, string> _linkedSlotPaths = new();
+    private readonly Dictionary<string, string> _probing = new();
     private bool _suppressLinkedRefresh;
 
     public MainViewModel(IPerformanceController controller, ILog log)
@@ -138,6 +141,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
         AudioTracks = new ObservableCollection<AudioTrackRow>();
 
         _controller.StateChanged += OnControllerStateChanged;
+        _controller.CommandFailed += OnControllerCommandFailed;
     }
 
     public ObservableCollection<MonitorAssignmentRow> Rows { get; }
@@ -287,7 +291,8 @@ public sealed class MainViewModel : INotifyPropertyChanged
         private set { _status = value; OnChanged(); }
     }
 
-    /// <summary>Apply the current assignments as a show and enter perform mode. Posts and returns.</summary>
+    /// <summary>Apply the current assignments as a show and enter perform mode. Posts and returns; the
+    /// status line follows the controller's StateChanged / CommandFailed events.</summary>
     public void Perform()
     {
         if (IsSingleSourceMode)
@@ -304,25 +309,13 @@ public sealed class MainViewModel : INotifyPropertyChanged
             return;
         }
 
-        try
-        {
-            _controller.ApplyShow(BuildShow());
-            _controller.EnterPerform();
-            Status = $"Performing — {SelectedMode}.";
-        }
-        catch (Exception ex)
-        {
-            _log.Error("Control", $"Perform failed: {ex}");
-            Status = $"Perform failed: {ex.Message}";
-        }
+        Status = "Starting…";
+        _controller.ApplyShow(BuildShow());
+        _controller.EnterPerform();
     }
 
     /// <summary>Leave perform mode (hide outputs, pause the clock). Posts and returns.</summary>
-    public void Stop()
-    {
-        _controller.ExitPerform();
-        Status = "Stopped.";
-    }
+    public void Stop() => _controller.ExitPerform();
 
     /// <summary>F11: enter perform mode if idle, leave it if performing.</summary>
     public void TogglePerform()
@@ -336,10 +329,8 @@ public sealed class MainViewModel : INotifyPropertyChanged
     /// <summary>Space: pause/resume playback without leaving perform mode (frame freezes in place).</summary>
     public void TogglePause()
     {
-        if (!IsPerforming)
-            return;
-        _controller.TogglePause();
-        Status = _controller.IsPaused ? "Paused." : $"Performing — {SelectedMode}.";
+        if (IsPerforming)
+            _controller.TogglePause();
     }
 
     /// <summary>Surface a failed global-hotkey registration (e.g. another app owns F11) without crashing.</summary>
@@ -384,7 +375,40 @@ public sealed class MainViewModel : INotifyPropertyChanged
     /// </summary>
     private void RefreshLinkedAudio()
     {
-        // Desired slot → path for the videos shown in this mode.
+        var desired = DesiredSlots();
+
+        // Drop linked tracks whose slot is gone or whose path changed (the add pass re-creates changed ones).
+        foreach (var key in _linkedTracks.Keys.ToList())
+        {
+            if (desired.TryGetValue(key, out var path) && PathEquals(path, _linkedSlotPaths[key]))
+                continue;
+            AudioTracks.Remove(_linkedTracks[key]);
+            _linkedTracks.Remove(key);
+            _linkedSlotPaths.Remove(key);
+        }
+
+        // Probe each new/changed slot OFF the UI thread (a full MF decode); the result is applied back on
+        // the UI thread by OnAudioProbed, which re-checks that the slot still wants the probed path.
+        foreach (var (key, path) in desired)
+        {
+            if (_linkedTracks.ContainsKey(key))
+                continue; // unchanged slot already linked above
+            if (_probing.TryGetValue(key, out var inFlight) && PathEquals(inFlight, path))
+                continue; // same probe already running
+            _probing[key] = path;
+            Task.Run(() => _controller.FileHasAudio(path)).ContinueWith(t =>
+            {
+                if (t.IsFaulted) // the probe is best-effort; treat a fault as "no audio" (and observe it)
+                    _log.Error("Control", $"Audio probe failed for '{path}': {t.Exception}");
+                var hasAudio = t.Status == TaskStatus.RanToCompletion && t.Result;
+                RunOnUi(() => OnAudioProbed(key, path, hasAudio));
+            });
+        }
+    }
+
+    /// <summary>Slot → path for the videos that play in the current mode.</summary>
+    private Dictionary<string, string> DesiredSlots()
+    {
         var desired = new Dictionary<string, string>();
         if (IsSingleSourceMode)
         {
@@ -397,33 +421,27 @@ public sealed class MainViewModel : INotifyPropertyChanged
                 if (!string.IsNullOrWhiteSpace(r.FilePath))
                     desired[r.DeviceId] = r.FilePath;
         }
+        return desired;
+    }
 
-        // Drop linked tracks whose slot is gone or whose path changed (the add pass re-creates changed ones).
-        foreach (var key in _linkedTracks.Keys.ToList())
+    /// <summary>UI thread: a probe finished. Link the track only if the slot still wants that exact path
+    /// (the user may have changed the file or mode while the probe ran) and nothing linked it meanwhile.</summary>
+    private void OnAudioProbed(string key, string path, bool hasAudio)
+    {
+        if (_probing.TryGetValue(key, out var inFlight) && PathEquals(inFlight, path))
+            _probing.Remove(key);
+        if (!hasAudio || _linkedTracks.ContainsKey(key))
+            return;
+        if (!DesiredSlots().TryGetValue(key, out var wanted) || !PathEquals(wanted, path))
+            return; // stale result
+        var row = new AudioTrackRow(_controller, Guid.NewGuid().ToString("N"), Path.GetFileNameWithoutExtension(path), path)
         {
-            if (desired.TryGetValue(key, out var path) && PathEquals(path, _linkedSlotPaths[key]))
-                continue;
-            AudioTracks.Remove(_linkedTracks[key]);
-            _linkedTracks.Remove(key);
-            _linkedSlotPaths.Remove(key);
-        }
-
-        // Add a linked track for each new/changed slot whose file actually has an audio stream.
-        foreach (var (key, path) in desired)
-        {
-            if (_linkedTracks.ContainsKey(key))
-                continue; // unchanged slot already linked above
-            if (!_controller.FileHasAudio(path))
-                continue; // no audio stream → nothing to add
-            var row = new AudioTrackRow(_controller, Guid.NewGuid().ToString("N"), Path.GetFileNameWithoutExtension(path), path)
-            {
-                IsLinked = true,
-                OutputDeviceId = SelectedAudioDevice?.Id,
-            };
-            AudioTracks.Add(row);
-            _linkedTracks[key] = row;
-            _linkedSlotPaths[key] = path;
-        }
+            IsLinked = true,
+            OutputDeviceId = SelectedAudioDevice?.Id,
+        };
+        AudioTracks.Add(row);
+        _linkedTracks[key] = row;
+        _linkedSlotPaths[key] = path;
     }
 
     private static bool PathEquals(string a, string b) => string.Equals(a, b, StringComparison.OrdinalIgnoreCase);
@@ -630,15 +648,28 @@ public sealed class MainViewModel : INotifyPropertyChanged
         RefreshLinkedAudio();
     }
 
-    private void OnControllerStateChanged(PerformState state)
+    // The controller raises these on its worker thread (the V0087 rule); IsPerforming/Status fire WPF
+    // PropertyChanged, which must touch bindings on the UI thread — so marshal here, in the view-model.
+    private void OnControllerStateChanged(PerformState state) => RunOnUi(() =>
     {
-        // The controller may raise this off the UI thread (its teardown runs off-thread, the V0087 rule),
-        // and setting IsPerforming fires WPF PropertyChanged — which must touch bindings on the UI thread.
+        IsPerforming = state != PerformState.Idle;
+        Status = state switch
+        {
+            PerformState.Performing => $"Performing — {SelectedMode}.",
+            PerformState.Paused => "Paused.",
+            _ => "Stopped.",
+        };
+    });
+
+    private void OnControllerCommandFailed(string message) => RunOnUi(() => Status = $"Perform failed: {message}");
+
+    private static void RunOnUi(Action action)
+    {
         var dispatcher = System.Windows.Application.Current?.Dispatcher;
         if (dispatcher is not null && !dispatcher.CheckAccess())
-            dispatcher.InvokeAsync(() => IsPerforming = state == PerformState.Performing);
+            dispatcher.InvokeAsync(action);
         else
-            IsPerforming = state == PerformState.Performing;
+            action();
     }
 
     public event PropertyChangedEventHandler? PropertyChanged;

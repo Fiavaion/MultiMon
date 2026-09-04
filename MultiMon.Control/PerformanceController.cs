@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using MultiMon.Audio;
 using MultiMon.Core.Abstractions;
 using MultiMon.Core.Diagnostics;
@@ -19,9 +20,14 @@ namespace MultiMon.Control;
 /// windows and starts/pauses the clock; applying a show re-binds sources→outputs — the device,
 /// swapchains, shaders, and render loop are NEVER rebuilt (LESSON-ARCH-002).
 ///
-/// <para>Threading / the V0087 rule: every method posts work to the render thread (via the loop) or runs
-/// off-thread teardown; NONE blocks the caller (UI thread) on a native teardown. The binding logic
-/// mirrors the path the stress harness gates at 50 cycles per mode.</para>
+/// <para>Threading / the V0087 rule: the controller owns ONE long-lived worker thread with a FIFO command
+/// queue. Every public command (ApplyShow / EnterPerform / ExitPerform / TogglePause / mixer / the Dispose
+/// teardown) is posted to it and returns immediately, so the UI thread never runs — or blocks on — a
+/// native build or teardown (SetContent(null) joins the render thread, source Stop joins decode threads,
+/// IMFSourceReader/D3D/WASAPI disposal, MF source construction). All per-show state below is touched ONLY
+/// on the worker; FIFO keeps the ordering the UI relies on (an EnterPerform posted after an ApplyShow runs
+/// after it completes). <see cref="StateChanged"/> / <see cref="CommandFailed"/> are raised ON the worker —
+/// handlers marshal. The binding logic mirrors the path the stress harness gates (--controller) per mode.</para>
 /// </summary>
 public sealed class PerformanceController : IPerformanceController
 {
@@ -30,6 +36,8 @@ public sealed class PerformanceController : IPerformanceController
     private readonly RenderLoop _loop;
     private readonly MasterClock _clock = new();
     private readonly OutputWindow[] _outputs;
+    private readonly BlockingCollection<Action> _commands = new();
+    private readonly Thread _worker;
     private MfDeviceManager? _mf;
 
     // Per-show state, rebuilt on ApplyShow. _outputs is fixed for the session; these are not.
@@ -40,23 +48,24 @@ public sealed class PerformanceController : IPerformanceController
     private AudioEngine? _audio;
     // Master mix settings live HERE, not in the per-show engine: BuildAudio creates a fresh AudioEngine on
     // every ApplyShow, so a master set on the old engine would be lost. The controller is the stable owner
-    // across rebuilds; BuildAudio re-applies these to each new engine. Touched only on the UI thread (the
-    // setters and ApplyShow→BuildShow→BuildAudio all run there), so no synchronization is needed.
+    // across rebuilds; BuildAudio re-applies these to each new engine. Worker-thread state like the rest.
     private double _masterVolume = 1.0;
     private bool _masterMuted;
-    private bool _disposed;
+    private volatile PerformState _state = PerformState.Idle;
+    private volatile bool _disposed;
 
-    public PerformState State { get; private set; } = PerformState.Idle;
-    public bool IsPaused { get; private set; }
+    public PerformState State => _state;
     public IReadOnlyList<MonitorInfo> Monitors { get; }
 
     public event Action<PerformState>? StateChanged;
+    public event Action<string>? CommandFailed;
 
     /// <summary>
     /// Builds the persistent pipeline for <paramref name="monitors"/> (one output window each). The device
     /// is created on the primary adapter; cross-adapter outputs are DWM-composited (ADR 0002 D4).
+    /// <paramref name="enableDebugLayer"/> is the harness hook (live-object counting); the app leaves it off.
     /// </summary>
-    public PerformanceController(IReadOnlyList<MonitorInfo> monitors, ILog log)
+    public PerformanceController(IReadOnlyList<MonitorInfo> monitors, ILog log, bool enableDebugLayer = false)
     {
         ArgumentNullException.ThrowIfNull(monitors);
         if (monitors.Count == 0)
@@ -65,7 +74,7 @@ public sealed class PerformanceController : IPerformanceController
         _log = log;
         Monitors = monitors;
 
-        _provider = new GraphicsDeviceProvider(log); // no debug layer in the shipping app
+        _provider = new GraphicsDeviceProvider(log, enableDebugLayer);
         _provider.Acquire();
         AdapterMap.LogTopology(_provider.Factory, _provider.DeviceAdapterName, log);
 
@@ -75,22 +84,119 @@ public sealed class PerformanceController : IPerformanceController
         _outputs = new OutputWindow[monitors.Count];
         for (var i = 0; i < monitors.Count; i++)
             _outputs[i] = _loop.CreateOutputWindow($"MultiMon Output {i + 1}", monitors[i].Bounds);
+
+        _worker = new Thread(WorkerProc) { Name = "MultiMon.Controller", IsBackground = true };
+        _worker.Start();
     }
+
+    // ── Public commands: post-and-return (the UI thread never waits on native work) ──────────────
 
     public void ApplyShow(ShowDefinition show)
     {
         ArgumentNullException.ThrowIfNull(show);
-        ThrowIfDisposed();
-
-        TeardownShow();      // unbind + dispose any previous show (off-thread; never touches the device)
-        BuildShow(show);     // build sources/passes + bind outputs for the new show
+        Post(() =>
+        {
+            TeardownShow();      // unbind + dispose any previous show (never touches the device)
+            try
+            {
+                BuildShow(show); // build sources/passes + bind outputs for the new show
+            }
+            catch
+            {
+                TeardownShow();  // never leave a half-built show bound; the queued EnterPerform then no-ops
+                throw;
+            }
+        });
     }
 
-    public void EnterPerform()
+    public void EnterPerform() => Post(EnterPerformCore);
+    public void ExitPerform() => Post(ExitPerformCore);
+    public void TogglePause() => Post(TogglePauseCore);
+
+    public IReadOnlyList<AudioOutputDevice> GetAudioDevices() => AudioEngine.EnumerateDevices(_log);
+
+    /// <summary>Probe whether a file has AUDIBLE audio — not just a stream, but actual signal (a silent
+    /// placeholder track, common in camera/NLE exports, does not count). Keeps the decode type behind the
+    /// firewall — the VM never references MultiMon.Audio. A full MF decode probe: callers run it off the
+    /// UI thread (the view-model uses a Task). Best-effort; false on any failure.</summary>
+    public bool FileHasAudio(string filePath) => MfAudioSource.HasAudibleAudio(filePath);
+
+    // Live mixer — master settings persist on the controller (survive engine rebuilds) and are pushed to the
+    // current engine if a show with audio is playing. Track settings are per-show, so they stay on the engine.
+    // Posted like everything else: _audio is created/disposed on the worker, so only the worker touches it.
+    public void SetMasterVolume(double volume) => Post(() => { _masterVolume = volume; _audio?.SetMasterVolume(volume); });
+    public void SetMasterMuted(bool muted) => Post(() => { _masterMuted = muted; _audio?.SetMasterMuted(muted); });
+    public void SetTrackVolume(string trackId, double volume) => Post(() => _audio?.SetTrackVolume(trackId, volume));
+    public void SetTrackMuted(string trackId, bool muted) => Post(() => _audio?.SetTrackMuted(trackId, muted));
+    public void SetTrackSolo(string trackId, bool solo) => Post(() => _audio?.SetTrackSolo(trackId, solo));
+    public void SetTrackPan(string trackId, double pan) => Post(() => _audio?.SetTrackPan(trackId, pan));
+
+    /// <summary>Queues <paramref name="command"/> on the worker. Throws only if already disposed.</summary>
+    private void Post(Action command)
     {
-        ThrowIfDisposed();
-        if (State == PerformState.Performing || _activeOutputs.Count == 0)
+        if (_disposed)
+            throw new ObjectDisposedException(nameof(PerformanceController));
+        _commands.Add(command);
+    }
+
+    /// <summary>The worker loop: runs commands strictly FIFO. A failing command is logged + surfaced via
+    /// <see cref="CommandFailed"/> and never kills the worker (the next command still runs).</summary>
+    private void WorkerProc()
+    {
+        foreach (var command in _commands.GetConsumingEnumerable())
+        {
+            try
+            {
+                command();
+            }
+            catch (Exception ex)
+            {
+                _log.Error("Control", $"Controller command failed: {ex}");
+                CommandFailed?.Invoke(ex.Message);
+            }
+        }
+    }
+
+    // ── Harness hooks (MultiMon.Stress only) ─────────────────────────────────
+
+    /// <summary>Posts a marker and waits until every command queued before it has run — the harness's
+    /// per-cycle wedge detector. False if the worker did not get there within <paramref name="timeout"/>.</summary>
+    internal bool WaitForQueue(TimeSpan timeout)
+    {
+        var done = new TaskCompletionSource();
+        Post(() => done.SetResult());
+        return done.Task.Wait(timeout);
+    }
+
+    /// <summary>Waits until every output bound by the current show has presented <paramref name="frames"/>
+    /// more frames. Call only after <see cref="WaitForQueue"/> returned true (the bound set is worker state).</summary>
+    internal bool WaitForPresentedFrames(int frames, TimeSpan timeout, out string stalled)
+    {
+        foreach (var i in _activeOutputs)
+        {
+            if (_outputs[i].WaitForPresentedFrames(frames, timeout))
+                continue;
+            stalled = $"{_outputs[i].Name} (deviceLost={_outputs[i].DeviceLost})";
+            return false;
+        }
+        stalled = string.Empty;
+        return true;
+    }
+
+    internal bool DebugLayerActive => _provider.DebugLayerActive;
+    internal int GetLiveObjectCount() => _provider.GetLiveObjectCount();
+
+    // ── Worker-thread implementations ────────────────────────────────────────
+
+    private void EnterPerformCore()
+    {
+        if (_state != PerformState.Idle)
             return;
+        if (_activeOutputs.Count == 0)
+        {
+            CommandFailed?.Invoke("No source could be opened (see the log).");
+            return;
+        }
 
         foreach (var i in _activeOutputs)
             _outputs[i].Show(Monitors[i].Bounds);
@@ -101,37 +207,40 @@ public sealed class PerformanceController : IPerformanceController
         _clock.Reset();
         _clock.Start();                              // shared clock (synced modes + free-run fallback)
         foreach (var c in _freeRunClocks) c.Start(); // Individual free-run: independent timelines
-        IsPaused = false;
         SetState(PerformState.Performing);
     }
 
-    public void ExitPerform()
+    private void ExitPerformCore()
     {
-        ThrowIfDisposed();
-        if (State != PerformState.Performing)
+        if (_state == PerformState.Idle)
             return;
 
         // Pause the clock (decode self-blocks while paused) then hide. Content stays bound so a re-enter
         // is an instant Show+Start. No native teardown here — that only happens on ApplyShow / Dispose.
         _clock.Stop();
         foreach (var c in _freeRunClocks) c.Stop();
-        IsPaused = false;
-        foreach (var i in _activeOutputs)
-            _outputs[i].Hide();
+        try
+        {
+            foreach (var i in _activeOutputs)
+                _outputs[i].Hide();
+        }
+        catch (Exception ex)
+        {
+            _log.Error("Control", $"Hide on the render thread failed (render loop dead?): {ex.Message}");
+        }
         SetState(PerformState.Idle);
     }
 
-    public void TogglePause()
+    private void TogglePauseCore()
     {
-        ThrowIfDisposed();
-        if (State != PerformState.Performing)
+        if (_state == PerformState.Idle)
             return;
 
-        if (IsPaused)
+        if (_state == PerformState.Paused)
         {
             _clock.Start();
             foreach (var c in _freeRunClocks) c.Start();
-            IsPaused = false;
+            SetState(PerformState.Performing);
         }
         else
         {
@@ -139,32 +248,15 @@ public sealed class PerformanceController : IPerformanceController
             // frozen media time, so the picture stays put and the windows remain visible.
             _clock.Stop();
             foreach (var c in _freeRunClocks) c.Stop();
-            IsPaused = true;
+            SetState(PerformState.Paused);
         }
         // Pause-freeze diagnostic: mark the transition + a present snapshot so the render-loop present-rate
         // log can be read relative to it (which output, if any, stops advancing after a pause).
         var snapshot = string.Join(" ", _activeOutputs.Select(i => $"{_outputs[i].Name}={_outputs[i].PresentCount}"));
-        _log.Info("Control", $"TogglePause -> {(IsPaused ? "PAUSED" : "RESUMED")} (mode-clocks={_freeRunClocks.Count} free-run + 1 shared) presents:[{snapshot}]");
+        _log.Info("Control", $"TogglePause -> {(_state == PerformState.Paused ? "PAUSED" : "RESUMED")} (mode-clocks={_freeRunClocks.Count} free-run + 1 shared) presents:[{snapshot}]");
     }
 
-    public IReadOnlyList<AudioOutputDevice> GetAudioDevices() =>
-        _audio?.GetDevices() ?? AudioEngine.EnumerateDevices(_log);
-
-    /// <summary>Probe whether a file has AUDIBLE audio — not just a stream, but actual signal (a silent
-    /// placeholder track, common in camera/NLE exports, does not count). Keeps the decode type behind the
-    /// firewall — the VM never references MultiMon.Audio. Best-effort; false on any failure.</summary>
-    public bool FileHasAudio(string filePath) => MfAudioSource.HasAudibleAudio(filePath);
-
-    // Live mixer — master settings persist on the controller (survive engine rebuilds) and are pushed to the
-    // current engine if a show with audio is playing. Track settings are per-show, so they stay on the engine.
-    public void SetMasterVolume(double volume) { _masterVolume = volume; _audio?.SetMasterVolume(volume); }
-    public void SetMasterMuted(bool muted) { _masterMuted = muted; _audio?.SetMasterMuted(muted); }
-    public void SetTrackVolume(string trackId, double volume) => _audio?.SetTrackVolume(trackId, volume);
-    public void SetTrackMuted(string trackId, bool muted) => _audio?.SetTrackMuted(trackId, muted);
-    public void SetTrackSolo(string trackId, bool solo) => _audio?.SetTrackSolo(trackId, solo);
-    public void SetTrackPan(string trackId, double pan) => _audio?.SetTrackPan(trackId, pan);
-
-    // ── Show build / teardown ────────────────────────────────────────────────
+    // ── Show build / teardown (worker thread) ────────────────────────────────
 
     private void BuildShow(ShowDefinition show)
     {
@@ -363,16 +455,24 @@ public sealed class PerformanceController : IPerformanceController
     }
 
     /// <summary>Unbinds outputs (marshalled → render thread drops the old passes), then stops + disposes
-    /// the previous show's sources/passes/audio off the calling thread. Never touches the device/swapchains.</summary>
+    /// the previous show's sources/passes/audio on the worker. Never touches the device/swapchains.</summary>
     private void TeardownShow()
     {
-        if (State == PerformState.Performing)
-            ExitPerform();
+        ExitPerformCore();
 
-        _loop.Invoke(() => _loop.RecoveryHandler = null);
-
-        foreach (var i in _activeOutputs)
-            _outputs[i].SetContent(null);     // blocks until the render thread drops the pass reference
+        // The unbinds marshal to the render thread. If that thread has died (a fatal render fault) the
+        // Invoke throws — log it and carry on: the sources/passes below must still be stopped and disposed,
+        // or Dispose would leak them and never release the device.
+        try
+        {
+            _loop.Invoke(() => _loop.RecoveryHandler = null);
+            foreach (var i in _activeOutputs)
+                _outputs[i].SetContent(null); // blocks until the render thread drops the pass reference
+        }
+        catch (Exception ex)
+        {
+            _log.Error("Control", $"Unbind on the render thread failed (render loop dead?): {ex.Message}");
+        }
         _activeOutputs.Clear();
 
         foreach (var s in _sources) s.Stop();
@@ -430,23 +530,19 @@ public sealed class PerformanceController : IPerformanceController
 
     private void SetState(PerformState state)
     {
-        if (State == state)
+        if (_state == state)
             return;
-        State = state;
+        _state = state;
         StateChanged?.Invoke(state);
     }
 
-    private void ThrowIfDisposed()
-    {
-        if (_disposed)
-            throw new ObjectDisposedException(nameof(PerformanceController));
-    }
-
     /// <summary>
-    /// Ordered teardown, OFF the UI thread (the V0087 rule): tear down the show (stop+dispose sources/
-    /// passes/audio) → stop+join the render loop (windows + swapchains die on the render thread) → dispose
-    /// the MF device manager → release the device. No synchronous native teardown runs on the caller's
-    /// thread that could deadlock the way the old app did.
+    /// Ordered teardown ON the worker (the V0087 rule — never on the UI thread): tear down the show
+    /// (stop+dispose sources/passes/audio) → stop+join the render loop (windows + swapchains die on the
+    /// render thread) → dispose the MF device manager → release the device. Queued after any pending
+    /// command, then the worker exits. BLOCKS until the worker has finished, so call it from a thread that
+    /// may wait (App.OnExit uses a time-guarded teardown thread). Tolerates a dead render loop: the unbind
+    /// failures are logged and Stop/Release still run.
     /// </summary>
     public void Dispose()
     {
@@ -454,9 +550,23 @@ public sealed class PerformanceController : IPerformanceController
             return;
         _disposed = true;
 
-        TeardownShow();
-        _loop.Stop();              // joins the render thread; all output windows/swapchains disposed there
-        _mf?.Dispose();
-        _provider.Release();
+        _commands.Add(() =>
+        {
+            try
+            {
+                TeardownShow();
+            }
+            catch (Exception ex)
+            {
+                // A show-teardown fault must not stop the device from being released below.
+                _log.Error("Control", $"Show teardown failed during Dispose: {ex}");
+            }
+            _loop.Stop();          // joins the render thread; all output windows/swapchains disposed there
+            _mf?.Dispose();
+            _provider.Release();
+        });
+        _commands.CompleteAdding();
+        _worker.Join();
+        _commands.Dispose();
     }
 }

@@ -45,8 +45,22 @@ public partial class App : Application
         var monitors = monitorService.GetMonitors();
 
         // Composition root: build the persistent pipeline once (device + render loop + one output per
-        // monitor). Downstream code depends only on the IPerformanceController abstraction.
-        _controller = new PerformanceController(monitors, log);
+        // monitor). Downstream code depends only on the IPerformanceController abstraction. A machine with
+        // no usable D3D11 device (or no monitor) throws here — tell the user where the log is instead of
+        // vanishing (an unhandled startup exception just kills the windowed process silently).
+        try
+        {
+            _controller = new PerformanceController(monitors, log);
+        }
+        catch (Exception ex)
+        {
+            log.Error("App", $"Startup failed: {ex}");
+            MessageBox.Show(
+                $"MultiMon could not start its graphics pipeline.\n\n{ex.Message}\n\nDetails are in the log:\n{log.FilePath ?? "(console only)"}",
+                "MultiMon", MessageBoxButton.OK, MessageBoxImage.Error);
+            Shutdown(1);
+            return;
+        }
 
         var services = new ServiceCollection();
         services.AddSingleton<ILog>(log);
@@ -60,9 +74,10 @@ public partial class App : Application
 
     protected override void OnExit(ExitEventArgs e)
     {
-        // Dispose the pipeline OFF the UI thread (the V0087 rule): stop sources/audio → join the render
-        // thread (windows + swapchains die there) → release the device. Joined so the device is cleanly
-        // released before the process exits.
+        // Dispose the pipeline OFF the UI thread (the V0087 rule): Dispose queues the ordered teardown on
+        // the controller's worker (stop sources/audio → join the render thread, where windows + swapchains
+        // die → release the device) and blocks until that worker has finished — so it runs on a guarded
+        // thread here, never the UI thread. Joined so the device is cleanly released before the process exits.
         if (_controller is not null)
         {
             var teardown = new Thread(_controller.Dispose) { Name = "MultiMon.Teardown", IsBackground = true };
