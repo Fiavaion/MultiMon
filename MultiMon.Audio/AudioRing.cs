@@ -182,18 +182,4 @@ public sealed class AudioRing
             return _totalSlots - (int)(w - r);
         }
     }
-
-    // ── Teardown ──────────────────────────────────────────────────────────────
-
-    /// <summary>
-    /// Resets the ring to empty.
-    /// <para><b>PRECONDITION:</b> only safe when <em>neither</em> the producer nor the consumer is
-    /// actively calling <see cref="Write"/> or <see cref="Read"/>.  Call this during pause or
-    /// teardown after both threads are quiesced.</para>
-    /// </summary>
-    public void Clear()
-    {
-        Volatile.Write(ref _writePos, 0L);
-        Volatile.Write(ref _readPos,  0L);
-    }
 }

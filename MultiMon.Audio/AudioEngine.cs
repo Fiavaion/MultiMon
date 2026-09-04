@@ -7,14 +7,18 @@ namespace MultiMon.Audio;
 
 /// <summary>
 /// Routes <see cref="AudioTrack"/>s to WASAPI render endpoints, clocked to the shared
-/// <see cref="MasterClock"/> (REBUILD_ARCHITECTURE §2.2). Each track becomes a pipeline of
+/// <see cref="MasterClock"/> (REBUILD_ARCHITECTURE §2.2). Each track becomes its own pipeline of
 /// <see cref="MfAudioSource"/> (decode thread → PCM) → <see cref="AudioRing"/> →
-/// <see cref="WasapiOutput"/> (one render thread per device). Built ONCE at <see cref="Start"/> and
-/// reused for the session; the MasterClock pausing/resuming per perform cycle gates content vs silence
-/// inside each <see cref="WasapiOutput"/> — the engine itself does not churn per cycle.
+/// <see cref="WasapiOutput"/> (one shared-mode client + one render thread PER TRACK). Built ONCE at
+/// <see cref="Start"/> and reused for the session; the MasterClock pausing/resuming per perform cycle
+/// gates content vs silence inside each <see cref="WasapiOutput"/> — the engine itself does not churn
+/// per cycle.
 ///
-/// <para>M6 routes every track to the DEFAULT render endpoint (one device, one render thread). The
-/// per-device grouping that multi-device routing needs lands with the M7 control layer.</para>
+/// <para><b>Per-track outputs, not per-device:</b> tracks that target the same endpoint each open their own
+/// shared-mode client on it and Windows' audio engine mixes them — there is no in-process mixer. That is
+/// deliberate: each track keeps its native rate/channel count (WASAPI auto-converts per client), and every
+/// output drift-corrects independently against the SAME MasterClock with the same threshold and one-shot
+/// policy, so the tracks stay mutually aligned without a shared mix buffer.</para>
 ///
 /// <para><b>Never crash (success metric):</b> if the endpoint can't be opened or a track can't be
 /// decoded, that pipeline is logged and skipped — the rest of the app keeps running. Teardown is
@@ -80,7 +84,7 @@ public sealed class AudioEngine : IAudioEngine
             RecomputeGains(); // apply initial master/solo across all tracks once they're all built
 
         _log.Info("Audio", _pipelines.Count > 0
-            ? $"AudioEngine started: {_pipelines.Count} track(s) routed to the default endpoint."
+            ? $"AudioEngine started: {_pipelines.Count} track(s), one WASAPI client + render thread each (endpoint per track: requested id or default)."
             : "AudioEngine started: no audio outputs active (no tracks, or no endpoint available).");
     }
 
