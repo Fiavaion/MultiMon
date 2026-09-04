@@ -7,6 +7,7 @@ using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
+using MultiMon.Core.Diagnostics;
 
 namespace MultiMon.Platform.Conversion;
 
@@ -20,6 +21,10 @@ namespace MultiMon.Platform.Conversion;
 /// </summary>
 public sealed class FfmpegHapConverter : IVideoConverter
 {
+    private const int KillExitWaitMs = 5000; // bound on waiting for a killed ffmpeg to release its output file
+
+    private readonly ILog _log;
+
     // Cached after the first successful lookup so repeated calls don't re-walk PATH.
     private string? _ffmpegPath;
     private string? _ffprobePath;
@@ -32,6 +37,13 @@ public sealed class FfmpegHapConverter : IVideoConverter
     private static readonly Regex CodecRx = new(@"Video:\s*(\w+)", RegexOptions.Compiled);
     private static readonly Regex ResRx = new(@"(\d{2,5})x(\d{2,5})", RegexOptions.Compiled);
     private static readonly Regex FrateRx = new(@"([\d.]+)\s*fps", RegexOptions.Compiled);
+
+    /// <param name="log">Sink for the best-effort paths (kill/delete on cancel, probe failures). Defaults to the
+    /// console so a harness or redirected launch still sees them.</param>
+    public FfmpegHapConverter(ILog? log = null)
+    {
+        _log = log ?? new ConsoleLog();
+    }
 
     // ── Path resolution ────────────────────────────────────────────────────────
 
@@ -86,13 +98,14 @@ public sealed class FfmpegHapConverter : IVideoConverter
 
         try
         {
-            using var proc = StartProcess(path, "-version");
-            proc.Start();
-            await proc.WaitForExitAsync();
-            return proc.ExitCode == 0;
+            // Drains both pipes: a chatty build (long -version banner) can fill an undrained pipe and stall
+            // ffmpeg before it exits, hanging this probe forever.
+            var (exitCode, _, _) = await RunCaptureAsync(path, "-version");
+            return exitCode == 0;
         }
-        catch
+        catch (Exception ex)
         {
+            _log.Debug("HapConvert", $"ffmpeg -version probe failed: {ex.Message}");
             return false;
         }
     }
@@ -193,12 +206,10 @@ public sealed class FfmpegHapConverter : IVideoConverter
         {
             proc.Start();
             proc.BeginErrorReadLine();
+            proc.BeginOutputReadLine(); // nothing useful on stdout, but keep the pipe drained so it can't fill
 
             // Hook cancellation: kill the process so WaitForExitAsync returns promptly.
-            using var cancelReg = cancellationToken.Register(() =>
-            {
-                try { if (!proc.HasExited) proc.Kill(); } catch { }
-            });
+            using var cancelReg = cancellationToken.Register(() => KillQuietly(proc));
 
             await proc.WaitForExitAsync(cancellationToken);
 
@@ -239,6 +250,10 @@ public sealed class FfmpegHapConverter : IVideoConverter
         catch (OperationCanceledException)
         {
             stopwatch.Stop();
+            // The token fired before the process was observed exiting: the registration's Kill may still be
+            // in flight, and ffmpeg holds the output file open until it dies — so a delete now silently
+            // fails. Wait (bounded) for the exit first.
+            await EnsureExitedAsync(proc);
             DeletePartialOutput(options.OutputPath);
             return Fail("Conversion was cancelled.", stopwatch.Elapsed);
         }
@@ -301,18 +316,28 @@ public sealed class FfmpegHapConverter : IVideoConverter
         return new Process { StartInfo = startInfo };
     }
 
+    /// <summary>Run a child process to completion, draining stdout AND stderr concurrently. Draining only one
+    /// pipe (or neither) lets the other fill and block the child before it exits — a hang, not a failure.</summary>
+    private static async Task<(int ExitCode, string Stdout, string Stderr)> RunCaptureAsync(string exe, params string[] args)
+    {
+        using var proc = StartProcess(exe, args);
+        proc.Start();
+        var stdout = proc.StandardOutput.ReadToEndAsync();
+        var stderr = proc.StandardError.ReadToEndAsync();
+        await proc.WaitForExitAsync();
+        return (proc.ExitCode, await stdout, await stderr);
+    }
+
     private async Task<string?> RunReadAllStdout(string exe, params string[] args)
     {
         try
         {
-            using var proc = StartProcess(exe, args);
-            proc.Start();
-            var output = await proc.StandardOutput.ReadToEndAsync();
-            await proc.WaitForExitAsync();
-            return output;
+            var (_, stdout, _) = await RunCaptureAsync(exe, args);
+            return stdout;
         }
-        catch
+        catch (Exception ex)
         {
+            _log.Debug("HapConvert", $"{Path.GetFileName(exe)} run failed: {ex.Message}");
             return null;
         }
     }
@@ -325,10 +350,7 @@ public sealed class FfmpegHapConverter : IVideoConverter
         try
         {
             // "ffmpeg -i <file>" exits with code 1 but writes stream info to stderr — that's what we parse.
-            using var proc = StartProcess(ffmpegPath, "-i", filePath);
-            proc.Start();
-            var stderr = await proc.StandardError.ReadToEndAsync();
-            await proc.WaitForExitAsync();
+            var (_, _, stderr) = await RunCaptureAsync(ffmpegPath, "-i", filePath);
 
             var durMatch = DurationRx.Match(stderr);
             var duration = durMatch.Success
@@ -442,9 +464,26 @@ public sealed class FfmpegHapConverter : IVideoConverter
         + int.Parse(m.Groups[3].Value)
         + int.Parse(m.Groups[4].Value) / 100.0;
 
-    private static void DeletePartialOutput(string path)
+    private void KillQuietly(Process proc)
     {
-        try { if (File.Exists(path)) File.Delete(path); } catch { }
+        try { if (!proc.HasExited) proc.Kill(); }
+        catch (Exception ex) { _log.Debug("HapConvert", $"ffmpeg kill on cancel failed: {ex.Message}"); }
+    }
+
+    /// <summary>Kill (if still running) and wait up to <see cref="KillExitWaitMs"/> for the exit, so the
+    /// partial-output delete that follows isn't racing a process that still holds the file.</summary>
+    private async Task EnsureExitedAsync(Process proc)
+    {
+        KillQuietly(proc);
+        await Task.WhenAny(proc.WaitForExitAsync(), Task.Delay(KillExitWaitMs));
+        if (!proc.HasExited)
+            _log.Debug("HapConvert", $"ffmpeg did not exit within {KillExitWaitMs}ms of Kill; partial output may stay locked.");
+    }
+
+    private void DeletePartialOutput(string path)
+    {
+        try { if (File.Exists(path)) File.Delete(path); }
+        catch (Exception ex) { _log.Debug("HapConvert", $"could not delete partial output '{path}': {ex.Message}"); }
     }
 
     private static ConversionResult Fail(string message, TimeSpan duration) => new()
