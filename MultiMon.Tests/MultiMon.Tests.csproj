@@ -22,6 +22,7 @@
     <ProjectReference Include="..\MultiMon.Core\MultiMon.Core.csproj" />
     <ProjectReference Include="..\MultiMon.Decode\MultiMon.Decode.csproj" />
     <ProjectReference Include="..\MultiMon.Audio\MultiMon.Audio.csproj" />
+    <ProjectReference Include="..\MultiMon.Platform\MultiMon.Platform.csproj" />
   </ItemGroup>
 
 </Project>
