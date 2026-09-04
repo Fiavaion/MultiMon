@@ -197,6 +197,8 @@ MultiMon.sln
 │   │   └─ MasterClock.cs                 [NEW — QPC timeline]
 │   ├─ Sync/
 │   │   └─ FrameSelector.cs               [NEW — pick frame for a given media time]
+│   ├─ Show/
+│   │   └─ ShowPlanner.cs                 [NEW — pure mapping: show+monitors → source/UV/clock per output]
 │   └─ Abstractions/
 │       ├─ ISource.cs                     [NEW — decode contract, publishes GPU texture]
 │       ├─ IGraphicsDeviceProvider.cs     [NEW]
@@ -215,16 +217,19 @@ MultiMon.sln
 │       ├─ Quad.hlsl                      [NEW — passthrough sample]
 │       └─ HapYCoCg.hlsl                  [NEW — HapQ YCoCg→RGB; math from old VeldridHapRenderer]
 │
-├─ MultiMon.Decode/                         (Vortice.MediaFoundation + vendored HAP)
+├─ MultiMon.Hap/                            (net9.0 — pure HAP parsing/decoding, no GPU, no OS)
+│   ├─ MovHapDemuxer.cs                   [NEW — MOV atom parse: sample table, fourcc, format byte]
+│   ├─ HapFrameDecoder.cs                 [NEW — section headers + chunk reassembly → BCn payload]
+│   ├─ HapTextureFormat.cs                [SALVAGE enum — Dxt1/Dxt5/YCoCgDxt5/Bc7/RgTc1]
+│   ├─ HapLimits.cs                       [NEW — allocation ceilings for untrusted input]
+│   └─ Snappy/SnappyDecoder.cs            [NEW — HAP chunk decompression]
+│
+├─ MultiMon.Decode/                         (Vortice.MediaFoundation + the HAP upload)
 │   ├─ MediaFoundation/
 │   │   ├─ MediaFoundationSource.cs       [NEW — IMFSourceReader → D3D11 texture via IMFDXGIDeviceManager]
 │   │   └─ MfDeviceManager.cs             [NEW — bind MF to our ID3D11Device; HW decode + SW fallback]
 │   └─ Hap/
-│       ├─ HapContainerParser.cs          [NEW ~100 lines — section headers, frame offsets, format byte]
-│       ├─ HapFrame.cs                    [NEW — BCn payload + format enum]
-│       ├─ HapTextureFormat.cs            [SALVAGE enum — Dxt1/Dxt5/YCoCgDxt5/Bc7/RgTc1]
-│       ├─ HapSource.cs                   [NEW — demux (FFmpeg or container) → HapFrame → BCn D3D11 tex]
-│       └─ Snappy/                        [NEW or vendored — HAP chunk decompression if Snappy-compressed]
+│       └─ HapSource.cs                   [NEW — MultiMon.Hap frames → BCn D3D11 texture]
 │
 ├─ MultiMon.Audio/
 │   ├─ WasapiOutput.cs                    [NEW — shared-mode WASAPI per device, no NAudio]
@@ -246,14 +251,20 @@ MultiMon.sln
 ├─ MultiMon.Stress/                         (headless harness — CARRY FORWARD the approach)
 │   └─ StressHarness.cs                   [NEW — port the StressHarness.cs pattern to the D3D11 pipeline]
 │
-└─ MultiMon.Tests/                          (xUnit smoke + unit)
-    ├─ HapContainerParserTests.cs         [NEW — parse known HAP fixtures]
-    ├─ FrameSelectorTests.cs              [NEW]
-    └─ MasterClockTests.cs                [NEW]
+├─ MultiMon.Core.Tests/                     (net9.0 xUnit — everything that needs no Windows host)
+│   ├─ HapParserTests.cs / HapHardeningTests.cs  [NEW — parse known + hostile HAP input]
+│   ├─ ShowPlannerTests.cs                [NEW — pins the per-mode source/UV/clock mapping]
+│   ├─ UvLayoutTests.cs / ProjectServiceTests.cs / CoreModelsSmokeTests.cs
+│   ├─ FrameSelectorTests.cs              [NEW]
+│   └─ MasterClockTests.cs                [NEW]
+│
+└─ MultiMon.Tests/                          (net9.0-windows xUnit — needs a real Windows host)
+    ├─ AudioRingTests.cs / AudioAudibilityTests.cs  [NEW — WASAPI-side]
+    └─ GpuCapabilityServiceTests.cs       [NEW]
 ```
 
-Key namespaces: `MultiMon.Core.*`, `MultiMon.Graphics`, `MultiMon.Decode.{MediaFoundation,Hap}`,
-`MultiMon.Audio`, `MultiMon.Platform`, `MultiMon.Control`.
+Key namespaces: `MultiMon.Core.*`, `MultiMon.Hap{,.Snappy}`, `MultiMon.Graphics`,
+`MultiMon.Decode.{MediaFoundation,Hap}`, `MultiMon.Audio`, `MultiMon.Platform`, `MultiMon.Control`.
 
 ---
 
