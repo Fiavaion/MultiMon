@@ -88,3 +88,6 @@ desktop.ini
 
 # Claude Code agent worktrees
 .claude/worktrees/
+
+# Mac transfer bundle (copies of ~/.claude routing files; not part of the app)
+mac-handoff/
