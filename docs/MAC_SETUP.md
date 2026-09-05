@@ -27,21 +27,23 @@ The project folder was zipped whole, so these travel with it. Confirm each is pr
 | `notes/` (`CURRENT_STATUS.md`, `TODOs.md`, `lessons.md`) | gitignored continuity files; the restart package |
 | `docs/` (`MAC_PORT.md`, `adr/`, `sessions/2026-09-04-full-audit.md`) | the port plan, the founding ADRs, the audit record |
 | `mac-handoff/` | copies of the **global** `~/.claude` routing files (agents, modelswitcher skill, global `CLAUDE.md`, routing keys from `settings.json`). These do NOT live in the project on Windows; they were copied in for the transfer. Section 3 installs them. If the folder is missing, Appendix A–C contain the same files verbatim. |
-| `.git/` | full history (9.6 MB). `origin` = `https://github.com/Fiavaion/MultiMon.git`; `master` and `rebuild` are pushed and equal at `0c395c0`. |
+| `.git/` | full history (9.6 MB). `origin` = `https://github.com/Fiavaion/MultiMon.git`; `master` and `rebuild` are pushed and equal (app code `0c395c0` + the runbook commits). |
 | `Old/`, `OldProjectDoNotTouch/` | legacy LibVLC app, read-only reference (salvage logic, never code) |
 
 Not in the zip and needed: **test media**. Copy `D:\testing Videos\` (at minimum `Hap\5sec_hap.mov`, one
-H.264 mp4, one 4K mp4, one mp3) to the Mac, e.g. `~/MultiMonMedia/`. Section 2 points `MULTIMON_HAP_FIXTURE` at it.
+H.264 mp4, one 4K mp4, one mp3) to the Mac. `MultiMon-test-media.zip` carries exactly that set and extracts to
+`~/Desktop/AIprojects/MultiMonMedia/`; section 2 points `MULTIMON_HAP_FIXTURE` at it.
 
 Delete after unzipping (Windows build output — harmless but large and confusing): every `bin/` and `obj/`
 directory, and `.claude/worktrees/` if present.
 
 ```bash
-cd ~/AIprojects/MultiMon            # or wherever it was unzipped
+cd ~/Desktop/AIprojects/MultiMon    # both zips extract into ~/Desktop/AIprojects/
 find . -type d \( -name bin -o -name obj \) -not -path './Old/*' -prune -exec rm -rf {} +
 rm -rf .claude/worktrees
 git status --short | head           # expect: empty (mac-handoff/ and notes/ are ignored)
-git log --oneline -1                # expect: 0c395c0 Probe .mov clips on the HAP path first ...
+git log --oneline -1                # expect the newest master commit ("docs: macOS setup ..." or later);
+                                    # the app code itself is at 0c395c0 (2026-09-04)
 ```
 
 ---
@@ -77,7 +79,7 @@ The first gate. It must be green with **zero** changes; it proves the toolchain,
 split at once.
 
 ```bash
-export MULTIMON_HAP_FIXTURE=~/MultiMonMedia/Hap/5sec_hap.mov   # also add to ~/.zshrc
+export MULTIMON_HAP_FIXTURE=~/Desktop/AIprojects/MultiMonMedia/Hap/5sec_hap.mov   # also add to ~/.zshrc
 dotnet build MultiMon.Core MultiMon.Hap MultiMon.Core.Tests -nologo
 dotnet test MultiMon.Core.Tests --nologo
 ```
