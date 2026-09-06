@@ -5,7 +5,7 @@ using MultiMon.Platform.Mac;
 using MultiMon.Stress.Mac;
 
 // Headless stress harness entry point — the Mac primary verification gate.
-// Usage: MultiMon.Stress.Mac --cycles=50 --windows=1 [--fullscreen] [--soak-seconds=S] | --source-check | --list-monitors
+// Usage: MultiMon.Stress.Mac --cycles=50 --windows=1 [--fullscreen] [--soak-seconds=S] [--hap [--video=CLIP.mov] [--mode=span|individual]] | --source-check | --list-monitors
 // NSScreen needs the AppKit application object to exist before any display is enumerated.
 NSApplication.Init();
 
@@ -19,7 +19,7 @@ if (args.Length == 1 && args[0] == "--list-monitors")
 
 if (!StressHarness.TryParse(args, out var options))
 {
-    Console.Error.WriteLine("usage: MultiMon.Stress.Mac --cycles=N --windows=N [--fullscreen] [--soak-seconds=S] | --source-check | --list-monitors");
+    Console.Error.WriteLine("usage: MultiMon.Stress.Mac --cycles=N --windows=N [--fullscreen] [--soak-seconds=S] [--hap [--video=CLIP.mov] [--mode=span|individual]] | --source-check | --list-monitors");
     return 2;
 }
 

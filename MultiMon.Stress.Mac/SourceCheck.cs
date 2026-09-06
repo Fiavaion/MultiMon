@@ -1,9 +1,12 @@
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using Metal;
 using MultiMon.Core.Diagnostics;
 using MultiMon.Core.Models;
 using MultiMon.Core.Sync;
+using MultiMon.Decode.Mac.Hap;
 using MultiMon.Graphics.Mac;
+using MultiMon.Hap;
 
 namespace MultiMon.Stress.Mac;
 
@@ -13,11 +16,19 @@ namespace MultiMon.Stress.Mac;
 /// <see cref="FullscreenQuadPass"/> is bound to, drawn by the render thread with the shared
 /// <c>QuadPipeline</c> into an offscreen target, read back and compared pixel-exact. Four quadrant UV rects
 /// over a four-colour texture prove the uniform layout (a shader/C# mismatch collapses every quadrant to one
-/// texel); one HapQ YCoCg texel proves the conversion shader. Exit 0 = every check PASS.
+/// texel); one synthetic HapQ YCoCg texel proves the conversion shader; and, given a BC1/BC3/HapQ clip, the REAL
+/// HAP path — a <see cref="HapSource"/>'s mid-clip frame uploaded to a pooled BCn texture, blitted and sampled
+/// through a texel-exact window — must put the CPU-decoded reference colour (<see cref="BcnReference"/>) at the
+/// target's centre for TWO texels: the most chromatic one (a swapped chroma channel, flipped sign or dropped
+/// scale divide changes it) and the brightest one (luma). A BC4/BC7 clip has no CPU reference and gets only a
+/// non-clear + non-uniform frame check. Exit 0 = every check PASS.
 /// </summary>
 internal static class SourceCheck
 {
     private const int TargetSize = 64;
+    /// <summary>Per-channel slack for the HAP comparisons: GPU BCn decoders may round the 1/3–2/3 endpoint blends
+    /// differently from the CPU reference. A chroma fault that moves a texel by no more than this is invisible.</summary>
+    private const int HapTolerance = 8;
 
     /// <summary>
     /// The four quadrant colours as (r, g, b): top-left red, top-right green, bottom-left blue, bottom-right
@@ -46,20 +57,24 @@ internal static class SourceCheck
         return CreateUploadedTexture(provider, QuadrantTextureSize, pixels);
     }
 
-    public static int Run(ILog log)
+    /// <summary><paramref name="hapClip"/>: the HAP .mov for the hap checks, or null to skip them (noted).</summary>
+    public static int Run(ILog log, string? hapClip)
     {
         log.Info("Stress", "source-check: DecodedFrame -> FrameTimeline -> FullscreenQuadPass.Draw -> offscreen target -> readback");
+        // The check count is fixed BEFORE anything runs so a crash mid-way can never leave passed == expected.
+        var demux = hapClip is null ? null : MovHapDemuxer.Parse(hapClip);
+        var checkCount = 5 + (demux is null ? 0 : BcnReference.Supports(demux.DeclaredFormat) ? 2 : 1);
+        var passedChecks = 0;
         var provider = new GraphicsDeviceProvider(log);
         provider.Acquire();
         var loop = new RenderLoop(provider, log);
-        const int checkCount = 5;
-        var passedChecks = 0;
 
         IMTLTexture? quadrantTexture = null, ycocgTexture = null, target = null;
         IMTLBuffer? readback = null, uniforms = null;
         MTLRenderPassDescriptor? renderPass = null;
-        FullscreenQuadPass? quadrantPass = null, ycocgPass = null;
+        FullscreenQuadPass? quadrantPass = null, ycocgPass = null, hapPass = null;
         FrameTimeline? quadrantTimeline = null, ycocgTimeline = null;
+        HapSource? hapSource = null;
         try
         {
             loop.Start();
@@ -113,6 +128,87 @@ internal static class SourceCheck
             ycocgPass.BindSource(ycocgTimeline, 2, 2, MTLPixelFormat.BGRA8Unorm, useYCoCg: true);
             var ycocgActual = RenderCentrePixel(loop, provider, ycocgPass, renderPass, uniforms, target, readback, UvRect.Full);
             passedChecks += Report(log, "ycocg (180,140,60) via scaled CoCgY (248,148,8,130)", ycocgExpected, ycocgActual, tolerance: 2);
+
+            // Checks 6-7: the real HAP path. The source decodes into pooled BCn textures; draws at the MID-CLIP sample's
+            // exact PTS (frame 0 of a typical clip is a black fade-in, which would prove nothing) select the greatest
+            // PTS <= target, pruning earlier frames so the blocked decoder advances, until that frame is published
+            // and selected; it is blitted into the pass's BCn texture. The same sample is decoded on the CPU
+            // (BC1/BC3/HapQ) and its most chromatic + brightest texels found; a draw per texel samples a 64-texel
+            // window centred on it so the target's centre fragment lands exactly on that texel — the pixel must not
+            // be the clear colour and must match the CPU reference. BC4/BC7 have no reference and settle for a
+            // non-clear, non-uniform full frame.
+            if (hapClip is not null)
+            {
+                var sampleIndex = demux!.Samples.Count / 2;
+                var targetPts = TimeSpan.FromTicks(demux.Samples[sampleIndex].PtsTicks);
+                hapSource = new HapSource(hapClip, provider, log, "check");
+                hapPass = new FullscreenQuadPass(provider);
+                hapPass.BindSource(hapSource.Frames, hapSource.Width, hapSource.Height, hapSource.TextureFormat, hapSource.UseYCoCg);
+                hapSource.Start();
+                if (!SpinWait.SpinUntil(() => hapSource.DecodedFrames > 0 || hapSource.IsFaulted, TimeSpan.FromSeconds(5)) || hapSource.IsFaulted)
+                    throw new InvalidOperationException($"HAP source published no frame within 5s (faulted={hapSource.IsFaulted}).");
+                var draws = 0;
+                var budget = Stopwatch.StartNew();
+                do
+                {
+                    RenderTarget(loop, provider, hapPass, renderPass, uniforms, target, readback, UvRect.Full, targetPts);
+                    draws++;
+                } while (hapSource.CurrentPts < targetPts && !hapSource.IsFaulted && budget.Elapsed < TimeSpan.FromSeconds(10));
+                if (hapSource.CurrentPts < targetPts)
+                    throw new InvalidOperationException($"HAP source never reached sample {sampleIndex} (pts {targetPts.TotalSeconds:0.000}s) after {draws} draws in {budget.Elapsed.TotalSeconds:0.0}s (decoded={hapSource.DecodedFrames} faulted={hapSource.IsFaulted}).");
+                if (BcnReference.Supports(demux.DeclaredFormat))
+                {
+                    var sample = demux.Samples[sampleIndex];
+                    var compressed = new byte[sample.Size];
+                    using (var file = File.OpenRead(hapClip))
+                    {
+                        file.Position = sample.FileOffset;
+                        file.ReadExactly(compressed);
+                    }
+                    var decoded = HapFrameDecoder.Decode(compressed);
+                    int w = hapSource.Width, h = hapSource.Height;
+                    var (chromatic, brightest) = BcnReference.FindReferenceTexels(decoded.Data, decoded.Format, w, h, step: 4);
+                    log.Info("Stress", $"  hap sample {sampleIndex} (pts {targetPts.TotalSeconds:0.000}s, {draws} draws to reach it) of {hapClip}: " +
+                                       $"most chromatic texel {chromatic}, brightest texel {brightest}");
+                    foreach (var ((tx, ty), kind) in new[] { (chromatic, "most chromatic"), (brightest, "brightest") })
+                    {
+                        // A TargetSize-texel window whose centre fragment (i.uv = 32.5/64) samples texel (tx, ty) exactly:
+                        // x = (x0 + 32.5) - 0.5 = tx when x0 = tx - 32 (clamped into the frame, then re-derived).
+                        var x0 = Math.Clamp(tx - TargetSize / 2, 0, w - TargetSize);
+                        var y0 = Math.Clamp(ty - TargetSize / 2, 0, h - TargetSize);
+                        var window = new UvRect((float)x0 / w, (float)y0 / h, (float)(x0 + TargetSize) / w, (float)(y0 + TargetSize) / h);
+                        var u = (x0 + TargetSize / 2 + 0.5f) / w;
+                        var v = (y0 + TargetSize / 2 + 0.5f) / h;
+                        var reference = BcnReference.Sample(decoded.Data, decoded.Format, w, h, u, v);
+                        if (kind == "most chromatic" && BcnReference.ChromaSensitivity(reference) <= HapTolerance)
+                            log.Info("Stress", $"  NOTE: the most chromatic texel decodes to ({reference.R},{reference.G},{reference.B}), chroma sensitivity {BcnReference.ChromaSensitivity(reference)} <= ±{HapTolerance} — " +
+                                               $"this clip is (near) greyscale at sample {sampleIndex}, so this run does NOT prove the chroma channels/sign/scale; use a colour HapQ clip for that.");
+                        var pixels = RenderTarget(loop, provider, hapPass, renderPass, uniforms, target, readback, window, targetPts);
+                        var centre = Pixel(pixels, TargetSize / 2, TargetSize / 2);
+                        var nonClear = centre != ((byte)0, (byte)0, (byte)0);
+                        var match = Report(log, $"hap {kind} texel ({x0 + TargetSize / 2},{y0 + TargetSize / 2}) in window {window} vs CPU {decoded.Format} reference", reference, centre, HapTolerance);
+                        passedChecks += match == 1 && nonClear ? 1 : 0;
+                        if (!nonClear)
+                            log.Error("Stress", $"  FAIL hap {kind} centre is the clear colour (0,0,0).");
+                    }
+                    hapSource.Stop();
+                }
+                else
+                {
+                    // Unexercised: no fixture in the media set is BC4 (HAP Alpha) or BC7 (HAP R); this branch has never run.
+                    var pixels = RenderTarget(loop, provider, hapPass, renderPass, uniforms, target, readback, UvRect.Full, targetPts);
+                    hapSource.Stop();
+                    var centre = Pixel(pixels, TargetSize / 2, TargetSize / 2);
+                    var corners = new[] { Pixel(pixels, 0, 0), Pixel(pixels, TargetSize - 1, 0), Pixel(pixels, 0, TargetSize - 1), Pixel(pixels, TargetSize - 1, TargetSize - 1) };
+                    var nonClear = centre != ((byte)0, (byte)0, (byte)0);
+                    var nonUniform = corners.Any(c => c != centre) || corners.Distinct().Count() > 1;
+                    log.Info("Stress", $"  NOTE: no CPU reference for {demux.DeclaredFormat}; the hap check is non-clear + non-uniform only. " +
+                                       $"centre=({centre.R},{centre.G},{centre.B}) corners=[{string.Join(" ", corners.Select(c => $"({c.R},{c.G},{c.B})"))}]");
+                    passedChecks += Report(log, $"hap sample {sampleIndex} non-clear + non-uniform", nonClear && nonUniform);
+                }
+            }
+            else
+                log.Info("Stress", "NOTE: no HAP clip (--video or MULTIMON_HAP_FIXTURE) — the hap check is skipped.");
         }
         catch (Exception ex)
         {
@@ -123,10 +219,13 @@ internal static class SourceCheck
             // Teardown order: render loop stopped and joined → passes (persistent textures) → timelines (frames)
             // → the check's own textures/buffers → device.
             loop.Stop();
+            hapSource?.Stop();
             quadrantPass?.Dispose();
             ycocgPass?.Dispose();
+            hapPass?.Dispose();
             quadrantTimeline?.Dispose();
             ycocgTimeline?.Dispose();
+            hapSource?.Dispose();
             renderPass?.Dispose();
             DisposeTexture(provider, quadrantTexture);
             DisposeTexture(provider, ycocgTexture);
@@ -146,10 +245,21 @@ internal static class SourceCheck
         return passed ? 0 : 1;
     }
 
-    /// <summary>Draws <paramref name="pass"/> through <paramref name="uv"/> on the render thread, blits the
-    /// target into the readback buffer, waits for completion, and returns the centre pixel as (r, g, b).</summary>
     private static (byte R, byte G, byte B) RenderCentrePixel(RenderLoop loop, GraphicsDeviceProvider provider,
-        FullscreenQuadPass pass, MTLRenderPassDescriptor renderPass, IMTLBuffer uniforms, IMTLTexture target, IMTLBuffer readback, UvRect uv)
+        FullscreenQuadPass pass, MTLRenderPassDescriptor renderPass, IMTLBuffer uniforms, IMTLTexture target, IMTLBuffer readback, UvRect uv) =>
+        Pixel(RenderTarget(loop, provider, pass, renderPass, uniforms, target, readback, uv), TargetSize / 2, TargetSize / 2);
+
+    private static (byte R, byte G, byte B) Pixel(byte[] bgra, int x, int y)
+    {
+        var i = (y * TargetSize + x) * 4;
+        return (bgra[i + 2], bgra[i + 1], bgra[i]); // BGRA8 memory order
+    }
+
+    /// <summary>Draws <paramref name="pass"/> through <paramref name="uv"/> on the render thread, blits the
+    /// target into the readback buffer, waits for completion, and returns the whole target as BGRA8 bytes.</summary>
+    private static byte[] RenderTarget(RenderLoop loop, GraphicsDeviceProvider provider,
+        FullscreenQuadPass pass, MTLRenderPassDescriptor renderPass, IMTLBuffer uniforms, IMTLTexture target, IMTLBuffer readback, UvRect uv,
+        TimeSpan mediaTime = default)
     {
         if (!loop.Invoke(() =>
         {
@@ -157,12 +267,13 @@ internal static class SourceCheck
                 ?? throw new InvalidOperationException("command buffer creation failed.");
             try
             {
-                pass.Draw(commandBuffer, renderPass, uniforms, 0, TargetSize, TargetSize, TimeSpan.Zero, uv);
+                var read = pass.Draw(commandBuffer, renderPass, uniforms, 0, TargetSize, TargetSize, mediaTime, uv);
                 var blit = commandBuffer.BlitCommandEncoder ?? throw new InvalidOperationException("blit encoder creation failed.");
                 blit.CopyFromTexture(target, 0, 0, new MTLOrigin(0, 0, 0), new MTLSize(TargetSize, TargetSize, 1),
                     readback, 0, TargetSize * 4, TargetSize * TargetSize * 4);
                 blit.EndEncoding();
                 blit.Dispose();
+                read?.HoldUntilCompleted(commandBuffer); // the committer's hold, immediately before Commit (see FullscreenQuadPass.Draw)
                 commandBuffer.Commit();
                 commandBuffer.WaitUntilCompleted();
                 if (commandBuffer.Status != MTLCommandBufferStatus.Completed)
@@ -175,10 +286,15 @@ internal static class SourceCheck
         }))
             throw new InvalidOperationException("render thread not alive.");
 
-        var centre = (TargetSize / 2 * TargetSize + TargetSize / 2) * 4;
-        var bytes = new byte[4];
-        Marshal.Copy(readback.Contents + centre, bytes, 0, 4);
-        return (bytes[2], bytes[1], bytes[0]); // BGRA8 memory order
+        var bytes = new byte[TargetSize * TargetSize * 4];
+        Marshal.Copy(readback.Contents, bytes, 0, bytes.Length);
+        return bytes;
+    }
+
+    private static int Report(ILog log, string name, bool ok)
+    {
+        log.Info("Stress", $"  {(ok ? "PASS" : "FAIL")} {name}");
+        return ok ? 1 : 0;
     }
 
     /// <summary>Logs one check; returns 1 when it passed, 0 when it failed.</summary>

@@ -263,9 +263,10 @@ public sealed class OutputWindow
             ?? throw new InvalidOperationException($"{Name}: command buffer creation failed.");
         try
         {
+            DecodedFrame? read = null;
             if (Content is { } pass)
             {
-                pass.Draw(commandBuffer, _renderPass!, _uniforms!, offset, _width, _height, time, _uv);
+                read = pass.Draw(commandBuffer, _renderPass!, _uniforms!, offset, _width, _height, time, _uv);
             }
             else
             {
@@ -276,6 +277,7 @@ public sealed class OutputWindow
             commandBuffer.AddCompletedHandler(_onCompleted);
             _renderPhase = "present";
             commandBuffer.PresentDrawable(drawable);
+            read?.HoldUntilCompleted(commandBuffer); // last thing before Commit: nothing can abandon the buffer in between
             commandBuffer.Commit();
         }
         finally

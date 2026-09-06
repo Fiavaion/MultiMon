@@ -203,10 +203,10 @@ assemblies in "Solution structure". Commit on a `mac-port` branch: `Scaffold the
 
 ## 6. Dev-phase TODO list (in order; each ends in a checkable gate)
 
-- [ ] **TODO 0 — Install routing** (section 3). Gate: `/agents` lists all eight; `modelswitcher` loads.
+- [x] **TODO 0 — Install routing** (section 3). Gate: `/agents` lists all eight; `modelswitcher` loads.
       *If `mac-handoff/` is missing, hardcode from Appendix A–C.*
-- [ ] **TODO 1 — Scaffold `MultiMon.Mac.sln`** (section 4). Gate: builds empty, 0 warnings; `MultiMon.Core.Tests` still 126/126.
-- [ ] **TODO 2 — `MultiMon.Platform.Mac`: `NSScreen` monitor service.** `MonitorInfo.DeviceId` = the
+- [x] **TODO 1 — Scaffold `MultiMon.Mac.sln`** (section 4). Gate: builds empty, 0 warnings; `MultiMon.Core.Tests` still 126/126.
+- [x] **TODO 2 — `MultiMon.Platform.Mac`: `NSScreen` monitor service.** `MonitorInfo.DeviceId` = the
       `CGDirectDisplayID` as a string (an opaque key — all `ShowPlanner` does with it); `Bounds` in pixels,
       matching the Windows contract — **origins:** AppKit global points × the *primary* screen's backing scale,
       Y flipped about the primary's top edge; **sizes:** each screen's own points × its own backing scale
@@ -216,7 +216,7 @@ assemblies in "Solution structure". Commit on a `mac-port` branch: `Scaffold the
       Gate: a small console program lists every attached display with correct pixel bounds; a `ShowPlanner`
       Span plan over that list matches the Windows plan for the same geometry (add it as a
       `MultiMon.Core.Tests` case using the real values).
-- [ ] **TODO 3 — `MultiMon.Graphics.Mac`** (`stability-core` agent). One `MTLDevice`
+- [x] **TODO 3 — `MultiMon.Graphics.Mac`** (`stability-core` agent). One `MTLDevice`
       (`MTLCreateSystemDefaultDevice`; on multi-GPU Macs pick the device driving the most outputs and log the
       candidates — the Windows adapter rule). One borderless `NSWindow` + `CAMetalLayer` per screen, created
       ONCE, shown/hidden per perform, never recreated. Render loop on one dedicated thread;
@@ -224,10 +224,12 @@ assemblies in "Solution structure". Commit on a `mac-port` branch: `Scaffold the
       + UV sub-rect + HapQ shader from `MultiMon.Graphics/QuadPipeline.cs` HLSL to MSL.
       Gate: `MultiMon.Stress.Mac --cycles=50 --windows=N` on the test pattern: zero wedge, zero sustained
       resource growth, flat RSS.
-- [ ] **TODO 4 — `MultiMon.Decode.Mac`, HAP first.** `HapSource` twin: `MultiMon.Hap` decodes, upload via
+- [x] **TODO 4 — `MultiMon.Decode.Mac`, HAP first.** `HapSource` twin: `MultiMon.Hap` decodes, upload via
       `replaceRegion` (`bc1_rgba`, `bc3_rgba`, `bc4_rUnorm`, `bc7_rgbaUnorm`), pooled buffers returned in the
       frame's release closure, same length/format validation as Windows.
       Gate: harness `--hap --mode=span` 50 cycles PASS; HAP visibly playing on two screens.
+      *Done 2026-09-06.* The 5sec fixture is greyscale; `--source-check --hap --video=…/Hap/colour_hapq.mov` (HAP-Q
+      testsrc2, generated with ffmpeg) is the chroma gate — the check NOTEs when a clip cannot prove chroma.
 - [ ] **TODO 5 — `MultiMon.Decode.Mac`, VideoToolbox.** `VTDecompressionSession` with
       `kCVPixelBufferMetalCompatibilityKey`; `CVMetalTextureCache` for zero copy; BGRA output for parity with
       the Windows pass (NV12 + a YUV→RGB MSL pass only if measured to matter); assert the first frame's

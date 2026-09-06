@@ -55,7 +55,9 @@ public sealed class FullscreenQuadPass : IDisposable
     /// <summary>
     /// Binds the decode source this pass samples and creates the persistent source texture (sized to the
     /// video) it copies each frame into. <paramref name="format"/> is the decoder's upload format (BGRA8 for
-    /// VideoToolbox; a BCn format for HAP) and <paramref name="useYCoCg"/> selects the HapQ pipeline. Called
+    /// VideoToolbox; a BCn format for HAP — the persistent texture is created in that SAME format, the blit in
+    /// Draw is format-to-format, and the sampler decompresses BCn on read) and <paramref name="useYCoCg"/>
+    /// selects the HapQ pipeline. Called
     /// ONCE, off the render thread, before the pass is shown. A second bind is rejected so the persistent
     /// texture is never rebuilt; a throwing bind leaves the pass unbound with no device objects.
     /// </summary>
@@ -83,18 +85,22 @@ public sealed class FullscreenQuadPass : IDisposable
     /// it through <paramref name="uv"/>; the pattern path animates by the media seconds. The uniform block is
     /// written into the output's ring slot at <paramref name="uniformBuffer"/>+<paramref name="uniformOffset"/>
     /// (the output guarantees that slot's previous reader has completed).
+    /// Returns the decoded frame whose read this command buffer now encodes, or null. INVARIANT: the caller
+    /// takes that frame's <see cref="DecodedFrame.HoldUntilCompleted"/> in the same scope that commits,
+    /// immediately before Commit, so a command buffer abandoned before Commit never strands a hold.
     /// </summary>
-    internal void Draw(IMTLCommandBuffer commandBuffer, MTLRenderPassDescriptor renderPass, IMTLBuffer uniformBuffer,
+    internal DecodedFrame? Draw(IMTLCommandBuffer commandBuffer, MTLRenderPassDescriptor renderPass, IMTLBuffer uniformBuffer,
         int uniformOffset, int width, int height, TimeSpan mediaTime, UvRect uv)
     {
         var pipeline = _provider.QuadPipeline;
         var hasSource = _source is not null;
+        DecodedFrame? read = null;
         if (hasSource)
         {
             // Select the frame for the clock time and blit it into the persistent texture — unless it is the
             // frame already there. Lifetime: the frame is alive for the whole callback (only PASSED frames are
             // disposed, after it returns) and the command buffer retains the source texture until it completes.
-            if (_source!.SelectInto(mediaTime, frame => CopyFrameIfNew(commandBuffer, frame)))
+            if (_source!.SelectInto(mediaTime, frame => { if (CopyFrameIfNew(commandBuffer, frame)) read = frame; }))
                 _hasContent = true;
         }
 
@@ -109,7 +115,7 @@ public sealed class FullscreenQuadPass : IDisposable
         try
         {
             if (hasSource && !_hasContent)
-                return; // no decoded frame yet: the pass's clear leaves black rather than stale memory (no wedge)
+                return null; // no decoded frame yet: the pass's clear leaves black rather than stale memory (no wedge)
 
             encoder.SetViewport(new MTLViewport(0, 0, width, height, 0, 1));
             encoder.SetFragmentBuffer(uniformBuffer, (nuint)uniformOffset, 0);
@@ -130,13 +136,21 @@ public sealed class FullscreenQuadPass : IDisposable
             encoder.EndEncoding();
             encoder.Dispose();
         }
+        return read;
     }
 
-    /// <summary>Blits one decoded frame into the persistent source texture unless it is already there.</summary>
-    private void CopyFrameIfNew(IMTLCommandBuffer commandBuffer, DecodedFrame frame)
+    /// <summary>
+    /// Blits one decoded frame into the persistent source texture unless it is already there; returns true when
+    /// a copy was encoded. The copy is only ENCODED here; the committer holds the frame
+    /// (<see cref="DecodedFrame.HoldUntilCompleted"/>) until this command buffer completes, so the timeline
+    /// disposing the frame right after this returns cannot recycle a texture the GPU has not read yet. The
+    /// frame's format must equal the bound format: a BCn source blits BCn→BCn whole-texture (block-aligned by
+    /// construction), BGRA→BGRA for VideoToolbox.
+    /// </summary>
+    private bool CopyFrameIfNew(IMTLCommandBuffer commandBuffer, DecodedFrame frame)
     {
         if (ReferenceEquals(frame, _lastCopied))
-            return;
+            return false;
         var blit = commandBuffer.BlitCommandEncoder
             ?? throw new InvalidOperationException("Metal blit encoder creation failed.");
         try
@@ -150,6 +164,7 @@ public sealed class FullscreenQuadPass : IDisposable
             blit.Dispose();
         }
         _lastCopied = frame;
+        return true;
     }
 
     /// <summary>Releases the source texture. PRECONDITION: the render loop is stopped (no command buffer may
