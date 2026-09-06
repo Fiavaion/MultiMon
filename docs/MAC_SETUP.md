@@ -3,8 +3,8 @@
 **Audience:** the Claude Code instance opened on the Mac, first session. Read this file top to bottom before
 touching anything. It is written to be followed literally; every step ends in a check you can run.
 
-**What you are inheriting:** the Windows app at `master` = `0c395c0` (2026-09-04), audited and fixed the same
-day, harness-green, zero known bugs. The portable half (`MultiMon.Core`, `MultiMon.Hap`, `MultiMon.Core.Tests`)
+**What you are inheriting:** the Windows app at `master` = `2a00473` (2026-09-06): the 2026-09-04 audit build (`0c395c0`)
+plus the final brand idents, Windows/macOS icon sets and the wired `ApplicationIcon`; harness-green, zero known bugs. The portable half (`MultiMon.Core`, `MultiMon.Hap`, `MultiMon.Core.Tests`)
 already builds and tests on macOS with no Mac code written. Your job is to add the macOS platform layers
 behind the existing Core abstractions, gated by a Mac stress harness, without touching the Windows build.
 
@@ -27,7 +27,7 @@ The project folder was zipped whole, so these travel with it. Confirm each is pr
 | `notes/` (`CURRENT_STATUS.md`, `TODOs.md`, `lessons.md`) | gitignored continuity files; the restart package |
 | `docs/` (`MAC_PORT.md`, `adr/`, `sessions/2026-09-04-full-audit.md`) | the port plan, the founding ADRs, the audit record |
 | `mac-handoff/` | copies of the **global** `~/.claude` routing files (agents, modelswitcher skill, global `CLAUDE.md`, routing keys from `settings.json`). These do NOT live in the project on Windows; they were copied in for the transfer. Section 3 installs them. If the folder is missing, Appendix A–C contain the same files verbatim. |
-| `.git/` | full history (9.6 MB). `origin` = `https://github.com/Fiavaion/MultiMon.git`; `master` and `rebuild` are pushed and equal (app code `0c395c0` + the runbook commits). |
+| `.git/` | full history (9.6 MB). `origin` = `https://github.com/Fiavaion/MultiMon.git`; `master` and `rebuild` are pushed and equal (`2a00473` + this runbook commit). |
 | `Old/`, `OldProjectDoNotTouch/` | legacy LibVLC app, read-only reference (salvage logic, never code) |
 
 Not in the zip and needed: **test media**. Copy `D:\testing Videos\` (at minimum `Hap\5sec_hap.mov`, one
@@ -43,7 +43,7 @@ find . -type d \( -name bin -o -name obj \) -not -path './Old/*' -prune -exec rm
 rm -rf .claude/worktrees
 git status --short | head           # expect: empty (mac-handoff/ and notes/ are ignored)
 git log --oneline -1                # expect the newest master commit ("docs: macOS setup ..." or later);
-                                    # the app code itself is at 0c395c0 (2026-09-04)
+                                    # app code + icons at 2a00473 (2026-09-06)
 ```
 
 ---
