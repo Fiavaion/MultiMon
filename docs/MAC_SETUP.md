@@ -207,8 +207,11 @@ assemblies in "Solution structure". Commit on a `mac-port` branch: `Scaffold the
       *If `mac-handoff/` is missing, hardcode from Appendix A–C.*
 - [ ] **TODO 1 — Scaffold `MultiMon.Mac.sln`** (section 4). Gate: builds empty, 0 warnings; `MultiMon.Core.Tests` still 126/126.
 - [ ] **TODO 2 — `MultiMon.Platform.Mac`: `NSScreen` monitor service.** `MonitorInfo.DeviceId` = the
-      `CGDirectDisplayID` as a string (an opaque key — all `ShowPlanner` does with it); `Bounds` in
-      global-desktop points × backing scale (pixels, matching the Windows contract); `IsPrimary` = the screen
+      `CGDirectDisplayID` as a string (an opaque key — all `ShowPlanner` does with it); `Bounds` in pixels,
+      matching the Windows contract — **origins:** AppKit global points × the *primary* screen's backing scale,
+      Y flipped about the primary's top edge; **sizes:** each screen's own points × its own backing scale
+      (one uniform unit for positions, else a Retina + non-Retina pair overlaps and Span collapses to 1×1);
+      `RefreshRate` = the *current* `CGDisplayMode` rate (not `MaximumFramesPerSecond`); `IsPrimary` = the screen
       with the menu bar; `MonitorsChanged` from `NSApplication.didChangeScreenParametersNotification`.
       Gate: a small console program lists every attached display with correct pixel bounds; a `ShowPlanner`
       Span plan over that list matches the Windows plan for the same geometry (add it as a
