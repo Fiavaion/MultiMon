@@ -1,7 +1,13 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <ItemGroup>
     <ProjectReference Include="..\MultiMon.Core\MultiMon.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="Shaders\Quad.metal" LogicalName="MultiMon.Graphics.Mac.Shaders.Quad.metal" />
+    <!-- The harness drives the render-thread-only Draw against an offscreen target (the source-check mode), as MultiMon.Control does for MultiMon.Stress. -->
+    <InternalsVisibleTo Include="MultiMon.Stress.Mac" />
   </ItemGroup>
 
   <PropertyGroup>
