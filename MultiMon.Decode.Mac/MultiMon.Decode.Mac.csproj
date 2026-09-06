@@ -1,0 +1,16 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\MultiMon.Core\MultiMon.Core.csproj" />
+    <ProjectReference Include="..\MultiMon.Hap\MultiMon.Hap.csproj" />
+    <ProjectReference Include="..\MultiMon.Graphics.Mac\MultiMon.Graphics.Mac.csproj" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <TargetFramework>net9.0-macos</TargetFramework>
+    <SupportedOSPlatformVersion>12.0</SupportedOSPlatformVersion>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+</Project>

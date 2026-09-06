@@ -1,0 +1,31 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <ApplicationId>com.fiavaion.multimon.control</ApplicationId>
+    <TargetFramework>net9.0-macos</TargetFramework>
+    <SupportedOSPlatformVersion>12.0</SupportedOSPlatformVersion>
+    <!-- Workload 26.5 pins Xcode 26.5; the installed Xcode is newer (26.6). Newer is safe; the check is major.minor equality. -->
+    <ValidateXcodeVersion>false</ValidateXcodeVersion>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Avalonia" Version="12.1.2" />
+    <PackageReference Include="Avalonia.Desktop" Version="12.1.2" />
+    <PackageReference Include="Avalonia.Themes.Fluent" Version="12.1.2" />
+    <PackageReference Include="Avalonia.Fonts.Inter" Version="12.1.2" />
+    <PackageReference Include="AvaloniaUI.DiagnosticsSupport" Version="2.2.3">
+      <IncludeAssets Condition="'$(Configuration)' != 'Debug'">None</IncludeAssets>
+      <PrivateAssets Condition="'$(Configuration)' != 'Debug'">All</PrivateAssets>
+    </PackageReference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\MultiMon.Core\MultiMon.Core.csproj" />
+    <ProjectReference Include="..\MultiMon.Hap\MultiMon.Hap.csproj" />
+    <ProjectReference Include="..\MultiMon.Platform.Mac\MultiMon.Platform.Mac.csproj" />
+    <ProjectReference Include="..\MultiMon.Graphics.Mac\MultiMon.Graphics.Mac.csproj" />
+    <ProjectReference Include="..\MultiMon.Decode.Mac\MultiMon.Decode.Mac.csproj" />
+    <ProjectReference Include="..\MultiMon.Audio.Mac\MultiMon.Audio.Mac.csproj" />
+  </ItemGroup>
+</Project>
