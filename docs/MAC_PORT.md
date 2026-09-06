@@ -94,3 +94,8 @@ as the Windows one: **50 open/close cycles, zero wedge, no sustained resource gr
   growth, exactly as `StressHarness` does today.
 - The same modes must be gated: span, split, individual, HAP, and audio.
 - Cycle counts, wedge detection and the warm-up window carry over unchanged; only the counter is new.
+
+## App icon (ready, not yet bundled)
+The macOS icon is pre-built at `Ident/icons/MultiMon.icns` (PNG-in-ICNS, all sizes 16→1024 incl. @2x) with the matching
+`Ident/icons/MultiMon.iconset/` folder. When the app bundle exists, copy the `.icns` to `Contents/Resources/MultiMon.icns`
+and set `CFBundleIconFile` = `MultiMon` in `Info.plist`. Regenerate from the idents with `python Ident/icons/_build_icons.py`.

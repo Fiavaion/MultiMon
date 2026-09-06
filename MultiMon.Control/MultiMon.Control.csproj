@@ -21,6 +21,7 @@
     <!-- Per-monitor-V2 DPI awareness (see app.manifest): aligns the bare D3D11 output-window placement
          with MonitorService's physical-pixel bounds on mixed-DPI multi-monitor layouts. -->
     <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>Assets\MultiMon.ico</ApplicationIcon>
   </PropertyGroup>
 
 </Project>
