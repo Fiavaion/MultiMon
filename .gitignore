@@ -91,3 +91,6 @@ desktop.ini
 
 # Mac transfer bundle (copies of ~/.claude routing files; not part of the app)
 mac-handoff/
+
+# Branding work-in-progress (ComfyUI candidates, ~540 MB); finals are committed under Images/
+Ident/candidates/
