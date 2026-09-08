@@ -237,10 +237,12 @@ assemblies in "Solution structure". Commit on a `mac-port` branch: `Scaffold the
       Gate: harness `--mode=individual --video --video2` 50 cycles PASS; 4K H.264 and HEVC play.
       *Done 2026-09-08.* BGRA via CVMetalTextureCache (unpaced 4K decode 412 fps, so no NV12 pass). HEVC clips
       generated with `hevc_videotoolbox` into `MultiMonMedia/`; `colour_h264.mp4` is the VT readback fixture.
-- [ ] **TODO 6 — `MultiMon.Audio.Mac`.** Port `AudioRing` (pure); `AVAudioEngine` or `AudioUnit` output per
+- [x] **TODO 6 — `MultiMon.Audio.Mac`.** Port `AudioRing` (pure); `AVAudioEngine` or `AudioUnit` output per
       track; drift correction against `MasterClock` (copy the one-shot proportional policy from
       `WasapiOutput`); device selection by `AudioTrack.OutputDeviceId`; device-invalidated rebuild.
       Gate: harness `--audio` 30 cycles, 0 underruns, peak drift under 40 ms.
+      *Done 2026-09-08.* AUHAL per track (device-selectable; AVAudioEngine cannot target a device). `AudioRing` moved to
+      `MultiMon.Core/Audio` (namespace `MultiMon.Audio` kept) — **needs one Windows build of `MultiMon.sln` before merge.**
 - [ ] **TODO 7 — Mac `PerformanceController` + `MultiMon.Stress.Mac --controller`.** Same shape as
       Windows: one worker thread, `BlockingCollection<Action>` FIFO, UI posts and returns, `StateChanged` /
       `CommandFailed` events, `ShowPlanner` for the mapping (no port needed), symmetric decode ladder (`.mov`
