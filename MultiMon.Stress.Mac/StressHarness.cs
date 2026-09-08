@@ -5,29 +5,34 @@ using MultiMon.Core.Diagnostics;
 using MultiMon.Core.Models;
 using MultiMon.Core.Sync;
 using MultiMon.Core.Timing;
-using MultiMon.Decode.Mac.Hap;
+using MultiMon.Decode.Mac;
 using MultiMon.Graphics.Mac;
 using MultiMon.Platform.Mac;
 
 namespace MultiMon.Stress.Mac;
 
-/// <summary>How HAP sources bind to outputs: Span = ONE source, each output samples its UvLayout slice;
+/// <summary>How clip sources bind to outputs: Span = ONE source, each output samples its UvLayout slice;
 /// Individual = one source per output, full frame (the multi-decoder concurrency path).</summary>
 public enum HapMode { Span, Individual }
 
+/// <summary><paramref name="Hap"/> refuses the ladder's VideoToolbox fallthrough (a HAP gate must run HAP);
+/// <paramref name="Video2"/> feeds the second output in Individual mode; <paramref name="ForceSwDecode"/> forces the
+/// VideoToolbox software session (the Windows <c>--force-sw-decode</c>).</summary>
 public sealed record StressOptions(int Cycles, int Windows, bool Fullscreen, int SoakSeconds, bool SourceCheck,
-    bool Hap, string? Video, HapMode Mode);
+    bool Hap, string? Video, string? Video2, bool ForceSwDecode, HapMode Mode);
 
 /// <summary>
 /// The Mac twin of <c>MultiMon.Stress.StressHarness</c>'s bind-once loop: build the persistent Metal pipeline
 /// ONCE, then churn EnterPerform (show + bind) → hold until frames complete (the wedge detector) → ExitPerform
 /// (unbind + hide) WITHOUT destroying anything. Cycles alternate the test pattern with a bound SOURCE (a frame
 /// published through <see cref="FrameTimeline"/> each sourced cycle, sampled through a quadrant UV rect) so the
-/// decode→render handoff churns under the same growth gate. With <c>--hap --video=CLIP</c> every cycle is the
-/// app's real per-perform path instead: create + start HapSource(s) on the persistent device → bind → hold
-/// while the clip advances (asserted from each source's PTS against the MasterClock) → unbind → stop (join,
-/// off the main thread) → dispose → sample. <c>--mode=span</c> shares ONE source across the outputs through
-/// their UvLayout slices; <c>--mode=individual</c> gives each output its own source. After a short warm-up the tracked
+/// decode→render handoff churns under the same growth gate. With <c>--video=CLIP</c> every cycle is the
+/// app's real per-perform path instead: open the clip through the real decode ladder (<see cref="SourceLadder"/>:
+/// HAP for a HAP .mov, else VideoToolbox; <c>--hap</c> refuses the fallthrough) + start the source(s) on the
+/// persistent device → bind → hold while the clip advances (asserted from each source's PTS against the
+/// MasterClock) → unbind → stop (join, off the main thread) → dispose → sample. <c>--mode=span</c> shares ONE
+/// source across the outputs through their UvLayout slices; <c>--mode=individual</c> gives each output its own
+/// source (<c>--video2</c> for the second). After a short warm-up the tracked
 /// Metal object count is the baseline and ANY later growth fails the run — growth is an ownership bug,
 /// never something to mask (LESSON-BUG-001). A watchdog fails the run loudly if a cycle does not complete
 /// within <see cref="CycleDeadline"/>, printing the stuck state. Runs on its own thread; the main thread
@@ -44,15 +49,17 @@ public static class StressHarness
 
     public static bool TryParse(string[] args, out StressOptions options)
     {
-        options = new StressOptions(50, 1, false, 0, false, false, null, HapMode.Span);
+        options = new StressOptions(50, 1, false, 0, false, false, null, null, false, HapMode.Span);
         var cycles = 50; var windows = 1; var fullscreen = false; var soak = 0; var sourceCheck = false;
-        var hap = false; string? video = null; var mode = HapMode.Span;
+        var hap = false; string? video = null; string? video2 = null; var forceSw = false; var mode = HapMode.Span;
         foreach (var arg in args)
         {
             if (arg == "--fullscreen") fullscreen = true;
             else if (arg == "--source-check") sourceCheck = true;
             else if (arg == "--hap") hap = true;
             else if (arg.StartsWith("--video=", StringComparison.Ordinal) && arg.Length > "--video=".Length) video = arg["--video=".Length..];
+            else if (arg.StartsWith("--video2=", StringComparison.Ordinal) && arg.Length > "--video2=".Length) video2 = arg["--video2=".Length..];
+            else if (arg == "--force-sw-decode") forceSw = true;
             else if (arg == "--mode=span") mode = HapMode.Span;
             else if (arg == "--mode=individual") mode = HapMode.Individual;
             else if (arg.StartsWith("--cycles=", StringComparison.Ordinal) && int.TryParse(arg["--cycles=".Length..], out var c) && c > 0) cycles = c;
@@ -60,32 +67,31 @@ public static class StressHarness
             else if (arg.StartsWith("--soak-seconds=", StringComparison.Ordinal) && int.TryParse(arg["--soak-seconds=".Length..], out var s) && s >= 0) soak = s;
             else return false;
         }
-        options = new StressOptions(cycles, windows, fullscreen, soak, sourceCheck, hap, video, mode);
+        options = new StressOptions(cycles, windows, fullscreen, soak, sourceCheck, hap, video, video2, forceSw, mode);
         return true;
     }
 
     /// <summary>Runs the gate; returns the process exit code (0 = PASS, 1 = FAIL).</summary>
     public static int Run(StressOptions options, ILog log)
     {
-        var hapPath = ResolveHapClip(options, log);
-        if (options.Video is not null && !options.Hap)
-        {
-            log.Error("Stress", "--video needs --hap on the Mac until VideoToolbox lands (TODO 5).");
-            return 2;
-        }
-        if (options.Hap && hapPath is null)
+        var clipPath = options.Video ?? ResolveHapClip(options, log);
+        if (options.Hap && clipPath is null)
         {
             // Never degrade a HAP gate to the test pattern: that would report PASS for a path that never ran.
             log.Error("Stress", "--hap needs a clip: pass --video=<HAP .mov> or set MULTIMON_HAP_FIXTURE=<HAP .mov>.");
             return 2;
         }
         if (options.SourceCheck)
-            return SourceCheck.Run(log, hapPath ?? ResolveHapClip(options with { Hap = true }, log));
+            return SourceCheck.Run(log, clipPath ?? ResolveHapClip(options with { Hap = true }, log), ResolveVideoToolboxClip(options, log));
 
-        var (cycles, windows, fullscreen, soakSeconds, _, _, _, mode) = options;
+        var (cycles, windows, fullscreen, soakSeconds, _, requireHap, _, video2, forceSw, mode) = options;
+        // Per-source clip list: Individual mode gives output i clip i (the second from --video2, else the first again).
+        var clips = clipPath is null ? Array.Empty<string>() : video2 is null ? [clipPath] : [clipPath, video2];
+        if (video2 is not null && (clipPath is null || mode != HapMode.Individual))
+            log.Info("Stress", "NOTE: --video2 only feeds the second source in --mode=individual with --video — ignored.");
         log.Info("Stress", $"cycles={cycles} windows={windows} fullscreen={fullscreen} soakSeconds={(soakSeconds > 0 ? soakSeconds.ToString() : "off")} " +
-                           (hapPath is not null ? $"content=HAP {hapPath} mode={mode} (sources created/started/stopped/disposed per cycle)"
-                                                : "content=test pattern / bound source (alternating cycles)"));
+                           (clipPath is not null ? $"content={string.Join(" + ", clips)} mode={mode} requireHap={requireHap} forceSwDecode={forceSw} (sources created/started/stopped/disposed per cycle)"
+                                                 : "content=test pattern / bound source (alternating cycles)"));
 
         // Monitors: NSScreen is read on the main thread, exactly as the app will.
         var monitors = MainThread.Invoke(() =>
@@ -129,7 +135,7 @@ public static class StressHarness
         IMTLTexture? frameTexture = null;
         FrameTimeline? sourceTimeline = null;
         FullscreenQuadPass? sourcePass = null;
-        if (hapPath is null)
+        if (clipPath is null)
         {
             frameTexture = SourceCheck.CreateQuadrantTexture(provider);
             sourceTimeline = new FrameTimeline();
@@ -138,10 +144,10 @@ public static class StressHarness
         }
         var framesPublished = 0;
         var framesReleased = 0;
-        // HAP: per-cycle sources + their passes (a pass is one persistent texture bound to one source, as in the
+        // Clips: per-cycle sources + their passes (a pass is one persistent texture bound to one source, as in the
         // Windows PerformanceController); the counters must all equal cycles × sources-per-cycle at the end.
-        var hapSources = new List<HapSource>();
-        var hapPasses = new List<FullscreenQuadPass>();
+        var clipSources = new List<IMetalSource>();
+        var clipPasses = new List<FullscreenQuadPass>();
         int sourcesStarted = 0, sourcesStopped = 0, sourcesDisposed = 0, texturesOutstandingAtDispose = 0;
         var contentFail = false;
         var outputs = Array.Empty<OutputWindow>();
@@ -187,29 +193,29 @@ public static class StressHarness
                 Volatile.Write(ref currentCycle, cycle);
 
                 // EnterPerform: show + bind. The device, windows, layers and pipeline are NEVER touched.
-                // HAP: the app's per-perform path — new source(s) + pass(es) on the persistent device, clock from 0
-                // (PerformanceController.EnterPerform). Pattern runs: even cycles bind the quadrant source pass,
-                // publishing one frame (ascending PTS = the paused clock's media time).
-                var sourced = hapPath is not null || cycle % 2 == 0;
-                var label = hapPath is not null ? $"hap-{mode.ToString().ToLowerInvariant()}" : sourced ? "source" : "pattern";
+                // Clips: the app's per-perform path — new source(s) via the ladder + pass(es) on the persistent device,
+                // clock from 0 (PerformanceController.EnterPerform). Pattern runs: even cycles bind the quadrant source
+                // pass, publishing one frame (ascending PTS = the paused clock's media time).
+                var sourced = clipPath is not null || cycle % 2 == 0;
+                var label = clipPath is not null ? $"clip-{mode.ToString().ToLowerInvariant()}" : sourced ? "source" : "pattern";
                 var ptsAtStart = Array.Empty<TimeSpan>();
-                if (hapPath is not null)
+                if (clipPath is not null)
                 {
                     var perCycle = mode == HapMode.Individual ? windows : 1;
                     for (var i = 0; i < perCycle; i++)
                     {
-                        var source = new HapSource(hapPath, provider, log, perCycle == 1 ? "hap" : $"hap{i + 1}");
-                        hapSources.Add(source);
+                        var source = SourceLadder.Open(clips[i % clips.Length], provider, log, requireHap, forceSw, perCycle == 1 ? "clip" : $"clip{i + 1}");
+                        clipSources.Add(source);
                         var p = new FullscreenQuadPass(provider);
-                        hapPasses.Add(p);
+                        clipPasses.Add(p);
                         p.BindSource(source.Frames, source.Width, source.Height, source.TextureFormat, source.UseYCoCg);
                     }
-                    foreach (var source in hapSources)
+                    foreach (var source in clipSources)
                     {
                         source.Start();
                         sourcesStarted++;
                     }
-                    ptsAtStart = hapSources.Select(s => s.CurrentPts).ToArray();
+                    ptsAtStart = clipSources.Select(s => s.CurrentPts).ToArray();
                     clock.Reset();
                 }
                 else if (sourced)
@@ -220,12 +226,13 @@ public static class StressHarness
                 for (var i = 0; i < windows; i++)
                 {
                     outputs[i].Show(bounds[i]);
-                    if (hapPath is not null)
+                    if (clipPath is not null)
                     {
                         var uv = mode == HapMode.Individual ? UvRect.Full : UvLayout.Spanning(i, bounds);
-                        outputs[i].SetContent(mode == HapMode.Individual ? hapPasses[i] : hapPasses[0], uv);
+                        var source = clipSources[mode == HapMode.Individual ? i : 0];
+                        outputs[i].SetContent(mode == HapMode.Individual ? clipPasses[i] : clipPasses[0], uv);
                         if (cycle == 1)
-                            log.Info("Stress", $"{outputs[i].Name} <- {hapSources[mode == HapMode.Individual ? i : 0].Id} uv={uv}");
+                            log.Info("Stress", $"{outputs[i].Name} <- {source.Id} ({source.GetType().Name}) uv={uv}");
                     }
                     else if (sourced)
                         outputs[i].SetContent(sourcePass, UvLayout.Quadrant(i % 2, (i / 2) % 2, 2, 2));
@@ -268,17 +275,17 @@ public static class StressHarness
                         log.Error("Stress", $"cycle {cycle:00}/{cycles}: WEDGE — {output.Name} still has command buffers in flight {WedgeTimeout.TotalSeconds:0}s after hide");
                     }
 
-                // HAP: the clip must have ADVANCED during the hold (PTS past its start value and at or ahead of
+                // Clips: each must have ADVANCED during the hold (PTS past its start value and at or ahead of
                 // the clock the render thread selected against — a stalled or starving decoder fails here), then the
-                // per-perform teardown in the controller's order: stop (join) → passes → sources (pool textures).
+                // per-perform teardown in the controller's order: stop (join) → passes → sources (frame textures).
                 var hapText = "";
-                if (hapPath is not null)
+                if (clipPath is not null)
                 {
                     var clockTime = clock.CurrentMediaTime;
                     var parts = new List<string>();
-                    for (var i = 0; i < hapSources.Count; i++)
+                    for (var i = 0; i < clipSources.Count; i++)
                     {
-                        var source = hapSources[i];
+                        var source = clipSources[i];
                         var pts = source.CurrentPts;
                         var ok = !source.IsFaulted && pts > ptsAtStart[i] && pts >= clockTime;
                         if (!ok)
@@ -290,7 +297,7 @@ public static class StressHarness
                     }
                     hapText = $", clock={clockTime.TotalSeconds:0.00}s {string.Join(" ", parts)}";
                     var joinWatch = Stopwatch.StartNew();
-                    TeardownHapSources(hapSources, hapPasses, ref sourcesStopped, ref sourcesDisposed, ref texturesOutstandingAtDispose);
+                    TeardownSources(clipSources, clipPasses, ref sourcesStopped, ref sourcesDisposed, ref texturesOutstandingAtDispose);
                     hapText += $", stop+dispose {joinWatch.Elapsed.TotalMilliseconds:0}ms";
                 }
 
@@ -344,7 +351,7 @@ public static class StressHarness
                 frameTexture.Dispose();
                 provider.Tracker.TextureDisposed();
             }
-            TeardownHapSources(hapSources, hapPasses, ref sourcesStopped, ref sourcesDisposed, ref texturesOutstandingAtDispose); // only non-empty after a failed cycle
+            TeardownSources(clipSources, clipPasses, ref sourcesStopped, ref sourcesDisposed, ref texturesOutstandingAtDispose); // only non-empty after a failed cycle
             provider.Release();
             provider.Dispose();
             log.Info("Stress", $"teardown complete: {provider.Tracker}");
@@ -356,18 +363,18 @@ public static class StressHarness
         var allocFail = allocGrowthMb > AllocatedGrowthLimitMb;
         var wsFail = wsGrowthMb > WorkingSetGrowthLimitMb;
         var frameFail = framesPublished != Volatile.Read(ref framesReleased);
-        var expectedSources = hapPath is null ? 0 : cycles * (mode == HapMode.Individual ? windows : 1);
+        var expectedSources = clipPath is null ? 0 : cycles * (mode == HapMode.Individual ? windows : 1);
         // A pooled texture still held by GPU work when its source was disposed = the fence and the teardown order
         // disagree (the render side had not completed its reads) — an ownership bug, so it fails the run.
         var sourceFail = sourcesStarted != expectedSources || sourcesStopped != expectedSources || sourcesDisposed != expectedSources || texturesOutstandingAtDispose != 0;
         var passed = completed == cycles && !wedged && !contentFail && !leakFail && !allocFail && !wsFail && !frameFail && !sourceFail && provider.Tracker.LiveCount == 0;
         log.Info("Stress", $"cycles={completed}/{cycles} wedges={(wedged ? 1 : 0)} framesCompleted={outputs.Sum(o => o.PresentCount)} " +
-                           (hapPath is null ? $"sourceFrames published={framesPublished} released={framesReleased} "
+                           (clipPath is null ? $"sourceFrames published={framesPublished} released={framesReleased} "
                                             : $"sources started={sourcesStarted} stopped={sourcesStopped} disposed={sourcesDisposed} (expected {expectedSources}) texturesOutstandingAtDispose={texturesOutstandingAtDispose} ") +
                            $"trackedBaseline={baseline} maxGrowth={maxGrowth} allocMaxGrowth={allocGrowthMb}MB rssMaxGrowth={wsGrowthMb}MB trackedAfterTeardown={provider.Tracker.LiveCount}");
         log.Info("Stress", passed
             ? "RESULT: PASS — all cycles clean, zero tracked-object growth, flat allocation and RSS."
-            : $"RESULT: FAIL — {(wedged ? "wedge detected" : contentFail ? "HAP source did not advance / faulted" : leakFail ? "tracked Metal object growth (ownership bug)" : allocFail ? $"device allocation growth {allocGrowthMb}MB > {AllocatedGrowthLimitMb}MB" : wsFail ? $"RSS growth {wsGrowthMb}MB > {WorkingSetGrowthLimitMb}MB" : frameFail ? $"source frames published={framesPublished} released={framesReleased} (frame ownership bug)" : sourceFail ? $"sources started={sourcesStarted} stopped={sourcesStopped} disposed={sourcesDisposed}, expected {expectedSources}; {texturesOutstandingAtDispose} pooled texture(s) still held at dispose" : provider.Tracker.LiveCount != 0 ? $"{provider.Tracker.LiveCount} tracked object(s) survived teardown" : "incomplete run")}.");
+            : $"RESULT: FAIL — {(wedged ? "wedge detected" : contentFail ? "clip source did not advance / faulted" : leakFail ? "tracked Metal object growth (ownership bug)" : allocFail ? $"device allocation growth {allocGrowthMb}MB > {AllocatedGrowthLimitMb}MB" : wsFail ? $"RSS growth {wsGrowthMb}MB > {WorkingSetGrowthLimitMb}MB" : frameFail ? $"source frames published={framesPublished} released={framesReleased} (frame ownership bug)" : sourceFail ? $"sources started={sourcesStarted} stopped={sourcesStopped} disposed={sourcesDisposed}, expected {expectedSources}; {texturesOutstandingAtDispose} pooled texture(s) still held at dispose" : provider.Tracker.LiveCount != 0 ? $"{provider.Tracker.LiveCount} tracked object(s) survived teardown" : "incomplete run")}.");
         return passed ? 0 : 1;
     }
 
@@ -386,10 +393,23 @@ public static class StressHarness
         return fixture;
     }
 
+    /// <summary>The known-colour H.264 clip for the source-check's VideoToolbox check: <c>--video2</c>, else the
+    /// MULTIMON_H264_FIXTURE path (noted), else null (the check is skipped, noted).</summary>
+    private static string? ResolveVideoToolboxClip(StressOptions options, ILog log)
+    {
+        if (options.Video2 is not null)
+            return options.Video2;
+        var fixture = Environment.GetEnvironmentVariable("MULTIMON_H264_FIXTURE");
+        if (string.IsNullOrEmpty(fixture))
+            return null;
+        log.Info("Stress", $"NOTE: --source-check without --video2 — using the MULTIMON_H264_FIXTURE clip {fixture}.");
+        return fixture;
+    }
+
     /// <summary>The controller's ExitPerform order for the sources: stop every decode thread (join) → dispose the
-    /// passes (their persistent textures) → dispose the sources (timeline frames, then pool textures).
-    /// <paramref name="outstandingAtDispose"/> accumulates every source's <see cref="HapSource.OutstandingAtDispose"/>.</summary>
-    private static void TeardownHapSources(List<HapSource> sources, List<FullscreenQuadPass> passes, ref int stopped, ref int disposed, ref int outstandingAtDispose)
+    /// passes (their persistent textures) → dispose the sources (timeline frames, then their textures).
+    /// <paramref name="outstandingAtDispose"/> accumulates every source's <see cref="IMetalSource.OutstandingAtDispose"/>.</summary>
+    private static void TeardownSources(List<IMetalSource> sources, List<FullscreenQuadPass> passes, ref int stopped, ref int disposed, ref int outstandingAtDispose)
     {
         foreach (var source in sources)
         {

@@ -34,7 +34,7 @@ namespace MultiMon.Decode.Mac.Hap;
 /// <see cref="MaxConsecutiveFailures"/> bad frames in a row (<see cref="IsFaulted"/>). Every decode iteration
 /// runs inside its own NSAutoreleasePool (LESSON-BUG-008).
 /// </summary>
-public sealed class HapSource : ISource
+public sealed class HapSource : IMetalSource
 {
     /// <summary>Consecutive undecodable frames before the source gives up (a burst, not one bad frame).</summary>
     private const int MaxConsecutiveFailures = 30;

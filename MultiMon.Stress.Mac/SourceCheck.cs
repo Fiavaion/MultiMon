@@ -5,6 +5,7 @@ using MultiMon.Core.Diagnostics;
 using MultiMon.Core.Models;
 using MultiMon.Core.Sync;
 using MultiMon.Decode.Mac.Hap;
+using MultiMon.Decode.Mac.VideoToolbox;
 using MultiMon.Graphics.Mac;
 using MultiMon.Hap;
 
@@ -21,7 +22,10 @@ namespace MultiMon.Stress.Mac;
 /// through a texel-exact window — must put the CPU-decoded reference colour (<see cref="BcnReference"/>) at the
 /// target's centre for TWO texels: the most chromatic one (a swapped chroma channel, flipped sign or dropped
 /// scale divide changes it) and the brightest one (luma). A BC4/BC7 clip has no CPU reference and gets only a
-/// non-clear + non-uniform frame check. Exit 0 = every check PASS.
+/// non-clear + non-uniform frame check. Given a known-colour H.264 clip (<see cref="VideoToolboxExpected"/>), the REAL
+/// VideoToolbox path — a <see cref="VideoToolboxSource"/>'s first frame, a CVMetalTextureCache-vended BGRA texture
+/// blitted and sampled — must put that colour at the target's centre within <see cref="VideoToolboxTolerance"/>.
+/// Exit 0 = every check PASS.
 /// </summary>
 internal static class SourceCheck
 {
@@ -29,6 +33,20 @@ internal static class SourceCheck
     /// <summary>Per-channel slack for the HAP comparisons: GPU BCn decoders may round the 1/3–2/3 endpoint blends
     /// differently from the CPU reference. A chroma fault that moves a texel by no more than this is invisible.</summary>
     private const int HapTolerance = 8;
+
+    /// <summary>
+    /// The colour the VideoToolbox check expects at the centre of the fixture's first frame. The fixture is a SOLID
+    /// RGB (200,40,120) frame encoded to limited-range BT.709 yuv420p and tagged bt709, generated with
+    /// <c>ffmpeg -f lavfi -i color=c=0xC82878:s=1920x1080:r=30:d=2 -vf "scale=out_color_matrix=bt709:out_range=tv,format=yuv420p"
+    /// -c:v libx264 -crf 12 -colorspace bt709 -color_primaries bt709 -color_trc bt709 -color_range tv -an colour_h264.mp4</c>.
+    /// That encodes to Y=83 Cb=146 Cr=195 (read back with ffmpeg), which the BT.709 limited-range matrix maps to
+    /// (198,38,116) — ffmpeg's own bt709 decode of the clip, used here as the reference. A solid frame has no
+    /// chroma-subsampling error, so the tolerance only covers 8-bit YCbCr quantisation and the converter's rounding.
+    /// It still discriminates the faults that matter: a BT.601 conversion gives (185,16,114) (G off by 22) and a swapped
+    /// R/B gives (116,38,198) (off by 82).
+    /// </summary>
+    private static readonly (byte R, byte G, byte B) VideoToolboxExpected = (198, 38, 116);
+    private const int VideoToolboxTolerance = 8;
 
     /// <summary>
     /// The four quadrant colours as (r, g, b): top-left red, top-right green, bottom-left blue, bottom-right
@@ -57,13 +75,14 @@ internal static class SourceCheck
         return CreateUploadedTexture(provider, QuadrantTextureSize, pixels);
     }
 
-    /// <summary><paramref name="hapClip"/>: the HAP .mov for the hap checks, or null to skip them (noted).</summary>
-    public static int Run(ILog log, string? hapClip)
+    /// <summary><paramref name="hapClip"/>: the HAP .mov for the hap checks, or null to skip them (noted);
+    /// <paramref name="vtClip"/>: the known-colour H.264 clip for the VideoToolbox check, or null to skip it (noted).</summary>
+    public static int Run(ILog log, string? hapClip, string? vtClip)
     {
         log.Info("Stress", "source-check: DecodedFrame -> FrameTimeline -> FullscreenQuadPass.Draw -> offscreen target -> readback");
         // The check count is fixed BEFORE anything runs so a crash mid-way can never leave passed == expected.
         var demux = hapClip is null ? null : MovHapDemuxer.Parse(hapClip);
-        var checkCount = 5 + (demux is null ? 0 : BcnReference.Supports(demux.DeclaredFormat) ? 2 : 1);
+        var checkCount = 5 + (demux is null ? 0 : BcnReference.Supports(demux.DeclaredFormat) ? 2 : 1) + (vtClip is null ? 0 : 1);
         var passedChecks = 0;
         var provider = new GraphicsDeviceProvider(log);
         provider.Acquire();
@@ -72,9 +91,10 @@ internal static class SourceCheck
         IMTLTexture? quadrantTexture = null, ycocgTexture = null, target = null;
         IMTLBuffer? readback = null, uniforms = null;
         MTLRenderPassDescriptor? renderPass = null;
-        FullscreenQuadPass? quadrantPass = null, ycocgPass = null, hapPass = null;
+        FullscreenQuadPass? quadrantPass = null, ycocgPass = null, hapPass = null, vtPass = null;
         FrameTimeline? quadrantTimeline = null, ycocgTimeline = null;
         HapSource? hapSource = null;
+        VideoToolboxSource? vtSource = null;
         try
         {
             loop.Start();
@@ -209,6 +229,27 @@ internal static class SourceCheck
             }
             else
                 log.Info("Stress", "NOTE: no HAP clip (--video or MULTIMON_HAP_FIXTURE) — the hap check is skipped.");
+
+            // Check 8: the real VideoToolbox path. The source's FIRST frame (media time 0 selects it) is a cache-vended
+            // BGRA texture wrapping the decoder's own pixel buffer; blitted through the pass, the solid fixture colour
+            // must reach the target's centre — proving demux → VT decode → YCbCr→BGRA conversion → CVMetalTextureCache
+            // → blit → sample with the expected colour matrix.
+            if (vtClip is not null)
+            {
+                vtSource = new VideoToolboxSource(vtClip, provider, log, id: "vtcheck");
+                vtPass = new FullscreenQuadPass(provider);
+                vtPass.BindSource(vtSource.Frames, vtSource.Width, vtSource.Height, vtSource.TextureFormat, vtSource.UseYCoCg);
+                vtSource.Start();
+                if (!SpinWait.SpinUntil(() => vtSource.DecodedFrames > 0 || vtSource.IsFaulted, TimeSpan.FromSeconds(5)) || vtSource.IsFaulted)
+                    throw new InvalidOperationException($"VideoToolbox source published no frame within 5s (faulted={vtSource.IsFaulted}).");
+                var pixels = RenderTarget(loop, provider, vtPass, renderPass, uniforms, target, readback, UvRect.Full, TimeSpan.Zero);
+                vtSource.Stop();
+                var centre = Pixel(pixels, TargetSize / 2, TargetSize / 2);
+                passedChecks += Report(log, $"videotoolbox first frame of {Path.GetFileName(vtClip)} ({(vtSource.IsHardwareDecode ? "hardware" : "software")} decode) vs bt709 reference",
+                    VideoToolboxExpected, centre, VideoToolboxTolerance);
+            }
+            else
+                log.Info("Stress", "NOTE: no H.264 colour clip (--video2 or MULTIMON_H264_FIXTURE) — the videotoolbox check is skipped.");
         }
         catch (Exception ex)
         {
@@ -220,12 +261,15 @@ internal static class SourceCheck
             // → the check's own textures/buffers → device.
             loop.Stop();
             hapSource?.Stop();
+            vtSource?.Stop();
             quadrantPass?.Dispose();
             ycocgPass?.Dispose();
             hapPass?.Dispose();
+            vtPass?.Dispose();
             quadrantTimeline?.Dispose();
             ycocgTimeline?.Dispose();
             hapSource?.Dispose();
+            vtSource?.Dispose();
             renderPass?.Dispose();
             DisposeTexture(provider, quadrantTexture);
             DisposeTexture(provider, ycocgTexture);
