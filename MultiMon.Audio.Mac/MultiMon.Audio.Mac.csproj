@@ -9,6 +9,8 @@
     <SupportedOSPlatformVersion>12.0</SupportedOSPlatformVersion>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <!-- The AUHAL render callback writes the device buffer through a Span over its raw pointer. -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
 
 </Project>

@@ -230,11 +230,13 @@ assemblies in "Solution structure". Commit on a `mac-port` branch: `Scaffold the
       Gate: harness `--hap --mode=span` 50 cycles PASS; HAP visibly playing on two screens.
       *Done 2026-09-06.* The 5sec fixture is greyscale; `--source-check --hap --video=…/Hap/colour_hapq.mov` (HAP-Q
       testsrc2, generated with ffmpeg) is the chroma gate — the check NOTEs when a clip cannot prove chroma.
-- [ ] **TODO 5 — `MultiMon.Decode.Mac`, VideoToolbox.** `VTDecompressionSession` with
+- [x] **TODO 5 — `MultiMon.Decode.Mac`, VideoToolbox.** `VTDecompressionSession` with
       `kCVPixelBufferMetalCompatibilityKey`; `CVMetalTextureCache` for zero copy; BGRA output for parity with
       the Windows pass (NV12 + a YUV→RGB MSL pass only if measured to matter); assert the first frame's
       format/size like Windows does and log the decode path.
       Gate: harness `--mode=individual --video --video2` 50 cycles PASS; 4K H.264 and HEVC play.
+      *Done 2026-09-08.* BGRA via CVMetalTextureCache (unpaced 4K decode 412 fps, so no NV12 pass). HEVC clips
+      generated with `hevc_videotoolbox` into `MultiMonMedia/`; `colour_h264.mp4` is the VT readback fixture.
 - [ ] **TODO 6 — `MultiMon.Audio.Mac`.** Port `AudioRing` (pure); `AVAudioEngine` or `AudioUnit` output per
       track; drift correction against `MasterClock` (copy the one-shot proportional policy from
       `WasapiOutput`); device selection by `AudioTrack.OutputDeviceId`; device-invalidated rebuild.

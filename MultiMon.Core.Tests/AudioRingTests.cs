@@ -1,11 +1,12 @@
 using MultiMon.Audio;
 
-namespace MultiMon.Tests;
+namespace MultiMon.Core.Tests;
 
 /// <summary>
-/// Contract tests for <see cref="AudioRing"/> (M6 audio milestone).
+/// Contract tests for <see cref="AudioRing"/> (M6 audio milestone). Portable: the ring lives in
+/// MultiMon.Core, so these run on Windows and macOS from the same suite.
 /// Covers round-trip correctness, wrap-around integrity, partial I/O accounting, capacity
-/// reporting, Clear(), constructor validation, and a concurrent SPSC soak that verifies the
+/// reporting, constructor validation, and a concurrent SPSC soak that verifies the
 /// monotonic ordering guarantee with no gaps, duplicates, or torn reads.
 /// </summary>
 public class AudioRingTests

@@ -1,10 +1,14 @@
+// Lives in MultiMon.Core (portable, no platform types) but KEEPS the namespace MultiMon.Audio it was
+// written in, so MultiMon.Audio (Windows/WASAPI) and MultiMon.Audio.Mac (CoreAudio) both consume it with
+// no source change and the public API is byte-identical to before the move.
 namespace MultiMon.Audio;
 
 /// <summary>
 /// Lock-free single-producer / single-consumer (SPSC) ring buffer of <see cref="float"/> audio samples.
 ///
 /// <para><b>Thread contract:</b> exactly ONE thread calls <see cref="Write"/> (the MF decode thread) and
-/// exactly ONE other thread calls <see cref="Read"/> (the WASAPI render thread). Both may run concurrently
+/// exactly ONE other thread calls <see cref="Read"/> (the WASAPI / CoreAudio render thread). Both may run
+/// concurrently
 /// without locks or allocation on the hot path.</para>
 ///
 /// <para><b>Memory ordering:</b> <c>_writePos</c> is written by the producer and read by the consumer;
@@ -114,7 +118,7 @@ public sealed class AudioRing
         return toWrite;
     }
 
-    // ── Consumer (WASAPI render thread) ───────────────────────────────────────
+    // ── Consumer (WASAPI / CoreAudio render thread) ───────────────────────────
 
     /// <summary>
     /// Copies up to <c>destination.Length</c> floats out of the ring.
