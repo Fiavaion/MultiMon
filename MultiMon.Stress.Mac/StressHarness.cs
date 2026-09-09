@@ -52,8 +52,8 @@ public sealed record StressOptions(int Cycles, int Windows, bool Fullscreen, int
 /// logs the post-gain output peak per channel (<c>peakL/peakR</c>) so a <c>--audio-gain</c>/<c>--audio-pan</c>/
 /// <c>--audio-master</c> run can be checked against unity. After a short warm-up the tracked
 /// Metal object count is the baseline and ANY later growth fails the run — growth is an ownership bug,
-/// never something to mask (LESSON-BUG-001). A watchdog fails the run loudly if a cycle does not complete
-/// within <see cref="CycleDeadline"/>, printing the stuck state. Runs on its own thread; the main thread
+/// never something to mask (LESSON-BUG-001). A <see cref="Watchdog"/> fails the run loudly if a cycle — or the
+/// final teardown — does not complete within <see cref="CycleDeadline"/>, printing the stuck state. Runs on its own thread; the main thread
 /// only pumps AppKit. <c>--controller</c> instead drives the app's REAL per-perform path through
 /// <see cref="PerformanceController"/> (<see cref="RunController"/>).
 /// </summary>
@@ -270,23 +270,7 @@ public static class StressHarness
         ulong allocBaseline = 0, allocMax = 0;
         long wsBaseline = 0, wsMax = 0;
 
-        // Watchdog: a cycle that does not finish within the deadline is a wedge — dump the stuck state and
-        // fail the process (a truly stuck main or render thread would otherwise hang the run forever).
-        var currentCycle = 0;
-        var cycleStartedAt = Stopwatch.StartNew();
-        var watchdogStop = new ManualResetEventSlim(false);
-        var watchdog = new Thread(() =>
-        {
-            while (!watchdogStop.Wait(250))
-            {
-                var cycle = Volatile.Read(ref currentCycle);
-                if (cycle == 0 || cycleStartedAt.Elapsed <= CycleDeadline) continue;
-                log.Error("Stress", $"WATCHDOG: cycle {cycle} did not complete within {CycleDeadline.TotalSeconds:0}s — FAIL.");
-                DumpStuckState(log, loop, outputs, provider);
-                log.Info("Stress", "RESULT: FAIL — wedge (watchdog).");
-                Environment.Exit(1);
-            }
-        }) { Name = "MultiMon.Watchdog", IsBackground = true };
+        var watchdog = new Watchdog(log, () => "", () => DumpStuckState(log, loop, outputs, provider));
 
         try
         {
@@ -300,8 +284,7 @@ public static class StressHarness
             for (var cycle = 1; cycle <= cycles; cycle++)
             {
                 using var pool = new NSAutoreleasePool(); // this thread's AppKit calls (Show/Hide) return autoreleased objects
-                cycleStartedAt.Restart();
-                Volatile.Write(ref currentCycle, cycle);
+                watchdog.BeginCycle(cycle);
 
                 // EnterPerform: show + bind. The device, windows, layers and pipeline are NEVER touched.
                 // Clips: the app's per-perform path — new source(s) via the ladder + pass(es) on the persistent device,
@@ -389,13 +372,13 @@ public static class StressHarness
                         DumpStuckState(log, loop, outputs, provider);
                     }
                     if (soakSeconds > 0 && !wedged)
-                        cycleStartedAt.Restart(); // a soak is a deliberate dwell, not a stuck cycle
+                        watchdog.Extend(); // a soak is a deliberate dwell, not a stuck cycle
                 } while (!wedged && soakSeconds > 0 && hold.Elapsed < TimeSpan.FromSeconds(soakSeconds));
 
                 // Audio hold: the callback must have consumed real content (not just opened and rendered silence)
                 // before this cycle may end, or the audio gate below is measuring nothing. Bounded by the wedge timeout.
                 if (audioEngine is not null && !wedged)
-                    audioGate.HoldForContent(cycle, () => AudioSample.From(audioEngine), watchdogStop);
+                    audioGate.HoldForContent(cycle, () => AudioSample.From(audioEngine), watchdog.StopSignal);
 
                 // ExitPerform: pause the clock(s), unbind + hide. Destroys NOTHING of the pipeline.
                 clock.Stop();
@@ -477,20 +460,21 @@ public static class StressHarness
                     allocText = $"alloc={alloc / (1024 * 1024)}MB (delta {((long)alloc - (long)allocBaseline) / (1024 * 1024):+0;-#}MB)";
                     wsText = $"rss={ws / (1024 * 1024)}MB (delta {(ws - wsBaseline) / (1024 * 1024):+0;-#}MB)";
                 }
-                log.Info("Stress", $"cycle {cycle:00}/{cycles} [{label}]: enter->present({HoldFramesPerCycle}f)->exit ok in {cycleStartedAt.Elapsed.TotalMilliseconds:0}ms, {liveText}, {allocText}, {wsText}{hapText}{audioText}, {provider.Tracker}");
+                log.Info("Stress", $"cycle {cycle:00}/{cycles} [{label}]: enter->present({HoldFramesPerCycle}f)->exit ok in {watchdog.Elapsed.TotalMilliseconds:0}ms, {liveText}, {allocText}, {wsText}{hapText}{audioText}, {provider.Tracker}");
             }
         }
         catch (Exception ex)
         {
             wedged = true;
-            log.Error("Stress", $"harness failed on cycle {Volatile.Read(ref currentCycle)}: {ex}");
+            log.Error("Stress", $"harness failed on cycle {watchdog.Cycle}: {ex}");
         }
         finally
         {
-            Volatile.Write(ref currentCycle, 0);
-            watchdogStop.Set();
             // Teardown, off the main thread, in the CLAUDE.md order: stop the render loop (join, windows closed
             // on the main thread) → dispose the passes → dispose the source (its buffered frames) → release the device.
+            // UNDER the watchdog: the render-thread join is unbounded, so the deadline is what turns a teardown wedge
+            // into a loud FAIL + exit 1 instead of a silent hang.
+            watchdog.BeginTeardown();
             clock.Stop();
             audioEngine?.Stop();   // only non-null after a cycle threw mid-perform
             audioEngine?.Dispose();
@@ -506,6 +490,7 @@ public static class StressHarness
             TeardownSources(clipSources, clipPasses, ref sourcesStopped, ref sourcesDisposed, ref texturesOutstandingAtDispose); // only non-empty after a failed cycle
             provider.Release();
             provider.Dispose();
+            watchdog.Stop();
             log.Info("Stress", $"teardown complete: {provider.Tracker}");
         }
 
@@ -606,12 +591,13 @@ public static class StressHarness
         var controller = new PerformanceController(infos, log, forceSw);
         var failures = 0;
         controller.CommandFailed += m => { Interlocked.Increment(ref failures); log.Error("Stress", $"controller command failed: {m}"); };
+        var watchdog = new Watchdog(log, () => $" (controller state={controller.State})",
+            () => DumpStuckState(log, controller.Loop, controller.Outputs, controller.Provider));
         // State transitions arrive on the controller's worker; the Idle wait below is event-driven on them.
-        var currentCycle = 0;
         var idle = new ManualResetEventSlim(false);
         controller.StateChanged += state =>
         {
-            log.Info("Stress", $"cycle {Volatile.Read(ref currentCycle):00}/{cycles}: state -> {state}");
+            log.Info("Stress", $"cycle {watchdog.Cycle:00}/{cycles}: state -> {state}");
             if (state == PerformState.Idle) idle.Set();
         };
 
@@ -624,37 +610,13 @@ public static class StressHarness
         ulong allocBaseline = 0, allocMax = 0;
         long wsBaseline = 0, wsMax = 0;
 
-        // Watchdog: a cycle — or the final teardown — that does not finish within the deadline is a wedge: dump the
-        // stuck state and fail the process. Dispose joins the controller's worker with no bound of its own, so
-        // without this a teardown wedge would hang the harness silently after every cycle had passed.
-        var cycleStartedAt = Stopwatch.StartNew();
-        var tearingDown = false;
-        var watchdogStop = new ManualResetEventSlim(false);
-        var watchdog = new Thread(() =>
-        {
-            while (!watchdogStop.Wait(250))
-            {
-                var cycle = Volatile.Read(ref currentCycle);
-                var teardown = Volatile.Read(ref tearingDown);
-                if ((cycle == 0 && !teardown) || cycleStartedAt.Elapsed <= CycleDeadline) continue;
-                log.Error("Stress", teardown
-                    ? $"WATCHDOG: teardown (controller.Dispose) did not complete within {CycleDeadline.TotalSeconds:0}s — FAIL."
-                    : $"WATCHDOG: cycle {cycle} did not complete within {CycleDeadline.TotalSeconds:0}s (controller state={controller.State}) — FAIL.");
-                try { DumpStuckState(log, controller.Loop, controller.Outputs, controller.Provider); }
-                catch (Exception ex) { log.Error("Stress", $"  stuck-state dump failed: {ex.Message}"); }
-                log.Info("Stress", teardown ? "RESULT: FAIL — teardown wedge." : "RESULT: FAIL — wedge (watchdog).");
-                Environment.Exit(1);
-            }
-        }) { Name = "MultiMon.Watchdog", IsBackground = true };
-
         try
         {
             watchdog.Start();
             for (var cycle = 1; cycle <= cycles; cycle++)
             {
                 using var pool = new NSAutoreleasePool();
-                cycleStartedAt.Restart();
-                Volatile.Write(ref currentCycle, cycle);
+                watchdog.BeginCycle(cycle);
                 idle.Reset();
 
                 controller.ApplyShow(show);
@@ -709,12 +671,12 @@ public static class StressHarness
                         break;
                     }
                     if (soakSeconds > 0)
-                        cycleStartedAt.Restart();
+                        watchdog.Extend();
                 } while (soakSeconds > 0 && hold.Elapsed < TimeSpan.FromSeconds(soakSeconds));
                 if (wedged)
                     break;
                 if (audioTrack is not null)
-                    audioGate.HoldForContent(cycle, () => SampleAudio(controller), watchdogStop);
+                    audioGate.HoldForContent(cycle, () => SampleAudio(controller), watchdog.StopSignal);
 
                 controller.ExitPerform();
                 if (!idle.Wait(WedgeTimeout))
@@ -783,24 +745,22 @@ public static class StressHarness
                     allocText = $"alloc={alloc / (1024 * 1024)}MB (delta {((long)alloc - (long)allocBaseline) / (1024 * 1024):+0;-#}MB)";
                     wsText = $"rss={ws / (1024 * 1024)}MB (delta {(ws - wsBaseline) / (1024 * 1024):+0;-#}MB)";
                 }
-                log.Info("Stress", $"cycle {cycle:00}/{cycles}: apply->enter->present({HoldFramesPerCycle}f{(soakSeconds > 0 ? $", soak {hold.Elapsed.TotalSeconds:0}s" : "")})->exit->idle ok in {cycleStartedAt.Elapsed.TotalMilliseconds:0}ms, {liveText}, {allocText}, {wsText}{contentText}{audioText}, {controller.Tracker}");
+                log.Info("Stress", $"cycle {cycle:00}/{cycles}: apply->enter->present({HoldFramesPerCycle}f{(soakSeconds > 0 ? $", soak {hold.Elapsed.TotalSeconds:0}s" : "")})->exit->idle ok in {watchdog.Elapsed.TotalMilliseconds:0}ms, {liveText}, {allocText}, {wsText}{contentText}{audioText}, {controller.Tracker}");
             }
         }
         catch (Exception ex)
         {
             wedged = true;
-            log.Error("Stress", $"harness failed on cycle {Volatile.Read(ref currentCycle)}: {ex}");
+            log.Error("Stress", $"harness failed on cycle {watchdog.Cycle}: {ex}");
         }
         finally
         {
             // Dispose queues the ordered teardown on the controller's worker and joins it — on this (non-main)
             // thread, UNDER the watchdog: the join is unbounded, so the deadline is what turns a teardown wedge into
             // a loud FAIL + exit 1 instead of a silent hang.
-            Volatile.Write(ref currentCycle, 0);
-            cycleStartedAt.Restart();
-            Volatile.Write(ref tearingDown, true);
+            watchdog.BeginTeardown();
             controller.Dispose();
-            watchdogStop.Set();
+            watchdog.Stop();
             log.Info("Stress", $"teardown complete: {controller.Tracker}");
         }
 
@@ -830,6 +790,68 @@ public static class StressHarness
     {
         var a = controller.AudioStatus()!.Value;
         return new AudioSample(a.Active, a.PeakDriftMs, a.Underruns, a.Faulted, a.RenderedSeconds, a.PeakLeft, a.PeakRight, a.OpenedDevices);
+    }
+
+    /// <summary>
+    /// The run watchdog both paths share: a cycle — or the final teardown — that does not finish within
+    /// <see cref="CycleDeadline"/> is a wedge: dump the stuck state and fail the process with exit 1. The teardown
+    /// joins (render thread, controller worker) are unbounded, so this is what turns a teardown wedge into a loud
+    /// FAIL instead of a silent hang after every cycle passed. <paramref name="stuckContext"/> is appended to the
+    /// cycle-wedge line; <paramref name="dumpStuckState"/> is guarded (a half-torn-down pipeline may throw).
+    /// </summary>
+    private sealed class Watchdog(ILog log, Func<string> stuckContext, Action dumpStuckState)
+    {
+        private readonly Stopwatch _phaseStartedAt = Stopwatch.StartNew();
+        private int _cycle;
+        private bool _tearingDown;
+
+        /// <summary>Set once teardown has returned; the bounded holds poll it so they end with the run.</summary>
+        public ManualResetEventSlim StopSignal { get; } = new(false);
+
+        /// <summary>The cycle in progress (0 = none).</summary>
+        public int Cycle => Volatile.Read(ref _cycle);
+
+        /// <summary>Time since the current cycle (or teardown) began.</summary>
+        public TimeSpan Elapsed => _phaseStartedAt.Elapsed;
+
+        public void Start() => new Thread(Watch) { Name = "MultiMon.Watchdog", IsBackground = true }.Start();
+
+        /// <summary>Marks the start of <paramref name="cycle"/>: the deadline runs from now.</summary>
+        public void BeginCycle(int cycle)
+        {
+            _phaseStartedAt.Restart();
+            Volatile.Write(ref _cycle, cycle);
+        }
+
+        /// <summary>Restarts the deadline inside a deliberate dwell (a soak is not a stuck cycle).</summary>
+        public void Extend() => _phaseStartedAt.Restart();
+
+        /// <summary>Marks the start of teardown: the deadline runs from now and a miss is a teardown wedge.</summary>
+        public void BeginTeardown()
+        {
+            Volatile.Write(ref _cycle, 0);
+            _phaseStartedAt.Restart();
+            Volatile.Write(ref _tearingDown, true);
+        }
+
+        public void Stop() => StopSignal.Set();
+
+        private void Watch()
+        {
+            while (!StopSignal.Wait(250))
+            {
+                var cycle = Cycle;
+                var teardown = Volatile.Read(ref _tearingDown);
+                if ((cycle == 0 && !teardown) || _phaseStartedAt.Elapsed <= CycleDeadline) continue;
+                log.Error("Stress", teardown
+                    ? $"WATCHDOG: teardown did not complete within {CycleDeadline.TotalSeconds:0}s — FAIL."
+                    : $"WATCHDOG: cycle {cycle} did not complete within {CycleDeadline.TotalSeconds:0}s{stuckContext()} — FAIL.");
+                try { dumpStuckState(); }
+                catch (Exception ex) { log.Error("Stress", $"  stuck-state dump failed: {ex.Message}"); }
+                log.Info("Stress", teardown ? "RESULT: FAIL — teardown wedge." : "RESULT: FAIL — wedge (watchdog).");
+                Environment.Exit(1);
+            }
+        }
     }
 
     /// <summary>One audio-gate sample — the counters both harness paths feed the same <see cref="AudioGate"/>.</summary>
