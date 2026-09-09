@@ -1,9 +1,152 @@
 <Window xmlns="https://github.com/avaloniaui"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
-        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
-        mc:Ignorable="d" d:DesignWidth="800" d:DesignHeight="450"
+        xmlns:vm="using:MultiMon.Control.Shared"
         x:Class="MultiMon.Control.Mac.MainWindow"
-        Title="MultiMon.Control.Mac">
-    Welcome to Avalonia!
+        x:DataType="vm:MainViewModel"
+        Title="MultiMon (rebuild) — Control Panel"
+        Width="1180" Height="660" MinWidth="1100" MinHeight="620"
+        Background="{StaticResource WindowBackground}">
+
+  <Grid Margin="22,18,22,18" RowDefinitions="Auto,Auto,Auto,*,Auto,Auto">
+
+    <!-- Header -->
+    <Grid Grid.Row="0" Margin="0,0,0,10">
+      <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+        <Border Width="4" Height="36" CornerRadius="2" Background="{StaticResource AccentBrush}" Margin="0,0,14,0"/>
+        <StackPanel VerticalAlignment="Center">
+          <TextBlock Text="MULTI-MONITOR VIDEO CONSOLE" Classes="eyebrow" Foreground="{StaticResource CyanBrush}"/>
+          <TextBlock Text="MultiMon" Classes="title" Margin="-1,1,0,0"/>
+        </StackPanel>
+      </StackPanel>
+      <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Center">
+        <Ellipse Width="8" Height="8" Fill="{StaticResource CyanBrush}" VerticalAlignment="Center" Margin="0,0,8,0"/>
+        <TextBlock Text="SIGNAL READY" Classes="eyebrow" VerticalAlignment="Center"/>
+      </StackPanel>
+    </Grid>
+
+    <TextBlock Name="GpuText" Grid.Row="1" Classes="hint" Margin="2,0,0,14"/>
+
+    <!-- Mode + audio device -->
+    <StackPanel Grid.Row="2" Orientation="Horizontal" Margin="0,0,0,12">
+      <TextBlock Text="MODE" Classes="label" Margin="0,0,8,0"/>
+      <ComboBox Name="ModeCombo" Width="150" ItemsSource="{Binding Modes}"
+                SelectedItem="{Binding SelectedMode}" IsEnabled="{Binding CanEdit}"/>
+      <TextBlock Text="AUDIO DEVICE" Classes="label" Margin="22,0,8,0"/>
+      <ComboBox Name="AudioCombo" Width="280" ItemsSource="{Binding AudioDevices}"
+                SelectedItem="{Binding SelectedAudioDevice}" IsEnabled="{Binding CanEdit}">
+        <ComboBox.ItemTemplate>
+          <DataTemplate><TextBlock Text="{Binding Name}"/></DataTemplate>
+        </ComboBox.ItemTemplate>
+      </ComboBox>
+      <CheckBox Content="Sync (frame-lock same-length clips)" VerticalAlignment="Center"
+                Margin="20,0,0,0" IsChecked="{Binding SyncIndividual}" IsEnabled="{Binding CanEdit}"
+                IsVisible="{Binding SyncToggleVisible}"/>
+      <Button Name="IdentifyButton" Content="Identify screens" Margin="24,0,0,0"
+              Click="Identify_Click" IsEnabled="{Binding CanEdit}"
+              ToolTip.Tip="Show a big number on each monitor (click an overlay to dismiss)."/>
+    </StackPanel>
+
+    <!-- Assignments (left) + audio mixer (right) -->
+    <Grid Grid.Row="3" ColumnDefinitions="3*,2*">
+
+      <HeaderedContentControl Grid.Column="0" Header="SOURCE VIDEO" Margin="0,0,10,0">
+        <Grid>
+          <!-- Individual / Hap: one clip per monitor -->
+          <ItemsControl ItemsSource="{Binding Rows}" IsVisible="{Binding IsMultiSourceMode}">
+            <ItemsControl.ItemTemplate>
+              <DataTemplate x:DataType="vm:MonitorAssignmentRow">
+                <Border Background="{StaticResource RaisedBrush}" CornerRadius="6" Margin="0,3" Padding="9,6">
+                  <DockPanel>
+                    <TextBlock DockPanel.Dock="Left" Text="{Binding DisplayName}" Width="230"
+                               TextTrimming="CharacterEllipsis" VerticalAlignment="Center"
+                               Foreground="{StaticResource TextPrimaryBrush}"/>
+                    <Button DockPanel.Dock="Right" Content="Browse…" Margin="8,0,0,0" Click="BrowseRow_Click"/>
+                    <TextBox Text="{Binding FilePath}" PlaceholderText="Video file"/>
+                  </DockPanel>
+                </Border>
+              </DataTemplate>
+            </ItemsControl.ItemTemplate>
+          </ItemsControl>
+
+          <!-- Span / Split: ONE source shown across all monitors -->
+          <StackPanel VerticalAlignment="Top" Margin="2,6,2,2" IsVisible="{Binding IsSingleSourceMode}">
+            <TextBlock Text="One clip shown across all monitors" Classes="eyebrow"
+                       Foreground="{StaticResource CyanBrush}" Margin="2,0,0,8"/>
+            <DockPanel>
+              <Button DockPanel.Dock="Right" Content="Browse…" Margin="8,0,0,0"
+                      Click="BrowseSpan_Click" IsEnabled="{Binding CanEdit}"/>
+              <TextBox Text="{Binding SpanSourcePath}" IsEnabled="{Binding CanEdit}"/>
+            </DockPanel>
+
+            <!-- Split grid: auto by screen count, or a manual rows × columns override -->
+            <StackPanel Margin="0,14,0,0" IsVisible="{Binding IsSplitMode}">
+              <TextBlock Text="Split grid" Classes="eyebrow" Foreground="{StaticResource CyanBrush}" Margin="2,0,0,6"/>
+              <StackPanel Orientation="Horizontal">
+                <CheckBox Content="Auto (by screens)" VerticalAlignment="Center"
+                          IsChecked="{Binding SplitAuto}" IsEnabled="{Binding CanEdit}"/>
+                <TextBlock Text="Rows" VerticalAlignment="Center" Margin="18,0,4,0"/>
+                <NumericUpDown Width="90" Minimum="1" Maximum="16" Increment="1" FormatString="0"
+                               Value="{Binding SplitRows}" IsEnabled="{Binding SplitGridEditable}"/>
+                <TextBlock Text="×   Cols" VerticalAlignment="Center" Margin="10,0,4,0"/>
+                <NumericUpDown Width="90" Minimum="1" Maximum="16" Increment="1" FormatString="0"
+                               Value="{Binding SplitColumns}" IsEnabled="{Binding SplitGridEditable}"/>
+              </StackPanel>
+            </StackPanel>
+          </StackPanel>
+        </Grid>
+      </HeaderedContentControl>
+
+      <HeaderedContentControl Grid.Column="1" Header="AUDIO MIXER">
+        <DockPanel>
+          <!-- Master + add -->
+          <StackPanel DockPanel.Dock="Top" Orientation="Horizontal" Margin="4,2,4,8">
+            <TextBlock Text="MASTER" Classes="label" Width="54"/>
+            <Slider Width="120" Minimum="0" Maximum="1" Value="{Binding MasterVolume}" VerticalAlignment="Center"/>
+            <CheckBox Content="Mute" VerticalAlignment="Center" Margin="10,0,0,0" IsChecked="{Binding MasterMuted}"/>
+            <Button Content="Add audio…" Margin="16,0,0,0" Click="AddAudio_Click" IsEnabled="{Binding CanEdit}"/>
+          </StackPanel>
+          <ScrollViewer VerticalScrollBarVisibility="Auto">
+            <ItemsControl ItemsSource="{Binding AudioTracks}">
+              <ItemsControl.ItemTemplate>
+                <DataTemplate x:DataType="vm:AudioTrackRow">
+                  <Border Background="{StaticResource RaisedBrush}" CornerRadius="6" Margin="0,3" Padding="9,6">
+                    <StackPanel Orientation="Horizontal">
+                      <TextBlock Text="{Binding Name}" Foreground="{StaticResource TextPrimaryBrush}" Width="110"
+                                 TextTrimming="CharacterEllipsis" VerticalAlignment="Center"/>
+                      <TextBlock Text="VOL" Classes="hint" VerticalAlignment="Center" Margin="6,0,4,0"/>
+                      <Slider Width="80" Minimum="0" Maximum="1" Value="{Binding Volume}" VerticalAlignment="Center"/>
+                      <ToggleButton Content="M" Width="30" Margin="6,0,0,0" IsChecked="{Binding Muted}"
+                                    ToolTip.Tip="Mute"/>
+                      <ToggleButton Content="S" Width="30" Margin="3,0,0,0" IsChecked="{Binding Solo}"
+                                    ToolTip.Tip="Solo"/>
+                      <TextBlock Text="PAN" Classes="hint" VerticalAlignment="Center" Margin="8,0,4,0"/>
+                      <Slider Width="60" Minimum="-1" Maximum="1" Value="{Binding Pan}" VerticalAlignment="Center"/>
+                      <Button Content="✕" Width="28" Margin="6,0,0,0" Click="RemoveAudio_Click"
+                              ToolTip.Tip="Remove track" IsVisible="{Binding CanRemove}"/>
+                    </StackPanel>
+                  </Border>
+                </DataTemplate>
+              </ItemsControl.ItemTemplate>
+            </ItemsControl>
+          </ScrollViewer>
+        </DockPanel>
+      </HeaderedContentControl>
+    </Grid>
+
+    <!-- Transport + project -->
+    <StackPanel Grid.Row="4" Orientation="Horizontal" Margin="0,14,0,10">
+      <Button Name="PerformButton" Content="PERFORM" Width="124" Height="34" Margin="0,0,10,0"
+              Classes="accent" Click="Perform_Click" IsEnabled="{Binding CanEdit}"/>
+      <Button Name="StopButton" Content="Stop" Width="90" Height="34" Margin="0,0,24,0"
+              Click="Stop_Click" IsEnabled="{Binding IsPerforming}"/>
+      <Button Content="New" Width="70" Height="34" Margin="0,0,8,0" Click="New_Click"/>
+      <Button Content="Open project…" Width="130" Height="34" Margin="0,0,8,0" Click="Open_Click"/>
+      <Button Content="Save project…" Width="130" Height="34" Margin="0,0,8,0" Click="Save_Click"/>
+      <Button Content="Convert to HAP…" Width="140" Height="34" Click="ConvertHap_Click"/>
+      <TextBlock Text="F11 perform/exit  ·  Esc exit  ·  Space pause/resume" Classes="hint"
+                 VerticalAlignment="Center" Margin="22,0,0,0"/>
+    </StackPanel>
+
+    <TextBlock Grid.Row="5" Text="{Binding Status}" Classes="telemetry"/>
+  </Grid>
 </Window>

@@ -199,6 +199,16 @@ assemblies in "Solution structure". Commit on a `mac-port` branch: `Scaffold the
 | D3D11 debug-layer live-object count | Metal validation (`MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1`) + a tracked-resource counter in `Graphics.Mac` + `MTLDevice.currentAllocatedSize` |
 | `DEVICE_REMOVED` recovery | no equivalent on a healthy device; keep the recovery *sequencing* (`DeviceRemovedHandler` shape) for eGPU unplug (`MTLDevice` removal notifications) |
 
+**Control-panel dev switch.** `MultiMon.Control.Mac --autoperform=<clip>[,seconds]` loads the clip on
+monitor 1, performs for `seconds` (default 3), stops and exits 0 — driving the real `MainViewModel`, so it
+gates the path the user clicks (LESSON-TEST-004) and includes the ordered teardown. Headless-friendly:
+`… --autoperform=~/…/5sec.mp4,3 > run.log 2>&1`; the log ends `teardown complete: live=0`.
+
+**The display must be awake** for any Mac GUI run here: Avalonia's macOS backend creates a `CVDisplayLink`,
+and with the screen locked and the panel asleep `CGGetActiveDisplayList` returns 0 displays, so startup dies
+with `Avalonia.Native was not able to start the RenderTimer. Native error code is: -6661`. Hold it awake with
+`caffeinate -u -t 900 &` before launching (this is environmental, not a code fault).
+
 ---
 
 ## 6. Dev-phase TODO list (in order; each ends in a checkable gate)

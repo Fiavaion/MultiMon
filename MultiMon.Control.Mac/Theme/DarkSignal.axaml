@@ -1,0 +1,23 @@
+<ResourceDictionary xmlns="https://github.com/avaloniaui"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+  <!-- The Windows panel's "Signal" dark palette, same hex values (MultiMon.Control/Theme/DarkSignal.xaml),
+       expressed for Avalonia's Fluent theme. Colours and spacing are mirrored; control chrome is Fluent's. -->
+
+  <Color x:Key="InkColor">#0E1116</Color>
+  <Color x:Key="CyanColor">#2DE2E6</Color>
+
+  <SolidColorBrush x:Key="WindowBackground"    Color="#0E1116"/>
+  <SolidColorBrush x:Key="PanelBrush"          Color="#161A21"/>
+  <SolidColorBrush x:Key="RaisedBrush"         Color="#1E232C"/>
+  <SolidColorBrush x:Key="LineBrush"           Color="#2A3039"/>
+  <SolidColorBrush x:Key="LineStrongBrush"     Color="#3A4250"/>
+
+  <SolidColorBrush x:Key="TextPrimaryBrush"    Color="#E6E9EF"/>
+  <SolidColorBrush x:Key="TextSecondaryBrush"  Color="#9AA3B2"/>
+  <SolidColorBrush x:Key="TextMutedBrush"      Color="#626B7A"/>
+
+  <SolidColorBrush x:Key="CyanBrush"           Color="#2DE2E6"/>
+  <SolidColorBrush x:Key="AccentBrush"         Color="#2DE2E6"/>
+  <SolidColorBrush x:Key="AccentInkBrush"      Color="#07171A"/>
+  <SolidColorBrush x:Key="LiveBrush"           Color="#FF5A6E"/>
+</ResourceDictionary>

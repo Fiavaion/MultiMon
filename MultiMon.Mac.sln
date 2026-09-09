@@ -21,6 +21,10 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "MultiMon.Stress.Mac", "Mult
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "MultiMon.Control.Mac", "MultiMon.Control.Mac\MultiMon.Control.Mac.csproj", "{2C64A518-CC06-43C5-BFF5-4CFF7E7C2809}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "MultiMon.Control.Mac.Core", "MultiMon.Control.Mac.Core\MultiMon.Control.Mac.Core.csproj", "{6D824651-24EF-4AA9-8BB0-7BC6FCE2CC8D}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "MultiMon.Control.Shared", "MultiMon.Control.Shared\MultiMon.Control.Shared.csproj", "{17DFB762-CCB0-46AB-B3B8-B8AB2EB58DC9}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -139,6 +143,30 @@ Global
 		{2C64A518-CC06-43C5-BFF5-4CFF7E7C2809}.Release|x64.Build.0 = Release|Any CPU
 		{2C64A518-CC06-43C5-BFF5-4CFF7E7C2809}.Release|x86.ActiveCfg = Release|Any CPU
 		{2C64A518-CC06-43C5-BFF5-4CFF7E7C2809}.Release|x86.Build.0 = Release|Any CPU
+		{6D824651-24EF-4AA9-8BB0-7BC6FCE2CC8D}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{6D824651-24EF-4AA9-8BB0-7BC6FCE2CC8D}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{6D824651-24EF-4AA9-8BB0-7BC6FCE2CC8D}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{6D824651-24EF-4AA9-8BB0-7BC6FCE2CC8D}.Debug|x64.Build.0 = Debug|Any CPU
+		{6D824651-24EF-4AA9-8BB0-7BC6FCE2CC8D}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{6D824651-24EF-4AA9-8BB0-7BC6FCE2CC8D}.Debug|x86.Build.0 = Debug|Any CPU
+		{6D824651-24EF-4AA9-8BB0-7BC6FCE2CC8D}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{6D824651-24EF-4AA9-8BB0-7BC6FCE2CC8D}.Release|Any CPU.Build.0 = Release|Any CPU
+		{6D824651-24EF-4AA9-8BB0-7BC6FCE2CC8D}.Release|x64.ActiveCfg = Release|Any CPU
+		{6D824651-24EF-4AA9-8BB0-7BC6FCE2CC8D}.Release|x64.Build.0 = Release|Any CPU
+		{6D824651-24EF-4AA9-8BB0-7BC6FCE2CC8D}.Release|x86.ActiveCfg = Release|Any CPU
+		{6D824651-24EF-4AA9-8BB0-7BC6FCE2CC8D}.Release|x86.Build.0 = Release|Any CPU
+		{17DFB762-CCB0-46AB-B3B8-B8AB2EB58DC9}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{17DFB762-CCB0-46AB-B3B8-B8AB2EB58DC9}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{17DFB762-CCB0-46AB-B3B8-B8AB2EB58DC9}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{17DFB762-CCB0-46AB-B3B8-B8AB2EB58DC9}.Debug|x64.Build.0 = Debug|Any CPU
+		{17DFB762-CCB0-46AB-B3B8-B8AB2EB58DC9}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{17DFB762-CCB0-46AB-B3B8-B8AB2EB58DC9}.Debug|x86.Build.0 = Debug|Any CPU
+		{17DFB762-CCB0-46AB-B3B8-B8AB2EB58DC9}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{17DFB762-CCB0-46AB-B3B8-B8AB2EB58DC9}.Release|Any CPU.Build.0 = Release|Any CPU
+		{17DFB762-CCB0-46AB-B3B8-B8AB2EB58DC9}.Release|x64.ActiveCfg = Release|Any CPU
+		{17DFB762-CCB0-46AB-B3B8-B8AB2EB58DC9}.Release|x64.Build.0 = Release|Any CPU
+		{17DFB762-CCB0-46AB-B3B8-B8AB2EB58DC9}.Release|x86.ActiveCfg = Release|Any CPU
+		{17DFB762-CCB0-46AB-B3B8-B8AB2EB58DC9}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
