@@ -75,6 +75,22 @@ public sealed class AudioEngine : IAudioEngine
     /// <summary>True when any track's decode loop ended on an error — the harness fails the run on it.</summary>
     public bool AnyFaulted => _pipelines.Any(p => p.source.IsFaulted);
 
+    /// <summary>Seconds of real content the LEAST-advanced output has written to its device — 0 until every track
+    /// has actually played. The harness holds on this so its audio gate cannot pass on an engine that only opened.</summary>
+    public double RenderedSeconds => _pipelines.Count == 0 ? 0 : _pipelines.Min(p => p.output.RenderedSeconds);
+
+    /// <summary>Highest post-gain |sample| any output has rendered on channel 0 / channel 1 — the harness's proof
+    /// that the mixer DSP (gain, pan, master) actually ran.</summary>
+    public float PeakLeft => _pipelines.Count == 0 ? 0f : _pipelines.Max(p => p.output.PeakLeft);
+    public float PeakRight => _pipelines.Count == 0 ? 0f : _pipelines.Max(p => p.output.PeakRight);
+
+    /// <summary>The CoreAudio device UID each live track's output actually opened (the requested UID, or the
+    /// default after the engine's fallback) — so a caller can assert its routing rather than trust it.</summary>
+    public IReadOnlyList<(string TrackId, string? DeviceUid)> OpenedDevices
+    {
+        get { lock (_mixGate) return _trackStates.Select(t => (t.Id, t.Output.OpenedDeviceUid)).ToList(); }
+    }
+
     /// <summary>Build and start every track pipeline. Idempotent; skips (logs) any track that fails.</summary>
     public void Start()
     {

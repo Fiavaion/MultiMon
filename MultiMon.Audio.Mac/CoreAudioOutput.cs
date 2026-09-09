@@ -24,7 +24,8 @@ namespace MultiMon.Audio.Mac;
 /// <para><b>One owner (LESSON-ARCH-001):</b> the unit is created, rebuilt and released under
 /// <see cref="_unitGate"/> by the engine thread and the device-watch thread only. The render callback runs on
 /// CoreAudio's realtime IO thread and touches NOTHING but the ring, the volatile mixer values and the clock — no
-/// locks, no allocation, no ObjC calls (so it needs no autorelease pool). <see cref="AudioUnit.AudioUnit.Stop"/>
+/// locks, no allocation, no logging, no ObjC calls (so it needs no autorelease pool); it reports problems by flag
+/// and the device-watch thread logs them. <see cref="AudioUnit.AudioUnit.Stop"/>
 /// does not return until the IO thread has left the callback, so teardown after Stop can never race it.</para>
 ///
 /// <para><b>Clocked to the MasterClock (ADR 0002 D1):</b> the device drains at its own crystal, so A/V alignment
@@ -62,11 +63,17 @@ public sealed class CoreAudioOutput : IDisposable
     private volatile bool _stop;
     private volatile bool _disposed;
     private volatile bool _primed;      // false until the ring has filled once against a running clock
-    private volatile bool _interleavedWarned;
+    // Render-thread diagnostics: set (once) by the callback, logged (once) by the watch thread — never logged in place.
+    private volatile int _unexpectedBufferCount; // non-zero = AUHAL asked for that many buffers on an interleaved stream
+    private volatile bool _renderFaulted;        // a managed exception was caught inside the callback
+    private bool _bufferCountLogged, _renderFaultLogged; // watch-thread-only (and Stop, after the watch has joined)
 
     private long _contentFrames;        // real clip frames rendered (excludes silence) → media position
     private long _underruns;            // fills that starved post-prime (Interlocked)
     private long _peakDriftMicros;      // max |audio - clock| seen post-prime (Interlocked)
+    private long _renderedFrames;       // real clip frames written to the device this session (Interlocked)
+    private float _peakLeft, _peakRight; // max |sample| rendered post-gain on channels 0/1 (IO thread writes, Volatile)
+    private volatile string? _openedDeviceUid;
 
     public int SampleRate { get; }
     public int Channels { get; }
@@ -76,6 +83,18 @@ public sealed class CoreAudioOutput : IDisposable
 
     /// <summary>Peak |audio − MasterClock| observed while running, in milliseconds (A/V drift gate).</summary>
     public double PeakDriftMs => Interlocked.Read(ref _peakDriftMicros) / 1000.0;
+
+    /// <summary>Seconds of real clip content written to the device (silence excluded) — 0 until the callback has
+    /// consumed the ring at least once, so a caller can tell "played" from "opened".</summary>
+    public double RenderedSeconds => Interlocked.Read(ref _renderedFrames) / (double)SampleRate;
+
+    /// <summary>Peak |sample| rendered on channel 0 / channel 1 AFTER gain and pan — the harness's proof that the
+    /// mixer DSP ran. Mono output leaves <see cref="PeakRight"/> at 0.</summary>
+    public float PeakLeft => Volatile.Read(ref _peakLeft);
+    public float PeakRight => Volatile.Read(ref _peakRight);
+
+    /// <summary>UID of the device the unit is actually bound to (null until opened, or when unreadable).</summary>
+    public string? OpenedDeviceUid => _openedDeviceUid;
 
     /// <summary>Live mixer controls (any thread): the render callback reads them per fill via Volatile.</summary>
     public void SetGain(float gain) => Volatile.Write(ref _gain, Math.Clamp(gain, 0f, 1f));
@@ -155,8 +174,9 @@ public sealed class CoreAudioOutput : IDisposable
         _primed = false;
 
         Check(_unit.Start(), "Start");
-        _log.Info("Audio", $"CoreAudio output '{AudioDeviceEnumerator.DescribeDevice(_deviceId)}' " +
-                           $"({(_targetDeviceUid is { Length: > 0 } ? _targetDeviceUid : "default")}): feeding {SampleRate}Hz {Channels}ch float " +
+        _openedDeviceUid = AudioDeviceEnumerator.DeviceUid(_deviceId);
+        _log.Info("Audio", $"CoreAudio output '{AudioDeviceEnumerator.DescribeDevice(_deviceId)}' uid={_openedDeviceUid ?? "?"} " +
+                           $"(requested {(_targetDeviceUid is { Length: > 0 } ? _targetDeviceUid : "default")}): feeding {SampleRate}Hz {Channels}ch float " +
                            $"(AUHAL-converted), maxFrames={maxFrames}, gain={_gain:0.00}.");
     }
 
@@ -201,6 +221,7 @@ public sealed class CoreAudioOutput : IDisposable
             {
                 if (_stop)
                     return;
+                LogRenderDiagnostics();
 
                 uint current;
                 lock (_unitGate)
@@ -262,6 +283,22 @@ public sealed class CoreAudioOutput : IDisposable
         return false;
     }
 
+    /// <summary>Report, once each, the conditions the render callback can only flag (it must not log). Watch thread
+    /// (and Stop, after the watch has joined).</summary>
+    private void LogRenderDiagnostics()
+    {
+        if (!_bufferCountLogged && _unexpectedBufferCount != 0)
+        {
+            _bufferCountLogged = true;
+            _log.Error("Audio", $"CoreAudio asked for {_unexpectedBufferCount} buffers on an interleaved stream; rendering silence.");
+        }
+        if (!_renderFaultLogged && _renderFaulted)
+        {
+            _renderFaultLogged = true;
+            _log.Error("Audio", "CoreAudio render callback threw; that fill was rendered silent (the process was kept alive).");
+        }
+    }
+
     /// <summary>Stop and release the unit (and its component wrapper). Caller holds <see cref="_unitGate"/>.
     /// After <c>Stop</c> returns, CoreAudio's IO thread has left the render callback.</summary>
     private void ReleaseUnit()
@@ -280,30 +317,53 @@ public sealed class CoreAudioOutput : IDisposable
     // ── Render callback: CoreAudio's realtime IO thread ────────────────────────────────────────────────────
 
     /// <summary>
-    /// Fill one IO cycle. Runs on CoreAudio's realtime thread: no locks, no allocation, no ObjC. The buffer is
-    /// always fully written (content, silence, or both) — a short write would play stale audio.
+    /// The AUHAL render entry point. INVARIANT: nothing escapes this frame — no exception (a managed throw crossing
+    /// the reverse-P/Invoke boundary into CoreAudio's IO thread aborts the process), no allocation, no lock, no log.
+    /// A throw inside <see cref="Fill"/> renders that cycle silent and raises <see cref="_renderFaulted"/> for the
+    /// watch thread to log. Always returns NoError: a status failure would stop the unit, and audio ending is
+    /// preferable to a wedge.
     /// </summary>
     private AudioUnitStatus Render(AudioUnitRenderActionFlags flags, AudioTimeStamp timestamp, uint bus,
         uint frameCount, AudioBuffers data)
     {
+        try
+        {
+            Fill(frameCount, data);
+        }
+        catch (Exception)
+        {
+            _renderFaulted = true;
+            try
+            {
+                for (var i = 0; i < data.Count; i++)
+                    Zero(data[i]);
+            }
+            catch (Exception) { /* the buffer list itself is unreadable; there is nothing left to write */ }
+        }
+        return AudioUnitStatus.NoError;
+    }
+
+    /// <summary>
+    /// Fill one IO cycle. Runs on CoreAudio's realtime thread under <see cref="Render"/>'s invariant. The buffer is
+    /// always fully written (content, silence, or both) — a short write would play stale audio.
+    /// </summary>
+    private void Fill(uint frameCount, AudioBuffers data)
+    {
         if (data.Count != 1)
         {
             // Our ASBD is interleaved, so AUHAL must ask for exactly one buffer. Anything else means the format
-            // was not honoured: render silence rather than write a wrong layout.
+            // was not honoured: render silence rather than write a wrong layout, and flag it for the watch thread.
             for (var i = 0; i < data.Count; i++)
                 Zero(data[i]);
-            if (!_interleavedWarned)
-            {
-                _interleavedWarned = true;
-                _log.Error("Audio", $"CoreAudio asked for {data.Count} buffers on an interleaved stream; rendering silence.");
-            }
-            return AudioUnitStatus.NoError;
+            if (_unexpectedBufferCount == 0)
+                _unexpectedBufferCount = data.Count;
+            return;
         }
 
         var buffer = data[0];
         var floats = (int)frameCount * Channels;
         if (buffer.Data == IntPtr.Zero || buffer.DataByteSize < floats * sizeof(float))
-            return AudioUnitStatus.NoError;
+            return;
 
         unsafe
         {
@@ -313,7 +373,7 @@ public sealed class CoreAudioOutput : IDisposable
             if (!_clock.IsRunning)
             {
                 destination.Clear();
-                return AudioUnitStatus.NoError;
+                return;
             }
 
             // Prime: don't begin consuming (and don't count underruns) until the decoder has filled the ring, so
@@ -323,7 +383,7 @@ public sealed class CoreAudioOutput : IDisposable
                 if (_ring.AvailableToRead < floats)
                 {
                     destination.Clear();
-                    return AudioUnitStatus.NoError;
+                    return;
                 }
                 // Re-baseline the content position to the clock at the instant we start consuming. The clock has
                 // been running since EnterPerform (and through the ring prime), so the first content sample is
@@ -357,7 +417,7 @@ public sealed class CoreAudioOutput : IDisposable
                 if (dropped > 0)
                 {
                     _contentFrames += dropped / Channels;
-                    _spaceAvailable.Set();
+                    SignalSpace();
                 }
             }
 
@@ -378,9 +438,20 @@ public sealed class CoreAudioOutput : IDisposable
 
             _contentFrames += read / Channels;  // inserted silence is NOT counted → the clock catches up
             if (read > 0)
-                _spaceAvailable.Set();           // freed ring space → wake the decoder
+            {
+                Interlocked.Add(ref _renderedFrames, read / Channels);
+                SignalSpace();                   // freed ring space → wake the decoder
+            }
         }
-        return AudioUnitStatus.NoError;
+    }
+
+    /// <summary>Wake the decoder (ring space freed). Skipped once Stop has begun: the engine stops the decoder
+    /// before this output and disposes the event after it, so past <see cref="_stop"/> the pulse has no listener
+    /// and the event may already be gone. A late ObjectDisposedException is still caught by <see cref="Render"/>.</summary>
+    private void SignalSpace()
+    {
+        if (!_stop)
+            _spaceAvailable.Set();
     }
 
     private static void Zero(AudioBuffer buffer)
@@ -390,28 +461,40 @@ public sealed class CoreAudioOutput : IDisposable
     }
 
     /// <summary>Apply the live mixer gain (and stereo pan for 2-channel output) to a span of interleaved float
-    /// samples. Reads the volatile controls once so a mid-fill change can't tear within the buffer.</summary>
+    /// samples, and meter the post-gain peak of channels 0/1. Reads the volatile controls once so a mid-fill
+    /// change can't tear within the buffer.</summary>
     private void ApplyGainAndPan(Span<float> samples)
     {
         var gain = Volatile.Read(ref _gain);
         var pan = Volatile.Read(ref _pan);
 
+        // Constant-ish balance for stereo: attenuate the opposite channel as pan moves off-centre.
+        var left = gain;
+        var right = gain;
         if (Channels == 2 && pan != 0f)
         {
-            // Constant-ish balance: attenuate the opposite channel as pan moves off-centre.
-            var left = gain * (pan > 0f ? 1f - pan : 1f);
-            var right = gain * (pan < 0f ? 1f + pan : 1f);
-            for (var i = 0; i + 1 < samples.Length; i += 2)
-            {
-                samples[i] *= left;
-                samples[i + 1] *= right;
-            }
-            return;
+            left = gain * (pan > 0f ? 1f - pan : 1f);
+            right = gain * (pan < 0f ? 1f + pan : 1f);
         }
 
-        if (gain != 1f)
-            for (var i = 0; i < samples.Length; i++)
-                samples[i] *= gain;
+        var peakLeft = _peakLeft;
+        var peakRight = _peakRight;
+        for (var i = 0; i + Channels <= samples.Length; i += Channels)
+        {
+            var l = samples[i] * left;
+            samples[i] = l;
+            peakLeft = MathF.Max(peakLeft, MathF.Abs(l));
+            if (Channels > 1)
+            {
+                var r = samples[i + 1] * right;
+                samples[i + 1] = r;
+                peakRight = MathF.Max(peakRight, MathF.Abs(r));
+            }
+            for (var c = 2; c < Channels; c++)
+                samples[i + c] *= gain;
+        }
+        Volatile.Write(ref _peakLeft, peakLeft);
+        Volatile.Write(ref _peakRight, peakRight);
     }
 
     /// <summary>Stop the device watch and the unit, off the UI/main thread. Idempotent.</summary>
@@ -425,6 +508,7 @@ public sealed class CoreAudioOutput : IDisposable
             _watch.Join();
         lock (_unitGate)
             ReleaseUnit();
+        LogRenderDiagnostics(); // a fault in the last fills before Stop would otherwise go unreported
     }
 
     /// <summary>Idempotent: a second Dispose must not signal the already-disposed wake event.</summary>

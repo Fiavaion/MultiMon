@@ -58,7 +58,8 @@ public static class AudioDeviceEnumerator
         uint qualifierDataSize, IntPtr qualifierData, ref uint dataSize, IntPtr data);
 
     [DllImport(CoreAudioLibrary)]
-    private static extern int AudioObjectHasProperty(uint objectId, ref AudioObjectPropertyAddress address);
+    [return: MarshalAs(UnmanagedType.U1)] // native Boolean (unsigned char), not OSStatus
+    private static extern bool AudioObjectHasProperty(uint objectId, ref AudioObjectPropertyAddress address);
 
     private static AudioObjectPropertyAddress Address(uint selector, uint scope = ScopeGlobal) =>
         new() { Selector = selector, Scope = scope, Element = ElementMain };
@@ -79,7 +80,7 @@ public static class AudioDeviceEnumerator
                 if (channels == 0)
                     continue; // input-only device (a microphone) — not a render endpoint
 
-                var uid = StringProperty(id, SelectorDeviceUid);
+                var uid = DeviceUid(id);
                 if (uid is null)
                 {
                     log.Error("Audio", $"CoreAudio device {id} has no UID; skipping it.");
@@ -114,10 +115,14 @@ public static class AudioDeviceEnumerator
     public static uint FindByUid(string uid)
     {
         foreach (var id in AllDeviceIds())
-            if (StringProperty(id, SelectorDeviceUid) == uid)
+            if (DeviceUid(id) == uid)
                 return id;
         return 0;
     }
+
+    /// <summary>kAudioDevicePropertyDeviceUID of a device id (the <see cref="AudioOutputDevice.Id"/> key), or null
+    /// when unreadable.</summary>
+    public static string? DeviceUid(uint deviceId) => StringProperty(deviceId, SelectorDeviceUid);
 
     /// <summary>kAudioDevicePropertyDeviceIsAlive — false once the endpoint is unplugged or torn down.</summary>
     public static bool IsAlive(uint deviceId)
@@ -126,7 +131,7 @@ public static class AudioDeviceEnumerator
             return false;
         var address = Address(SelectorDeviceIsAlive);
         // A device that has vanished loses the property entirely; that is "not alive", not an error.
-        if (AudioObjectHasProperty(deviceId, ref address) == 0)
+        if (!AudioObjectHasProperty(deviceId, ref address))
             return false;
         return ReadUInt32(deviceId, ref address) != 0;
     }

@@ -22,9 +22,13 @@ namespace MultiMon.Stress.Mac;
 /// track per cycle, from <paramref name="AudioFile"/> or the video's own audio stream. <paramref name="Mode"/> is the
 /// show mode (Span = ONE source, each output samples its UvLayout slice; Individual/Hap = one source per output, full
 /// frame; Split = one source through the auto-grid cells). <paramref name="Controller"/> drives the real
-/// <see cref="PerformanceController"/> instead of the bind-once loop.</summary>
+/// <see cref="PerformanceController"/> instead of the bind-once loop. <paramref name="AudioDevice"/> routes the
+/// audio track to that CoreAudio device UID (<c>--list-audio</c>; an unknown UID fails the run);
+/// <paramref name="AudioGain"/> / <paramref name="AudioPan"/> / <paramref name="AudioMaster"/> drive the engine's
+/// live track-volume / track-pan / master-volume setters so the mixer DSP is exercised and metered.</summary>
 public sealed record StressOptions(int Cycles, int Windows, bool Fullscreen, int SoakSeconds, bool SourceCheck,
-    bool Hap, string? Video, string? Video2, bool ForceSwDecode, ShowMode Mode, bool Audio, string? AudioFile, bool Controller);
+    bool Hap, string? Video, string? Video2, bool ForceSwDecode, ShowMode Mode, bool Audio, string? AudioFile, bool Controller,
+    string? AudioDevice, double? AudioGain, double? AudioPan, double? AudioMaster);
 
 /// <summary>
 /// The Mac twin of <c>MultiMon.Stress.StressHarness</c>'s bind-once loop: build the persistent Metal pipeline
@@ -40,7 +44,12 @@ public sealed record StressOptions(int Cycles, int Windows, bool Fullscreen, int
 /// source (<c>--video2</c> for the second). <c>--audio [--audio-file=PATH]</c> adds the real audio path on top of
 /// either: a fresh <see cref="AudioEngine"/> (AVAssetReader decode → ring → AUHAL) is built, started, stopped and
 /// disposed EVERY cycle — the app's per-perform rebuild — and the run fails unless every cycle ends with zero
-/// post-prime underruns and a peak |audio − MasterClock| under <see cref="AudioDriftLimitMs"/>. After a short warm-up the tracked
+/// post-prime underruns and a peak |audio − MasterClock| under <see cref="AudioDriftLimitMs"/>. The video hold (~0.3 s)
+/// is shorter than the decoder's first-PCM latency, so an audio cycle additionally holds until the engine has
+/// rendered <see cref="AudioMinContentSeconds"/> of real content — without that the gate passes on an engine that
+/// only opened (drift 0.0, no underruns, nothing played: LESSON-TEST-004). Each audio cycle also
+/// logs the post-gain output peak per channel (<c>peakL/peakR</c>) so a <c>--audio-gain</c>/<c>--audio-pan</c>/
+/// <c>--audio-master</c> run can be checked against unity. After a short warm-up the tracked
 /// Metal object count is the baseline and ANY later growth fails the run — growth is an ownership bug,
 /// never something to mask (LESSON-BUG-001). A watchdog fails the run loudly if a cycle does not complete
 /// within <see cref="CycleDeadline"/>, printing the stuck state. Runs on its own thread; the main thread
@@ -54,21 +63,27 @@ public static class StressHarness
     private const long WorkingSetGrowthLimitMb = 150;   // same backstop as the Windows harness
     private const long AllocatedGrowthLimitMb = 128;    // the layer's drawable pool (3 × a 4K BGRA surface) may come and go
     private const double AudioDriftLimitMs = 40;       // the Mac runbook's A/V alignment gate for the audio milestone
+    private const double AudioMinContentSeconds = 0.25; // every audio cycle must actually PLAY this much before it may exit
     private static readonly TimeSpan WedgeTimeout = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan CycleDeadline = TimeSpan.FromSeconds(10);
 
     public static bool TryParse(string[] args, out StressOptions options)
     {
-        options = new StressOptions(50, 1, false, 0, false, false, null, null, false, ShowMode.Span, false, null, false);
+        options = new StressOptions(50, 1, false, 0, false, false, null, null, false, ShowMode.Span, false, null, false, null, null, null, null);
         var cycles = 50; var windows = 1; var fullscreen = false; var soak = 0; var sourceCheck = false;
         var hap = false; string? video = null; string? video2 = null; var forceSw = false; var mode = ShowMode.Span;
         var audio = false; string? audioFile = null; var controller = false;
+        string? audioDevice = null; double? audioGain = null, audioPan = null, audioMaster = null;
         foreach (var arg in args)
         {
             if (arg == "--fullscreen") fullscreen = true;
             else if (arg == "--controller") controller = true;
             else if (arg == "--audio") audio = true;
             else if (arg.StartsWith("--audio-file=", StringComparison.Ordinal) && arg.Length > "--audio-file=".Length) audioFile = arg["--audio-file=".Length..];
+            else if (arg.StartsWith("--audio-device=", StringComparison.Ordinal) && arg.Length > "--audio-device=".Length) audioDevice = arg["--audio-device=".Length..];
+            else if (TryParseUnit(arg, "--audio-gain=", 0, 1, out var g)) audioGain = g;
+            else if (TryParseUnit(arg, "--audio-pan=", -1, 1, out var pn)) audioPan = pn;
+            else if (TryParseUnit(arg, "--audio-master=", 0, 1, out var m)) audioMaster = m;
             else if (arg == "--source-check") sourceCheck = true;
             else if (arg == "--hap") hap = true;
             else if (arg.StartsWith("--video=", StringComparison.Ordinal) && arg.Length > "--video=".Length) video = arg["--video=".Length..];
@@ -83,8 +98,18 @@ public static class StressHarness
             else if (arg.StartsWith("--soak-seconds=", StringComparison.Ordinal) && int.TryParse(arg["--soak-seconds=".Length..], out var s) && s >= 0) soak = s;
             else return false;
         }
-        options = new StressOptions(cycles, windows, fullscreen, soak, sourceCheck, hap, video, video2, forceSw, mode, audio, audioFile, controller);
+        options = new StressOptions(cycles, windows, fullscreen, soak, sourceCheck, hap, video, video2, forceSw, mode, audio, audioFile, controller,
+            audioDevice, audioGain, audioPan, audioMaster);
         return true;
+    }
+
+    /// <summary><c>prefix=VALUE</c> as an invariant double inside [min, max]; false (a usage error) otherwise.</summary>
+    private static bool TryParseUnit(string arg, string prefix, double min, double max, out double value)
+    {
+        value = 0;
+        return arg.StartsWith(prefix, StringComparison.Ordinal)
+            && double.TryParse(arg[prefix.Length..], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out value)
+            && value >= min && value <= max;
     }
 
     /// <summary>Runs the gate; returns the process exit code (0 = PASS, 1 = FAIL).</summary>
@@ -100,7 +125,7 @@ public static class StressHarness
         if (options.SourceCheck)
             return SourceCheck.Run(log, clipPath ?? ResolveHapClip(options with { Hap = true }, log), ResolveVideoToolboxClip(options, log));
 
-        var (cycles, windows, fullscreen, soakSeconds, _, requireHap, _, video2, forceSw, mode, _, _, controller) = options;
+        var (cycles, windows, fullscreen, soakSeconds, _, requireHap, _, video2, forceSw, mode, _, _, controller, _, _, _, _) = options;
 
         // Audio: resolve the track file BEFORE any cycle runs. --audio-file wins; otherwise the video's
         // own audio stream is used, and a video without one FAILS loudly — a silent fallback would report PASS
@@ -130,6 +155,28 @@ public static class StressHarness
                 return 2;
             }
         }
+        else if (options.AudioDevice is not null || options.AudioGain is not null || options.AudioPan is not null || options.AudioMaster is not null)
+        {
+            log.Error("Stress", "--audio-device/--audio-gain/--audio-pan/--audio-master need --audio.");
+            return 2;
+        }
+        // Device routing: the UID must exist NOW. The engine falls back to the default device for the app (audio
+        // over silence); the harness must not — a run that quietly played through another device would PASS a
+        // routing path that never ran.
+        if (options.AudioDevice is { } requestedDevice)
+        {
+            var devices = AudioEngine.EnumerateDevices(log);
+            var device = devices.FirstOrDefault(d => d.Id == requestedDevice);
+            if (device is null)
+            {
+                log.Error("Stress", $"--audio-device '{requestedDevice}' is not an output device on this machine. Available: " +
+                                    (devices.Count == 0 ? "(none)" : string.Join(", ", devices.Select(d => $"'{d.Id}' ({d.Name})"))) + ".");
+                return 2;
+            }
+            log.Info("Stress", $"audio routed to device '{device.Name}' id={device.Id}{(device.IsDefault ? " (the default)" : "")}");
+        }
+        if (options.AudioGain is not null || options.AudioPan is not null || options.AudioMaster is not null)
+            log.Info("Stress", $"audio mix: gain={options.AudioGain?.ToString("0.00") ?? "unity"} pan={options.AudioPan?.ToString("0.00") ?? "centre"} master={options.AudioMaster?.ToString("0.00") ?? "unity"}");
         // Per-source clip list: Individual mode gives output i clip i (the second from --video2, else the first again).
         var perOutput = mode is ShowMode.Individual or ShowMode.Hap; // one source per output; else one shared source
         var clips = clipPath is null ? Array.Empty<string>() : video2 is null ? [clipPath] : [clipPath, video2];
@@ -175,7 +222,7 @@ public static class StressHarness
                 log.Error("Stress", "--soak-seconds is not supported with --controller (use the bind-once loop for it).");
                 return 2;
             }
-            return RunController(log, monitors, bounds, cycles, mode, clipPath, video2, requireHap, forceSw, audioPath);
+            return RunController(log, monitors, bounds, cycles, mode, clipPath, video2, requireHap, forceSw, audioPath, options);
         }
 
         // Build the persistent pipeline ONCE.
@@ -210,10 +257,11 @@ public static class StressHarness
         // Audio: the engine is built, started, stopped and disposed PER CYCLE — the app's real per-perform path
         // (a rebuilt engine must re-baseline its content position against the already-running clock).
         AudioEngine? audioEngine = null;
-        var audioTrack = audioPath is null ? null : new AudioTrack { Name = Path.GetFileNameWithoutExtension(audioPath), SourceFilePath = audioPath };
+        var audioTrack = audioPath is null ? null : new AudioTrack { Name = Path.GetFileNameWithoutExtension(audioPath), SourceFilePath = audioPath, OutputDeviceId = options.AudioDevice };
         double audioPeakDriftMs = 0;
         long audioUnderruns = 0;
-        var audioFail = false;
+        float audioPeakLeft = 0, audioPeakRight = 0;
+        string? audioFail = null; // the first audio failure's cause; null = none
         var outputs = Array.Empty<OutputWindow>();
         var process = Process.GetCurrentProcess();
 
@@ -309,11 +357,31 @@ public static class StressHarness
                 if (audioTrack is not null)
                 {
                     audioEngine = new AudioEngine(clock, log, [audioTrack]);
+                    // Master is engine-wide state and is applied before Start (the controller's order); the
+                    // per-track setters bind to the live pipeline, which exists only after Start — the clock is
+                    // still paused here, so no content is rendered before they land.
+                    if (options.AudioMaster is { } master)
+                        audioEngine.SetMasterVolume(master);
                     audioEngine.Start();
+                    if (options.AudioGain is { } gain)
+                        audioEngine.SetTrackVolume(audioTrack.Id, gain);
+                    if (options.AudioPan is { } pan)
+                        audioEngine.SetTrackPan(audioTrack.Id, pan);
                     if (!audioEngine.Active)
                     {
-                        audioFail = true;
+                        audioFail ??= "no audio pipeline started";
                         log.Error("Stress", $"cycle {cycle:00}/{cycles}: no audio pipeline started for {audioTrack.SourceFilePath}.");
+                    }
+                    else
+                    {
+                        var opened = audioEngine.OpenedDevices[0].DeviceUid;
+                        if (cycle == 1)
+                            log.Info("Stress", $"audio track '{audioTrack.Name}' opened on device uid={opened ?? "?"}");
+                        if (options.AudioDevice is not null && opened != options.AudioDevice)
+                        {
+                            audioFail ??= "wrong audio device";
+                            log.Error("Stress", $"cycle {cycle:00}/{cycles}: audio opened on device '{opened ?? "?"}', requested '{options.AudioDevice}'.");
+                        }
                     }
                 }
                 clock.Start();
@@ -338,6 +406,20 @@ public static class StressHarness
                         cycleStartedAt.Restart(); // a soak is a deliberate dwell, not a stuck cycle
                 } while (!wedged && soakSeconds > 0 && hold.Elapsed < TimeSpan.FromSeconds(soakSeconds));
 
+                // Audio hold: the callback must have consumed real content (not just opened and rendered silence)
+                // before this cycle may end, or the audio gate below is measuring nothing. Bounded by the wedge timeout.
+                if (audioEngine is not null && !wedged && audioFail is null)
+                {
+                    var audioHold = Stopwatch.StartNew();
+                    while (audioEngine.RenderedSeconds < AudioMinContentSeconds && !audioEngine.AnyFaulted
+                           && audioHold.Elapsed < WedgeTimeout && !watchdogStop.Wait(5)) { }
+                    if (audioEngine.RenderedSeconds < AudioMinContentSeconds && !audioEngine.AnyFaulted)
+                    {
+                        audioFail ??= "audio rendered no content";
+                        log.Error("Stress", $"cycle {cycle:00}/{cycles}: audio rendered only {audioEngine.RenderedSeconds * 1000:0}ms of content in {WedgeTimeout.TotalSeconds:0}s (need {AudioMinContentSeconds * 1000:0}ms).");
+                    }
+                }
+
                 // ExitPerform: pause the clock, unbind + hide. Destroys NOTHING of the pipeline.
                 clock.Stop();
                 foreach (var output in outputs)
@@ -359,14 +441,18 @@ public static class StressHarness
                 {
                     var drift = audioEngine.PeakDriftMs;
                     var underruns = audioEngine.Underruns;
+                    var peakLeft = audioEngine.PeakLeft;
+                    var peakRight = audioEngine.PeakRight;
                     audioPeakDriftMs = Math.Max(audioPeakDriftMs, drift);
                     audioUnderruns += underruns;
+                    audioPeakLeft = Math.Max(audioPeakLeft, peakLeft);
+                    audioPeakRight = Math.Max(audioPeakRight, peakRight);
                     if (audioEngine.AnyFaulted)
                     {
-                        audioFail = true;
+                        audioFail ??= "audio decode faulted";
                         log.Error("Stress", $"cycle {cycle:00}/{cycles}: audio decode faulted.");
                     }
-                    audioText = $", audio drift={drift:0.0}ms underruns={underruns}";
+                    audioText = $", audio content={audioEngine.RenderedSeconds * 1000:0}ms drift={drift:0.0}ms underruns={underruns} peakL={peakLeft:0.000} peakR={peakRight:0.000}";
                     audioEngine.Stop();
                     audioEngine.Dispose();
                     audioEngine = null;
@@ -398,7 +484,7 @@ public static class StressHarness
                     hapText += $", stop+dispose {joinWatch.Elapsed.TotalMilliseconds:0}ms";
                 }
 
-                if (wedged || contentFail || audioFail)
+                if (wedged || contentFail || audioFail is not null)
                     break;
                 completed++;
 
@@ -468,16 +554,16 @@ public static class StressHarness
         var sourceFail = sourcesStarted != expectedSources || sourcesStopped != expectedSources || sourcesDisposed != expectedSources || texturesOutstandingAtDispose != 0;
         // A/V alignment gate: the audio engine drift-corrects its content position against the SAME MasterClock the
         // render thread selects frames from, so a stream that stayed inside the limit with zero starvation is aligned.
-        var audioGateFail = audioPath is not null && (audioFail || audioUnderruns > 0 || audioPeakDriftMs > AudioDriftLimitMs);
+        var audioGateFail = audioPath is not null && (audioFail is not null || audioUnderruns > 0 || audioPeakDriftMs > AudioDriftLimitMs);
         var passed = completed == cycles && !wedged && !contentFail && !leakFail && !allocFail && !wsFail && !frameFail && !sourceFail && !audioGateFail && provider.Tracker.LiveCount == 0;
         log.Info("Stress", $"cycles={completed}/{cycles} wedges={(wedged ? 1 : 0)} framesCompleted={outputs.Sum(o => o.PresentCount)} " +
                            (clipPath is null ? $"sourceFrames published={framesPublished} released={framesReleased} "
                                             : $"sources started={sourcesStarted} stopped={sourcesStopped} disposed={sourcesDisposed} (expected {expectedSources}) texturesOutstandingAtDispose={texturesOutstandingAtDispose} ") +
-                           (audioPath is null ? "" : $"audio peakDrift={audioPeakDriftMs:0.0}ms underruns={audioUnderruns} ") +
+                           (audioPath is null ? "" : $"audio peakDrift={audioPeakDriftMs:0.0}ms underruns={audioUnderruns} peakL={audioPeakLeft:0.000} peakR={audioPeakRight:0.000} ") +
                            $"trackedBaseline={baseline} maxGrowth={maxGrowth} allocMaxGrowth={allocGrowthMb}MB rssMaxGrowth={wsGrowthMb}MB trackedAfterTeardown={provider.Tracker.LiveCount}");
         log.Info("Stress", passed
             ? $"RESULT: PASS — all cycles clean, zero tracked-object growth, flat allocation and RSS{(audioPath is null ? "" : $", audio aligned (peakDrift={audioPeakDriftMs:0.0}ms, 0 underruns)")}."
-            : $"RESULT: FAIL — {(wedged ? "wedge detected" : contentFail ? "clip source did not advance / faulted" : leakFail ? "tracked Metal object growth (ownership bug)" : allocFail ? $"device allocation growth {allocGrowthMb}MB > {AllocatedGrowthLimitMb}MB" : wsFail ? $"RSS growth {wsGrowthMb}MB > {WorkingSetGrowthLimitMb}MB" : frameFail ? $"source frames published={framesPublished} released={framesReleased} (frame ownership bug)" : sourceFail ? $"sources started={sourcesStarted} stopped={sourcesStopped} disposed={sourcesDisposed}, expected {expectedSources}; {texturesOutstandingAtDispose} pooled texture(s) still held at dispose" : audioGateFail ? $"audio gate (peakDrift={audioPeakDriftMs:0.0}ms > {AudioDriftLimitMs}ms, underruns={audioUnderruns}, faulted={audioFail})" : provider.Tracker.LiveCount != 0 ? $"{provider.Tracker.LiveCount} tracked object(s) survived teardown" : "incomplete run")}.");
+            : $"RESULT: FAIL — {(wedged ? "wedge detected" : contentFail ? "clip source did not advance / faulted" : leakFail ? "tracked Metal object growth (ownership bug)" : allocFail ? $"device allocation growth {allocGrowthMb}MB > {AllocatedGrowthLimitMb}MB" : wsFail ? $"RSS growth {wsGrowthMb}MB > {WorkingSetGrowthLimitMb}MB" : frameFail ? $"source frames published={framesPublished} released={framesReleased} (frame ownership bug)" : sourceFail ? $"sources started={sourcesStarted} stopped={sourcesStopped} disposed={sourcesDisposed}, expected {expectedSources}; {texturesOutstandingAtDispose} pooled texture(s) still held at dispose" : audioGateFail ? $"audio gate ({AudioGateReason(audioFail, audioUnderruns, audioPeakDriftMs)})" : provider.Tracker.LiveCount != 0 ? $"{provider.Tracker.LiveCount} tracked object(s) survived teardown" : "incomplete run")}.");
         return passed ? 0 : 1;
     }
 
@@ -493,7 +579,7 @@ public static class StressHarness
     /// a stalled/faulted source, a non-HAP decoder under <c>--hap</c>, or an audio gate miss fails the run.
     /// </summary>
     private static int RunController(ILog log, IReadOnlyList<MonitorInfo> monitors, MonitorRect[] bounds, int cycles,
-        ShowMode mode, string? video, string? video2, bool requireHap, bool forceSw, string? audioPath)
+        ShowMode mode, string? video, string? video2, bool requireHap, bool forceSw, string? audioPath, StressOptions options)
     {
         log.Info("Stress", "=== CONTROLLER MODE: ApplyShow -> EnterPerform -> present -> ExitPerform per cycle (real per-perform path) ===");
 
@@ -540,8 +626,9 @@ public static class StressHarness
                 }
             }
         }
-        if (audioPath is not null)
-            show.AudioTracks.Add(new AudioTrack { Name = Path.GetFileNameWithoutExtension(audioPath), SourceFilePath = audioPath });
+        var audioTrack = audioPath is null ? null : new AudioTrack { Name = Path.GetFileNameWithoutExtension(audioPath), SourceFilePath = audioPath, OutputDeviceId = options.AudioDevice };
+        if (audioTrack is not null)
+            show.AudioTracks.Add(audioTrack);
         log.Info("Stress", $"show: mode={mode} sources={show.Sources.Count}{(show.Sources.Count == 0 ? " (test pattern)" : "")} audioTracks={show.AudioTracks.Count} windows={windows} requireHap={requireHap} forceSwDecode={forceSw}");
 
         var controller = new PerformanceController(infos, log, forceSw);
@@ -560,7 +647,7 @@ public static class StressHarness
         var completed = 0;
         var wedged = false;
         var contentFail = false;
-        var audioFail = false;
+        string? audioFail = null; // the first audio failure's cause; null = none
         double audioPeakDriftMs = 0;
         long audioUnderruns = 0;
         long baseline = -1, maxGrowth = 0;
@@ -594,6 +681,17 @@ public static class StressHarness
                 idle.Reset();
 
                 controller.ApplyShow(show);
+                // Mix settings through the controller's own setters, queued FIFO behind ApplyShow (the engine they
+                // address exists once it has run) and ahead of EnterPerform (the clock is still paused).
+                if (audioTrack is not null)
+                {
+                    if (options.AudioMaster is { } master)
+                        controller.SetMasterVolume(master);
+                    if (options.AudioGain is { } gain)
+                        controller.SetTrackVolume(audioTrack.Id, gain);
+                    if (options.AudioPan is { } pan)
+                        controller.SetTrackPan(audioTrack.Id, pan);
+                }
                 controller.EnterPerform();
                 if (!controller.WaitForQueue(WedgeTimeout))
                 {
@@ -612,7 +710,7 @@ public static class StressHarness
                         log.Info("Stress", $"source {s.Id} <- {s.Kind}");
                 if (audioPath is not null && controller.AudioStatus() is not { Active: true })
                 {
-                    audioFail = true;
+                    audioFail ??= "no audio pipeline started";
                     log.Error("Stress", $"cycle {cycle:00}/{cycles}: no audio pipeline started for {audioPath}.");
                 }
                 if (!controller.WaitForPresentedFrames(HoldFramesPerCycle, WedgeTimeout, out var stalled))
@@ -667,13 +765,13 @@ public static class StressHarness
                     audioUnderruns += audio.Underruns;
                     if (audio.Faulted)
                     {
-                        audioFail = true;
+                        audioFail ??= "audio decode faulted";
                         log.Error("Stress", $"cycle {cycle:00}/{cycles}: audio decode faulted.");
                     }
                     audioText = $", audio drift={audio.PeakDriftMs:0.0}ms underruns={audio.Underruns}";
                 }
 
-                if (contentFail || audioFail)
+                if (contentFail || audioFail is not null)
                     break;
                 completed++;
 
@@ -722,7 +820,7 @@ public static class StressHarness
         var allocFail = allocGrowthMb > AllocatedGrowthLimitMb;
         var wsFail = wsGrowthMb > WorkingSetGrowthLimitMb;
         var outstanding = controller.TexturesOutstandingAtDispose;
-        var audioGateFail = audioPath is not null && (audioFail || audioUnderruns > 0 || audioPeakDriftMs > AudioDriftLimitMs);
+        var audioGateFail = audioPath is not null && (audioFail is not null || audioUnderruns > 0 || audioPeakDriftMs > AudioDriftLimitMs);
         var commandFailures = Volatile.Read(ref failures);
         var survivors = controller.Tracker.LiveCount;
         var passed = completed == cycles && !wedged && !contentFail && !leakFail && !allocFail && !wsFail && outstanding == 0 && !audioGateFail && commandFailures == 0 && survivors == 0;
@@ -732,9 +830,14 @@ public static class StressHarness
                            $"trackedBaseline={baseline} maxGrowth={maxGrowth} allocMaxGrowth={allocGrowthMb}MB rssMaxGrowth={wsGrowthMb}MB trackedAfterTeardown={survivors}");
         log.Info("Stress", passed
             ? $"RESULT: PASS — {completed} controller cycles clean, zero tracked-object growth, flat allocation and RSS{(audioPath is null ? "" : $", audio aligned (peakDrift={audioPeakDriftMs:0.0}ms, 0 underruns)")}."
-            : $"RESULT: FAIL — {(wedged ? "wedge detected" : commandFailures > 0 ? "controller command failures" : contentFail ? "clip source did not advance / faulted / wrong decoder" : leakFail ? "tracked Metal object growth (ownership bug)" : allocFail ? $"device allocation growth {allocGrowthMb}MB > {AllocatedGrowthLimitMb}MB" : wsFail ? $"RSS growth {wsGrowthMb}MB > {WorkingSetGrowthLimitMb}MB" : outstanding != 0 ? $"{outstanding} pooled texture(s) still held at dispose" : audioGateFail ? $"audio gate (peakDrift={audioPeakDriftMs:0.0}ms > {AudioDriftLimitMs}ms, underruns={audioUnderruns}, faulted={audioFail})" : survivors != 0 ? $"{survivors} tracked object(s) survived teardown" : "incomplete run")}.");
+            : $"RESULT: FAIL — {(wedged ? "wedge detected" : commandFailures > 0 ? "controller command failures" : contentFail ? "clip source did not advance / faulted / wrong decoder" : leakFail ? "tracked Metal object growth (ownership bug)" : allocFail ? $"device allocation growth {allocGrowthMb}MB > {AllocatedGrowthLimitMb}MB" : wsFail ? $"RSS growth {wsGrowthMb}MB > {WorkingSetGrowthLimitMb}MB" : outstanding != 0 ? $"{outstanding} pooled texture(s) still held at dispose" : audioGateFail ? $"audio gate ({AudioGateReason(audioFail, audioUnderruns, audioPeakDriftMs)})" : survivors != 0 ? $"{survivors} tracked object(s) survived teardown" : "incomplete run")}.");
         return passed ? 0 : 1;
     }
+
+    /// <summary>The audio gate's actual cause, in the order the gate checks it — never a drift number for a
+    /// faulted run.</summary>
+    private static string AudioGateReason(string? audioFail, long underruns, double peakDriftMs) =>
+        audioFail ?? (underruns > 0 ? $"{underruns} post-prime underrun(s)" : $"peakDrift={peakDriftMs:0.0}ms > {AudioDriftLimitMs}ms");
 
     /// <summary>Split UV for output <paramref name="index"/> of <paramref name="count"/>: the near-square
     /// auto-grid over one source, row-major (2 → left/right halves; 4 → the quadrants). The controller path drives

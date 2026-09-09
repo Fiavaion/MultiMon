@@ -6,7 +6,7 @@ using MultiMon.Platform.Mac;
 using MultiMon.Stress.Mac;
 
 // Headless stress harness entry point — the Mac primary verification gate.
-// Usage: MultiMon.Stress.Mac --cycles=50 --windows=1 [--fullscreen] [--soak-seconds=S] [--audio [--audio-file=PATH]] [--video=CLIP [--video2=CLIP] [--hap] [--force-sw-decode] [--mode=span|individual|split|hap]] [--controller] | --source-check [--video=HAP.mov] [--video2=colour_h264.mp4] | --list-monitors | --list-audio
+// Usage: MultiMon.Stress.Mac --cycles=50 --windows=1 [--fullscreen] [--soak-seconds=S] [--audio [--audio-file=PATH] [--audio-device=UID] [--audio-gain=0..1] [--audio-pan=-1..1] [--audio-master=0..1]] [--video=CLIP [--video2=CLIP] [--hap] [--force-sw-decode] [--mode=span|individual|split|hap]] [--controller] | --source-check [--video=HAP.mov] [--video2=colour_h264.mp4] | --list-monitors | --list-audio
 // NSScreen needs the AppKit application object to exist before any display is enumerated.
 NSApplication.Init();
 
@@ -28,7 +28,7 @@ if (args.Length == 1 && args[0] == "--list-audio")
 
 if (!StressHarness.TryParse(args, out var options))
 {
-    Console.Error.WriteLine("usage: MultiMon.Stress.Mac --cycles=N --windows=N [--fullscreen] [--soak-seconds=S] [--audio [--audio-file=PATH]] [--video=CLIP [--video2=CLIP] [--hap] [--force-sw-decode] [--mode=span|individual|split|hap]] [--controller] | --source-check [--video=HAP.mov] [--video2=colour_h264.mp4] | --list-monitors | --list-audio");
+    Console.Error.WriteLine("usage: MultiMon.Stress.Mac --cycles=N --windows=N [--fullscreen] [--soak-seconds=S] [--audio [--audio-file=PATH] [--audio-device=UID] [--audio-gain=0..1] [--audio-pan=-1..1] [--audio-master=0..1]] [--video=CLIP [--video2=CLIP] [--hap] [--force-sw-decode] [--mode=span|individual|split|hap]] [--controller] | --source-check [--video=HAP.mov] [--video2=colour_h264.mp4] | --list-monitors | --list-audio");
     return 2;
 }
 
