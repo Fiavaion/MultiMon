@@ -11,7 +11,8 @@ namespace MultiMon.Control.Mac;
 /// "Identify": a borderless number overlay on each physical monitor so the performer can tell which screen
 /// is "Monitor 1" before assigning videos. Pure Avalonia — no Metal, no output window; it never touches the
 /// render loop or a CAMetalLayer. Toggled from the control panel, auto-hidden when a show starts. Click any
-/// overlay to dismiss. UI-thread only, like every other window here.
+/// overlay, or press Esc (in the panel, which keeps focus, or on an overlay), to dismiss. UI-thread only,
+/// like every other window here.
 /// </summary>
 internal sealed class IdentifyOverlays
 {
@@ -89,11 +90,25 @@ internal sealed class IdentifyOverlays
             // MonitorService reports physical pixels with a top-left origin — the same space as
             // PixelPoint/PixelSize — so the overlay covers exactly its monitor on mixed-scale layouts.
             Position = new PixelPoint((int)b.Left, (int)b.Top),
+            // Never steal focus: the control panel keeps the keyboard, so Esc there dismisses these too.
+            ShowActivated = false,
             Content = card,
         };
-        w.Width = b.Width;
-        w.Height = b.Height;
+        // Unit rule: Position is physical pixels, but Width/Height are DIPs — divide by the screen's scale or
+        // a 2x Retina overlay is built twice the size of its monitor.
+        var centre = new PixelPoint((int)(b.Left + b.Width / 2), (int)(b.Top + b.Height / 2));
+        var scale = w.Screens.ScreenFromPoint(centre)?.Scaling ?? 1.0;
+        w.Width = b.Width / scale;
+        w.Height = b.Height / scale;
         w.PointerPressed += (_, _) => Hide();
+        w.KeyDown += (_, e) =>
+        {
+            if (e.Key is Key.Escape or Key.Space)
+            {
+                Hide();
+                e.Handled = true;
+            }
+        };
         w.Show();
         return w;
     }

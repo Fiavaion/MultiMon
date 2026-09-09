@@ -28,11 +28,11 @@
 
     <!-- Mode + audio device -->
     <StackPanel Grid.Row="2" Orientation="Horizontal" Margin="0,0,0,12">
-      <TextBlock Text="MODE" Classes="label" Margin="0,0,8,0"/>
-      <ComboBox Name="ModeCombo" Width="150" ItemsSource="{Binding Modes}"
+      <TextBlock Name="ModeLabel" Text="MODE" Classes="label" Margin="0,0,8,0"/>
+      <ComboBox Name="ModeCombo" Width="150" AutomationProperties.LabeledBy="{Binding #ModeLabel}" ItemsSource="{Binding Modes}"
                 SelectedItem="{Binding SelectedMode}" IsEnabled="{Binding CanEdit}"/>
-      <TextBlock Text="AUDIO DEVICE" Classes="label" Margin="22,0,8,0"/>
-      <ComboBox Name="AudioCombo" Width="280" ItemsSource="{Binding AudioDevices}"
+      <TextBlock Name="AudioDeviceLabel" Text="AUDIO DEVICE" Classes="label" Margin="22,0,8,0"/>
+      <ComboBox Name="AudioCombo" Width="280" AutomationProperties.LabeledBy="{Binding #AudioDeviceLabel}" ItemsSource="{Binding AudioDevices}"
                 SelectedItem="{Binding SelectedAudioDevice}" IsEnabled="{Binding CanEdit}">
         <ComboBox.ItemTemplate>
           <DataTemplate><TextBlock Text="{Binding Name}"/></DataTemplate>
@@ -101,7 +101,8 @@
           <!-- Master + add -->
           <StackPanel DockPanel.Dock="Top" Orientation="Horizontal" Margin="4,2,4,8">
             <TextBlock Text="MASTER" Classes="label" Width="54"/>
-            <Slider Width="120" Minimum="0" Maximum="1" Value="{Binding MasterVolume}" VerticalAlignment="Center"/>
+            <Slider Width="120" Minimum="0" Maximum="1" Value="{Binding MasterVolume}" VerticalAlignment="Center"
+                    AutomationProperties.Name="Master volume"/>
             <CheckBox Content="Mute" VerticalAlignment="Center" Margin="10,0,0,0" IsChecked="{Binding MasterMuted}"/>
             <Button Content="Add audio…" Margin="16,0,0,0" Click="AddAudio_Click" IsEnabled="{Binding CanEdit}"/>
           </StackPanel>
@@ -114,15 +115,18 @@
                       <TextBlock Text="{Binding Name}" Foreground="{StaticResource TextPrimaryBrush}" Width="110"
                                  TextTrimming="CharacterEllipsis" VerticalAlignment="Center"/>
                       <TextBlock Text="VOL" Classes="hint" VerticalAlignment="Center" Margin="6,0,4,0"/>
-                      <Slider Width="80" Minimum="0" Maximum="1" Value="{Binding Volume}" VerticalAlignment="Center"/>
+                      <Slider Width="80" Minimum="0" Maximum="1" Value="{Binding Volume}" VerticalAlignment="Center"
+                              AutomationProperties.Name="{Binding Name, StringFormat='Volume {0}'}"/>
                       <ToggleButton Content="M" Width="30" Margin="6,0,0,0" IsChecked="{Binding Muted}"
-                                    ToolTip.Tip="Mute"/>
+                                    ToolTip.Tip="Mute" AutomationProperties.Name="{Binding Name, StringFormat='Mute {0}'}"/>
                       <ToggleButton Content="S" Width="30" Margin="3,0,0,0" IsChecked="{Binding Solo}"
-                                    ToolTip.Tip="Solo"/>
+                                    ToolTip.Tip="Solo" AutomationProperties.Name="{Binding Name, StringFormat='Solo {0}'}"/>
                       <TextBlock Text="PAN" Classes="hint" VerticalAlignment="Center" Margin="8,0,4,0"/>
-                      <Slider Width="60" Minimum="-1" Maximum="1" Value="{Binding Pan}" VerticalAlignment="Center"/>
+                      <Slider Width="60" Minimum="-1" Maximum="1" Value="{Binding Pan}" VerticalAlignment="Center"
+                              AutomationProperties.Name="{Binding Name, StringFormat='Pan {0}'}"/>
                       <Button Content="✕" Width="28" Margin="6,0,0,0" Click="RemoveAudio_Click"
-                              ToolTip.Tip="Remove track" IsVisible="{Binding CanRemove}"/>
+                              ToolTip.Tip="Remove track" IsVisible="{Binding CanRemove}"
+                              AutomationProperties.Name="{Binding Name, StringFormat='Remove track {0}'}"/>
                     </StackPanel>
                   </Border>
                 </DataTemplate>

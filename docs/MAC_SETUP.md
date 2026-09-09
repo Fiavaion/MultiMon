@@ -202,7 +202,7 @@ assemblies in "Solution structure". Commit on a `mac-port` branch: `Scaffold the
 **Control-panel dev switch.** `MultiMon.Control.Mac --autoperform=<clip>[,seconds]` loads the clip on
 monitor 1, performs for `seconds` (default 3), stops and exits 0 — driving the real `MainViewModel`, so it
 gates the path the user clicks (LESSON-TEST-004) and includes the ordered teardown. Headless-friendly:
-`… --autoperform=~/…/5sec.mp4,3 > run.log 2>&1`; the log ends `teardown complete: live=0`.
+`… --autoperform=~/…/5sec.mp4,3 > run.log 2>&1`; the pass signal is exit 0 plus the MEASURED tracker line `teardown complete: live=0 (textures=0 buffers=0 …)` — a wedge, a faulted teardown or any survivor logs `RESULT: FAIL — …` and exits 70.
 
 **The display must be awake** for any Mac GUI run here: Avalonia's macOS backend creates a `CVDisplayLink`,
 and with the screen locked and the panel asleep `CGGetActiveDisplayList` returns 0 displays, so startup dies

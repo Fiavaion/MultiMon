@@ -15,10 +15,3 @@ public interface IUiDispatcher
     /// <summary>Queue <paramref name="action"/> on the UI thread and return immediately. Never blocks.</summary>
     void Post(Action action);
 }
-
-/// <summary>Runs everything inline — for headless hosts (tests, the dev autoperform switch) with no UI thread.</summary>
-public sealed class ImmediateUiDispatcher : IUiDispatcher
-{
-    public bool IsOnUiThread => true;
-    public void Post(Action action) => action();
-}

@@ -73,6 +73,12 @@ public partial class MainWindow : Window
                 _vm.Stop();
                 e.Handled = true;
                 break;
+            // The identify overlays never take focus (ShowActivated = false), so this is the keyboard's
+            // way to dismiss them.
+            case Key.Escape when _identify.Active:
+                _identify.Hide();
+                e.Handled = true;
+                break;
             case Key.Space when _vm.IsPerforming:
                 _vm.TogglePause();
                 e.Handled = true;
@@ -81,7 +87,7 @@ public partial class MainWindow : Window
     }
 
     /// <summary>Toggle the number overlay on every monitor (helps map physical screens to the per-monitor
-    /// assignment rows). Click any overlay, or this button again, to dismiss.</summary>
+    /// assignment rows). Click any overlay, press Esc, or this button again, to dismiss.</summary>
     private void Identify_Click(object? sender, RoutedEventArgs e) => _identify.Toggle(_vm.Monitors);
 
     private async void BrowseRow_Click(object? sender, RoutedEventArgs e)

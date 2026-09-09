@@ -224,6 +224,13 @@ public sealed class PerformanceController : IPerformanceController
     /// pooled texture was still held by GPU work when its source went away (the fence and the teardown order disagree).</summary>
     internal int TexturesOutstandingAtDispose { get; private set; }
 
+    /// <summary>Tracked Metal objects still alive — read after <see cref="Dispose"/> by the app's exit path, which
+    /// refuses to exit 0 while it is non-zero (the same measurement the harness gates on).</summary>
+    public long TrackedLiveCount => _provider.Tracker.LiveCount;
+
+    /// <summary>The tracker's own per-kind line, "live=N (textures=… buffers=… …)", as the harness prints it.</summary>
+    public string TrackedResourceReport => _provider.Tracker.ToString();
+
     internal MetalResourceTracker Tracker => _provider.Tracker;
     internal ulong AllocatedBytes => _provider.CurrentAllocatedSize;
     internal RenderLoop Loop => _loop;

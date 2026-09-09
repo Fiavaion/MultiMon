@@ -16,10 +16,12 @@ internal static class Program
     /// handling input.
     /// </summary>
     [STAThread]
-    public static void Main(string[] args)
+    public static int Main(string[] args)
     {
         NSApplication.Init();
-        BuildAvaloniaApp().StartWithClassicDesktopLifetime(args);
+        // The lifetime's return value IS the code App.RequestExitAsync passed to Shutdown — returning it is
+        // what makes a wedge / leak / autoperform failure visible to the shell instead of exit 0.
+        return BuildAvaloniaApp().StartWithClassicDesktopLifetime(args);
     }
 
     // Avalonia configuration, don't remove; also used by visual designer.
