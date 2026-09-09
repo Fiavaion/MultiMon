@@ -65,6 +65,8 @@ public static class StressHarness
     private const long AllocatedGrowthLimitMb = 128;    // the layer's drawable pool (3 × a 4K BGRA surface) may come and go
     private const double AudioDriftLimitMs = 40;       // the Mac runbook's A/V alignment gate for the audio milestone
     private const double AudioMinContentSeconds = 0.25; // every audio cycle must actually PLAY this much before it may exit
+    private const double AudioMaxLeadInSeconds = 2.0;   // a fixture may open with encoder-delay/intro silence; past this much content, silence = FAIL
+    private const float AudioMinPeak = 0.01f;           // -40 dBFS post-gain: above MP3 dither (Kashmir's lead-in meters 0.0001), below any real content
     private static readonly TimeSpan WedgeTimeout = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan CycleDeadline = TimeSpan.FromSeconds(10);
 
@@ -260,7 +262,7 @@ public static class StressHarness
         // (a rebuilt engine must re-baseline its content position against the already-running clock).
         AudioEngine? audioEngine = null;
         var audioTrack = audioPath is null ? null : new AudioTrack { Name = Path.GetFileNameWithoutExtension(audioPath), SourceFilePath = audioPath, OutputDeviceId = options.AudioDevice };
-        var audioGate = new AudioGate(log, cycles, options.AudioDevice);
+        var audioGate = new AudioGate(log, cycles, options.AudioDevice, expectSignal: options.AudioGain is not 0 && options.AudioMaster is not 0);
         var outputs = Array.Empty<OutputWindow>();
         var process = Process.GetCurrentProcess();
 
@@ -605,7 +607,7 @@ public static class StressHarness
         var completed = 0;
         var wedged = false;
         var contentFail = false;
-        var audioGate = new AudioGate(log, cycles, options.AudioDevice);
+        var audioGate = new AudioGate(log, cycles, options.AudioDevice, expectSignal: options.AudioGain is not 0 && options.AudioMaster is not 0);
         long baseline = -1, maxGrowth = 0;
         ulong allocBaseline = 0, allocMax = 0;
         long wsBaseline = 0, wsMax = 0;
@@ -870,7 +872,7 @@ public static class StressHarness
     /// run verdict: any fault, any post-prime underrun, or a peak |audio − MasterClock| over
     /// <see cref="AudioDriftLimitMs"/> fails the run. Post-gain peaks are logged so a mix run can be checked against unity.
     /// </summary>
-    private sealed class AudioGate(ILog log, int cycles, string? requestedDevice)
+    private sealed class AudioGate(ILog log, int cycles, string? requestedDevice, bool expectSignal)
     {
         /// <summary>The first failure's cause; null = none so far.</summary>
         public string? Fail { get; private set; }
@@ -907,21 +909,35 @@ public static class StressHarness
         }
 
         /// <summary>The content hold: the render callback must have consumed real content (not just opened and rendered
-        /// silence) before the cycle may end, or the sample below measures nothing. Bounded by <see cref="WedgeTimeout"/>.</summary>
+        /// silence) AND, when the run's gain is non-zero, metered a post-gain peak of at least <see cref="AudioMinPeak"/> on some channel before the
+        /// cycle may end, or the sample below measures nothing (LESSON-TEST-005: a fixture that opens with encoder-delay
+        /// or intro silence — Kashmir's first ~350 ms decodes to exact zeros — makes a content-only hold meter silence and
+        /// call it played). A fixture that is still silent after <see cref="AudioMaxLeadInSeconds"/> of content fails.
+        /// Bounded by <see cref="WedgeTimeout"/>.</summary>
         public void HoldForContent(int cycle, Func<AudioSample> sample, ManualResetEventSlim stop)
         {
             if (Fail is not null)
                 return;
             var hold = Stopwatch.StartNew();
             var s = sample();
-            while (s.RenderedSeconds < AudioMinContentSeconds && !s.Faulted && hold.Elapsed < WedgeTimeout && !stop.Wait(5))
+            while (!Satisfied(s) && !s.Faulted && s.RenderedSeconds < AudioMaxLeadInSeconds && hold.Elapsed < WedgeTimeout && !stop.Wait(5))
                 s = sample();
-            if (s.RenderedSeconds < AudioMinContentSeconds && !s.Faulted)
+            if (s.Faulted || Satisfied(s))
+                return;
+            if (s.RenderedSeconds < AudioMinContentSeconds)
             {
                 Fail ??= "audio rendered no content";
                 log.Error("Stress", $"cycle {cycle:00}/{cycles}: audio rendered only {s.RenderedSeconds * 1000:0}ms of content in {WedgeTimeout.TotalSeconds:0}s (need {AudioMinContentSeconds * 1000:0}ms).");
             }
+            else
+            {
+                Fail ??= "audio rendered silence";
+                log.Error("Stress", $"cycle {cycle:00}/{cycles}: audio rendered {s.RenderedSeconds * 1000:0}ms of content but the post-gain peak stayed below {AudioMinPeak} (peakL={s.PeakLeft:0.0000} peakR={s.PeakRight:0.0000}; gain expected non-zero).");
+            }
         }
+
+        private bool Satisfied(AudioSample s) =>
+            s.RenderedSeconds >= AudioMinContentSeconds && (!expectSignal || s.PeakLeft >= AudioMinPeak || s.PeakRight >= AudioMinPeak);
 
         /// <summary>The end-of-perform sample: accumulates the run counters and returns the cycle's log text.</summary>
         public string Sample(int cycle, AudioSample s)
