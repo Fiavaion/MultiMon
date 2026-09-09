@@ -243,12 +243,14 @@ assemblies in "Solution structure". Commit on a `mac-port` branch: `Scaffold the
       Gate: harness `--audio` 30 cycles, 0 underruns, peak drift under 40 ms.
       *Done 2026-09-08.* AUHAL per track (device-selectable; AVAudioEngine cannot target a device). `AudioRing` moved to
       `MultiMon.Core/Audio` (namespace `MultiMon.Audio` kept) — **needs one Windows build of `MultiMon.sln` before merge.**
-- [ ] **TODO 7 — Mac `PerformanceController` + `MultiMon.Stress.Mac --controller`.** Same shape as
+- [x] **TODO 7 — Mac `PerformanceController` + `MultiMon.Stress.Mac --controller`.** Same shape as
       Windows: one worker thread, `BlockingCollection<Action>` FIFO, UI posts and returns, `StateChanged` /
       `CommandFailed` events, `ShowPlanner` for the mapping (no port needed), symmetric decode ladder (`.mov`
       probed on HAP first). **Never** run native teardown on the AppKit main thread — LESSON-TEST-004 and the
       V0087 deadlock rule apply verbatim.
       Gate: `--controller` 50 cycles PASS in Span, Individual, Split, HAP and audio.
+      *Done 2026-09-09.* Host contract: construct/dispose the controller off the main thread; keep the NSApplication
+      run loop pumping (window show/hide is marshalled to the main queue with a 5 s bound).
 - [ ] **TODO 8 — Avalonia control panel.** Reuse `MainViewModel`'s contract (WPF today; lift the view-model
       logic into a portable `MultiMon.Control.Shared` if the Dispatcher seam is the only WPF dependency —
       check first). Monitor rows, mode picker, Identify overlay, mixer, New/Open/Save, Convert-to-HAP
