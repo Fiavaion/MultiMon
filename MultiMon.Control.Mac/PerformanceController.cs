@@ -208,9 +208,17 @@ public sealed class PerformanceController : IPerformanceController
     internal IReadOnlyList<(string Id, string Kind, TimeSpan Pts, long Decoded, bool Faulted)> SourceStatus() =>
         _sources.Select(s => (s.Id, s.GetType().Name, s.CurrentPts, s.DecodedFrames, s.IsFaulted)).ToList();
 
-    /// <summary>Audio gate counters of the current show's engine (null = no audio in the show). Same precondition.</summary>
-    internal (bool Active, double PeakDriftMs, long Underruns, bool Faulted)? AudioStatus() =>
-        _audio is null ? null : (_audio.Active, _audio.PeakDriftMs, _audio.Underruns, _audio.AnyFaulted);
+    /// <summary>Audio gate counters of the current show's engine (null = no audio in the show) — the same fields the
+    /// bind-once harness path reads off its own engine, so the controller path runs the SAME content-asserting gate
+    /// (LESSON-TEST-005). Same precondition.</summary>
+    internal (bool Active, double PeakDriftMs, long Underruns, bool Faulted, double RenderedSeconds, float PeakLeft, float PeakRight,
+        IReadOnlyList<(string TrackId, string? DeviceUid)> OpenedDevices)? AudioStatus() =>
+        _audio is null ? null : (_audio.Active, _audio.PeakDriftMs, _audio.Underruns, _audio.AnyFaulted,
+                                 _audio.RenderedSeconds, _audio.PeakLeft, _audio.PeakRight, _audio.OpenedDevices);
+
+    /// <summary>How many outputs of the current show run on their own clock (Individual free-run) — the harness's
+    /// proof that <c>--free-run</c> actually took the free-run path. Same precondition.</summary>
+    internal int FreeRunClockCount => _freeRunClocks.Count;
 
     /// <summary>Sum of every torn-down source's <see cref="IMetalSource.OutstandingAtDispose"/> — non-zero means a
     /// pooled texture was still held by GPU work when its source went away (the fence and the teardown order disagree).</summary>
@@ -234,8 +242,22 @@ public sealed class PerformanceController : IPerformanceController
             return;
         }
 
-        foreach (var i in _activeOutputs)
-            _outputs[i].Show(Monitors[i].Bounds);
+        // Show every bound output. A Show that fails partway (MainThread.Invoke timing out because the main run
+        // loop stopped pumping) must not leave the earlier windows on screen with the state still Idle — ExitPerform's
+        // Idle early-return would never hide them. Hide every active output (best effort, each on its own: the one
+        // whose Show timed out may still appear when the main thread resumes, and the queue is FIFO) and rethrow →
+        // CommandFailed; the state stays Idle and the clock never starts.
+        try
+        {
+            foreach (var i in _activeOutputs)
+                _outputs[i].Show(Monitors[i].Bounds);
+        }
+        catch
+        {
+            foreach (var i in _activeOutputs)
+                TryHide(i, "rollback after a failed Show");
+            throw;
+        }
         // Each performance starts its timeline at zero: ApplyShow rebuilt the sources (PTS 0) and the audio
         // engine (content position 0), so the clock MUST restart at 0 too — else audio "catches up" to the
         // banked clock time by dropping frames (the Windows garbled-start bug). Reset, then start.
@@ -257,16 +279,23 @@ public sealed class PerformanceController : IPerformanceController
         foreach (var s in _sources)
             if (s.IsFaulted)
                 _log.Error("Control", $"Source '{s.Id}' faulted during the show (see Decode lines above); it is rebuilt on the next Perform.");
+        foreach (var i in _activeOutputs)
+            TryHide(i, "ExitPerform"); // one failed Hide must not skip the remaining outputs
+        SetState(PerformState.Idle);
+    }
+
+    /// <summary>Hides one output, logging instead of throwing (a main-thread timeout must not leave the other
+    /// outputs of a multi-window change on screen).</summary>
+    private void TryHide(int index, string phase)
+    {
         try
         {
-            foreach (var i in _activeOutputs)
-                _outputs[i].Hide();
+            _outputs[index].Hide();
         }
         catch (Exception ex)
         {
-            _log.Error("Control", $"Hide on the main thread failed (main run loop not pumping?): {ex.Message}");
+            _log.Error("Control", $"{_outputs[index].Name}: Hide on the main thread failed during {phase} (main run loop not pumping?): {ex.Message}");
         }
-        SetState(PerformState.Idle);
     }
 
     private void TogglePauseCore()
