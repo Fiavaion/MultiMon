@@ -265,6 +265,10 @@ with `Avalonia.Native was not able to start the RenderTimer. Native error code i
       logic into a portable `MultiMon.Control.Shared` if the Dispatcher seam is the only WPF dependency —
       check first). Monitor rows, mode picker, Identify overlay, mixer, New/Open/Save, Convert-to-HAP
       (ffmpeg via a Homebrew path probe). Gate: the user's manual run of every mode.
+      *Code-complete 2026-09-09* (commit "Mac control panel"); the manual-run gate is still open. Host contract: `NSApplication.Init()`
+      first on the main thread; controller built/disposed off the main thread; exit = bounded off-thread teardown while the run loop
+      is alive, then `desktop.Shutdown()` (LESSON-BUG-009). Mac-specific choices: hotkeys frontmost-only, no Report-a-bug button,
+      HAP always enabled on Metal.
 - [ ] **TODO 9 — Ship gate.** Full matrix on Apple Silicon **and** one Intel Mac; write
       `docs/sessions/<date>-mac-checkpoint.md`; update `notes/CURRENT_STATUS.md`; ADR 0005 "macOS platform
       layers" in `docs/adr/` recording the stack choices actually made.
