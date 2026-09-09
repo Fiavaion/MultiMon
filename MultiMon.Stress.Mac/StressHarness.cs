@@ -6,22 +6,25 @@ using MultiMon.Core.Models;
 using MultiMon.Core.Sync;
 using MultiMon.Core.Timing;
 using MultiMon.Audio.Mac;
+using MultiMon.Control.Mac;
+using MultiMon.Core.Abstractions;
+using MultiMon.Core.Show;
 using MultiMon.Decode.Mac;
+using MultiMon.Decode.Mac.Hap;
 using MultiMon.Graphics.Mac;
 using MultiMon.Platform.Mac;
 
 namespace MultiMon.Stress.Mac;
 
-/// <summary>How clip sources bind to outputs: Span = ONE source, each output samples its UvLayout slice;
-/// Individual = one source per output, full frame (the multi-decoder concurrency path).</summary>
-public enum HapMode { Span, Individual }
-
 /// <summary><paramref name="Hap"/> refuses the ladder's VideoToolbox fallthrough (a HAP gate must run HAP);
 /// <paramref name="Video2"/> feeds the second output in Individual mode; <paramref name="ForceSwDecode"/> forces the
 /// VideoToolbox software session (the Windows <c>--force-sw-decode</c>); <paramref name="Audio"/> adds a real audio
-/// track per cycle, from <paramref name="AudioFile"/> or the video's own audio stream.</summary>
+/// track per cycle, from <paramref name="AudioFile"/> or the video's own audio stream. <paramref name="Mode"/> is the
+/// show mode (Span = ONE source, each output samples its UvLayout slice; Individual/Hap = one source per output, full
+/// frame; Split = one source through the auto-grid cells). <paramref name="Controller"/> drives the real
+/// <see cref="PerformanceController"/> instead of the bind-once loop.</summary>
 public sealed record StressOptions(int Cycles, int Windows, bool Fullscreen, int SoakSeconds, bool SourceCheck,
-    bool Hap, string? Video, string? Video2, bool ForceSwDecode, HapMode Mode, bool Audio, string? AudioFile);
+    bool Hap, string? Video, string? Video2, bool ForceSwDecode, ShowMode Mode, bool Audio, string? AudioFile, bool Controller);
 
 /// <summary>
 /// The Mac twin of <c>MultiMon.Stress.StressHarness</c>'s bind-once loop: build the persistent Metal pipeline
@@ -41,7 +44,8 @@ public sealed record StressOptions(int Cycles, int Windows, bool Fullscreen, int
 /// Metal object count is the baseline and ANY later growth fails the run — growth is an ownership bug,
 /// never something to mask (LESSON-BUG-001). A watchdog fails the run loudly if a cycle does not complete
 /// within <see cref="CycleDeadline"/>, printing the stuck state. Runs on its own thread; the main thread
-/// only pumps AppKit.
+/// only pumps AppKit. <c>--controller</c> instead drives the app's REAL per-perform path through
+/// <see cref="PerformanceController"/> (<see cref="RunController"/>).
 /// </summary>
 public static class StressHarness
 {
@@ -55,13 +59,14 @@ public static class StressHarness
 
     public static bool TryParse(string[] args, out StressOptions options)
     {
-        options = new StressOptions(50, 1, false, 0, false, false, null, null, false, HapMode.Span, false, null);
+        options = new StressOptions(50, 1, false, 0, false, false, null, null, false, ShowMode.Span, false, null, false);
         var cycles = 50; var windows = 1; var fullscreen = false; var soak = 0; var sourceCheck = false;
-        var hap = false; string? video = null; string? video2 = null; var forceSw = false; var mode = HapMode.Span;
-        var audio = false; string? audioFile = null;
+        var hap = false; string? video = null; string? video2 = null; var forceSw = false; var mode = ShowMode.Span;
+        var audio = false; string? audioFile = null; var controller = false;
         foreach (var arg in args)
         {
             if (arg == "--fullscreen") fullscreen = true;
+            else if (arg == "--controller") controller = true;
             else if (arg == "--audio") audio = true;
             else if (arg.StartsWith("--audio-file=", StringComparison.Ordinal) && arg.Length > "--audio-file=".Length) audioFile = arg["--audio-file=".Length..];
             else if (arg == "--source-check") sourceCheck = true;
@@ -69,14 +74,16 @@ public static class StressHarness
             else if (arg.StartsWith("--video=", StringComparison.Ordinal) && arg.Length > "--video=".Length) video = arg["--video=".Length..];
             else if (arg.StartsWith("--video2=", StringComparison.Ordinal) && arg.Length > "--video2=".Length) video2 = arg["--video2=".Length..];
             else if (arg == "--force-sw-decode") forceSw = true;
-            else if (arg == "--mode=span") mode = HapMode.Span;
-            else if (arg == "--mode=individual") mode = HapMode.Individual;
+            else if (arg == "--mode=span") mode = ShowMode.Span;
+            else if (arg == "--mode=individual") mode = ShowMode.Individual;
+            else if (arg == "--mode=split") mode = ShowMode.Split;
+            else if (arg == "--mode=hap") mode = ShowMode.Hap;
             else if (arg.StartsWith("--cycles=", StringComparison.Ordinal) && int.TryParse(arg["--cycles=".Length..], out var c) && c > 0) cycles = c;
             else if (arg.StartsWith("--windows=", StringComparison.Ordinal) && int.TryParse(arg["--windows=".Length..], out var w) && w > 0) windows = w;
             else if (arg.StartsWith("--soak-seconds=", StringComparison.Ordinal) && int.TryParse(arg["--soak-seconds=".Length..], out var s) && s >= 0) soak = s;
             else return false;
         }
-        options = new StressOptions(cycles, windows, fullscreen, soak, sourceCheck, hap, video, video2, forceSw, mode, audio, audioFile);
+        options = new StressOptions(cycles, windows, fullscreen, soak, sourceCheck, hap, video, video2, forceSw, mode, audio, audioFile, controller);
         return true;
     }
 
@@ -93,7 +100,7 @@ public static class StressHarness
         if (options.SourceCheck)
             return SourceCheck.Run(log, clipPath ?? ResolveHapClip(options with { Hap = true }, log), ResolveVideoToolboxClip(options, log));
 
-        var (cycles, windows, fullscreen, soakSeconds, _, requireHap, _, video2, forceSw, mode, _, _) = options;
+        var (cycles, windows, fullscreen, soakSeconds, _, requireHap, _, video2, forceSw, mode, _, _, controller) = options;
 
         // Audio: resolve the track file BEFORE any cycle runs. --audio-file wins; otherwise the video's
         // own audio stream is used, and a video without one FAILS loudly — a silent fallback would report PASS
@@ -124,9 +131,10 @@ public static class StressHarness
             }
         }
         // Per-source clip list: Individual mode gives output i clip i (the second from --video2, else the first again).
+        var perOutput = mode is ShowMode.Individual or ShowMode.Hap; // one source per output; else one shared source
         var clips = clipPath is null ? Array.Empty<string>() : video2 is null ? [clipPath] : [clipPath, video2];
-        if (video2 is not null && (clipPath is null || mode != HapMode.Individual))
-            log.Info("Stress", "NOTE: --video2 only feeds the second source in --mode=individual with --video — ignored.");
+        if (video2 is not null && (clipPath is null || !perOutput))
+            log.Info("Stress", "NOTE: --video2 only feeds the second source in --mode=individual|hap with --video — ignored.");
         log.Info("Stress", $"cycles={cycles} windows={windows} fullscreen={fullscreen} soakSeconds={(soakSeconds > 0 ? soakSeconds.ToString() : "off")} " +
                            $"audio={(audioPath ?? "off")} " +
                            (clipPath is not null ? $"content={string.Join(" + ", clips)} mode={mode} requireHap={requireHap} forceSwDecode={forceSw} (sources created/started/stopped/disposed per cycle)"
@@ -158,6 +166,16 @@ public static class StressHarness
             bounds[i] = fullscreen ? monitors[i].Bounds : new MonitorRect(120 + i * (wWidth + wGap), 120, wWidth, wHeight);
             if (!fullscreen && !Contains(primary.Bounds, bounds[i]))
                 log.Info("Stress", $"NOTE: Output{i + 1} rect {bounds[i]} leaves the primary display {primary.Bounds} — partly or fully off-screen; the compositor may hand it no drawables.");
+        }
+
+        if (controller)
+        {
+            if (soakSeconds > 0)
+            {
+                log.Error("Stress", "--soak-seconds is not supported with --controller (use the bind-once loop for it).");
+                return 2;
+            }
+            return RunController(log, monitors, bounds, cycles, mode, clipPath, video2, requireHap, forceSw, audioPath);
         }
 
         // Build the persistent pipeline ONCE.
@@ -247,7 +265,7 @@ public static class StressHarness
                 var ptsAtStart = Array.Empty<TimeSpan>();
                 if (clipPath is not null)
                 {
-                    var perCycle = mode == HapMode.Individual ? windows : 1;
+                    var perCycle = perOutput ? windows : 1;
                     for (var i = 0; i < perCycle; i++)
                     {
                         var source = SourceLadder.Open(clips[i % clips.Length], provider, log, requireHap, forceSw, perCycle == 1 ? "clip" : $"clip{i + 1}");
@@ -274,9 +292,9 @@ public static class StressHarness
                     outputs[i].Show(bounds[i]);
                     if (clipPath is not null)
                     {
-                        var uv = mode == HapMode.Individual ? UvRect.Full : UvLayout.Spanning(i, bounds);
-                        var source = clipSources[mode == HapMode.Individual ? i : 0];
-                        outputs[i].SetContent(mode == HapMode.Individual ? clipPasses[i] : clipPasses[0], uv);
+                        var uv = perOutput ? UvRect.Full : mode == ShowMode.Split ? SplitCellUv(i, windows) : UvLayout.Spanning(i, bounds);
+                        var source = clipSources[perOutput ? i : 0];
+                        outputs[i].SetContent(perOutput ? clipPasses[i] : clipPasses[0], uv);
                         if (cycle == 1)
                             log.Info("Stress", $"{outputs[i].Name} <- {source.Id} ({source.GetType().Name}) uv={uv}");
                     }
@@ -444,7 +462,7 @@ public static class StressHarness
         var allocFail = allocGrowthMb > AllocatedGrowthLimitMb;
         var wsFail = wsGrowthMb > WorkingSetGrowthLimitMb;
         var frameFail = framesPublished != Volatile.Read(ref framesReleased);
-        var expectedSources = clipPath is null ? 0 : cycles * (mode == HapMode.Individual ? windows : 1);
+        var expectedSources = clipPath is null ? 0 : cycles * (perOutput ? windows : 1);
         // A pooled texture still held by GPU work when its source was disposed = the fence and the teardown order
         // disagree (the render side had not completed its reads) — an ownership bug, so it fails the run.
         var sourceFail = sourcesStarted != expectedSources || sourcesStopped != expectedSources || sourcesDisposed != expectedSources || texturesOutstandingAtDispose != 0;
@@ -461,6 +479,270 @@ public static class StressHarness
             ? $"RESULT: PASS — all cycles clean, zero tracked-object growth, flat allocation and RSS{(audioPath is null ? "" : $", audio aligned (peakDrift={audioPeakDriftMs:0.0}ms, 0 underruns)")}."
             : $"RESULT: FAIL — {(wedged ? "wedge detected" : contentFail ? "clip source did not advance / faulted" : leakFail ? "tracked Metal object growth (ownership bug)" : allocFail ? $"device allocation growth {allocGrowthMb}MB > {AllocatedGrowthLimitMb}MB" : wsFail ? $"RSS growth {wsGrowthMb}MB > {WorkingSetGrowthLimitMb}MB" : frameFail ? $"source frames published={framesPublished} released={framesReleased} (frame ownership bug)" : sourceFail ? $"sources started={sourcesStarted} stopped={sourcesStopped} disposed={sourcesDisposed}, expected {expectedSources}; {texturesOutstandingAtDispose} pooled texture(s) still held at dispose" : audioGateFail ? $"audio gate (peakDrift={audioPeakDriftMs:0.0}ms > {AudioDriftLimitMs}ms, underruns={audioUnderruns}, faulted={audioFail})" : provider.Tracker.LiveCount != 0 ? $"{provider.Tracker.LiveCount} tracked object(s) survived teardown" : "incomplete run")}.");
         return passed ? 0 : 1;
+    }
+
+    /// <summary>
+    /// <c>--controller</c>: the Windows <c>RunControllerAsync</c> twin — drive the app's REAL per-perform path
+    /// (ApplyShow → EnterPerform → present → ExitPerform per cycle through <see cref="PerformanceController"/>,
+    /// sources rebuilt every cycle) instead of the bind-once loop (LESSON-TEST-004: the gate must call the path
+    /// the user clicks). The controller is constructed ONCE for the run and disposed at the end, off this thread's
+    /// caller — the main thread only pumps AppKit. Per cycle: wait for the queue (wedge detector) → the
+    /// Performing state → ≥<see cref="HoldFramesPerCycle"/> completed frames on every bound output (and a live audio
+    /// engine with <c>--audio</c>) → ExitPerform → the Idle state via <see cref="IPerformanceController.StateChanged"/>
+    /// (bounded) → in-flight drain → resource sample. Any <see cref="IPerformanceController.CommandFailed"/>,
+    /// a stalled/faulted source, a non-HAP decoder under <c>--hap</c>, or an audio gate miss fails the run.
+    /// </summary>
+    private static int RunController(ILog log, IReadOnlyList<MonitorInfo> monitors, MonitorRect[] bounds, int cycles,
+        ShowMode mode, string? video, string? video2, bool requireHap, bool forceSw, string? audioPath)
+    {
+        log.Info("Stress", "=== CONTROLLER MODE: ApplyShow -> EnterPerform -> present -> ExitPerform per cycle (real per-perform path) ===");
+
+        // One MonitorInfo per requested window, with the harness bounds (windowed or fullscreen) — the
+        // controller places its outputs at Monitors[i].Bounds, exactly as it does for real monitors.
+        var windows = bounds.Length;
+        var infos = new List<MonitorInfo>(windows);
+        for (var i = 0; i < windows; i++)
+        {
+            var real = i < monitors.Count ? monitors[i] : null;
+            infos.Add(new MonitorInfo
+            {
+                DeviceId = real?.DeviceId ?? $"harness-{i + 1}",
+                DisplayName = real?.DisplayName ?? $"Harness {i + 1}",
+                Bounds = bounds[i],
+                WorkArea = bounds[i],
+                Resolution = $"{bounds[i].Width}x{bounds[i].Height}",
+                IsPrimary = i == 0,
+            });
+        }
+
+        // The show: no clip = the test pattern on every output; otherwise the Windows harness's show per mode.
+        var show = new ShowDefinition { Mode = mode, SyncIndividual = true };
+        if (video is not null)
+        {
+            if (mode is ShowMode.Individual or ShowMode.Hap)
+            {
+                for (var i = 0; i < windows; i++)
+                    show.Sources.Add(new SourceBinding
+                    {
+                        SourceId = $"src{i + 1}",
+                        FilePath = i == 0 ? video : (video2 ?? video),
+                        MonitorDeviceId = infos[i].DeviceId,
+                        IsHap = requireHap,
+                    });
+            }
+            else
+            {
+                show.Sources.Add(new SourceBinding { SourceId = "main", FilePath = video, IsHap = requireHap });
+                if (mode == ShowMode.Split)
+                {
+                    var (rows, cols) = ShowPlanner.AutoGrid(windows);
+                    show.WallConfiguration = new VideoWallConfiguration { SourceVideoPath = video, Auto = true, Rows = rows, Columns = cols };
+                }
+            }
+        }
+        if (audioPath is not null)
+            show.AudioTracks.Add(new AudioTrack { Name = Path.GetFileNameWithoutExtension(audioPath), SourceFilePath = audioPath });
+        log.Info("Stress", $"show: mode={mode} sources={show.Sources.Count}{(show.Sources.Count == 0 ? " (test pattern)" : "")} audioTracks={show.AudioTracks.Count} windows={windows} requireHap={requireHap} forceSwDecode={forceSw}");
+
+        var controller = new PerformanceController(infos, log, forceSw);
+        var failures = 0;
+        controller.CommandFailed += m => { Interlocked.Increment(ref failures); log.Error("Stress", $"controller command failed: {m}"); };
+        // State transitions arrive on the controller's worker; the Idle wait below is event-driven on them.
+        var currentCycle = 0;
+        var idle = new ManualResetEventSlim(false);
+        controller.StateChanged += state =>
+        {
+            log.Info("Stress", $"cycle {Volatile.Read(ref currentCycle):00}/{cycles}: state -> {state}");
+            if (state == PerformState.Idle) idle.Set();
+        };
+
+        var process = Process.GetCurrentProcess();
+        var completed = 0;
+        var wedged = false;
+        var contentFail = false;
+        var audioFail = false;
+        double audioPeakDriftMs = 0;
+        long audioUnderruns = 0;
+        long baseline = -1, maxGrowth = 0;
+        ulong allocBaseline = 0, allocMax = 0;
+        long wsBaseline = 0, wsMax = 0;
+
+        // Watchdog: a cycle that does not finish within the deadline is a wedge — dump the stuck state and fail.
+        var cycleStartedAt = Stopwatch.StartNew();
+        var watchdogStop = new ManualResetEventSlim(false);
+        var watchdog = new Thread(() =>
+        {
+            while (!watchdogStop.Wait(250))
+            {
+                var cycle = Volatile.Read(ref currentCycle);
+                if (cycle == 0 || cycleStartedAt.Elapsed <= CycleDeadline) continue;
+                log.Error("Stress", $"WATCHDOG: cycle {cycle} did not complete within {CycleDeadline.TotalSeconds:0}s (controller state={controller.State}) — FAIL.");
+                DumpStuckState(log, controller.Loop, controller.Outputs, controller.Provider);
+                log.Info("Stress", "RESULT: FAIL — wedge (watchdog).");
+                Environment.Exit(1);
+            }
+        }) { Name = "MultiMon.Watchdog", IsBackground = true };
+
+        try
+        {
+            watchdog.Start();
+            for (var cycle = 1; cycle <= cycles; cycle++)
+            {
+                using var pool = new NSAutoreleasePool();
+                cycleStartedAt.Restart();
+                Volatile.Write(ref currentCycle, cycle);
+                idle.Reset();
+
+                controller.ApplyShow(show);
+                controller.EnterPerform();
+                if (!controller.WaitForQueue(WedgeTimeout))
+                {
+                    wedged = true;
+                    log.Error("Stress", $"cycle {cycle:00}/{cycles}: WEDGE — ApplyShow/EnterPerform did not complete within {WedgeTimeout.TotalSeconds:0}s (controller worker stuck).");
+                    break;
+                }
+                if (controller.State != PerformState.Performing)
+                {
+                    log.Error("Stress", $"cycle {cycle:00}/{cycles}: perform did not start (state={controller.State}).");
+                    break;
+                }
+                var sourcesAtStart = controller.SourceStatus();
+                if (cycle == 1)
+                    foreach (var s in sourcesAtStart)
+                        log.Info("Stress", $"source {s.Id} <- {s.Kind}");
+                if (audioPath is not null && controller.AudioStatus() is not { Active: true })
+                {
+                    audioFail = true;
+                    log.Error("Stress", $"cycle {cycle:00}/{cycles}: no audio pipeline started for {audioPath}.");
+                }
+                if (!controller.WaitForPresentedFrames(HoldFramesPerCycle, WedgeTimeout, out var stalled))
+                {
+                    wedged = true;
+                    log.Error("Stress", $"cycle {cycle:00}/{cycles}: WEDGE — {stalled} completed no frame for {WedgeTimeout.TotalSeconds:0}s.");
+                    DumpStuckState(log, controller.Loop, controller.Outputs, controller.Provider);
+                    break;
+                }
+
+                controller.ExitPerform();
+                if (!idle.Wait(WedgeTimeout))
+                {
+                    wedged = true;
+                    log.Error("Stress", $"cycle {cycle:00}/{cycles}: WEDGE — Idle state not reached within {WedgeTimeout.TotalSeconds:0}s of ExitPerform (state={controller.State}).");
+                    break;
+                }
+                if (!controller.WaitForQueue(WedgeTimeout))
+                {
+                    wedged = true;
+                    log.Error("Stress", $"cycle {cycle:00}/{cycles}: WEDGE — ExitPerform did not complete within {WedgeTimeout.TotalSeconds:0}s.");
+                    break;
+                }
+                if (!controller.WaitForOutputsIdle(WedgeTimeout))
+                {
+                    wedged = true;
+                    log.Error("Stress", $"cycle {cycle:00}/{cycles}: WEDGE — command buffers still in flight {WedgeTimeout.TotalSeconds:0}s after hide.");
+                    break;
+                }
+
+                // Content: every source must have ADVANCED during the hold (PTS past its start, not faulted) and,
+                // under --hap, be the HAP decoder — a fallthrough to VideoToolbox would gate a path that never ran.
+                var sources = controller.SourceStatus();
+                var parts = new List<string>();
+                for (var i = 0; i < sources.Count; i++)
+                {
+                    var s = sources[i];
+                    var ok = !s.Faulted && s.Pts > sourcesAtStart[i].Pts && (!requireHap || s.Kind == nameof(HapSource));
+                    if (!ok)
+                    {
+                        contentFail = true;
+                        log.Error("Stress", $"cycle {cycle:00}/{cycles}: {s.Id} ({s.Kind}) failed the content check — pts {sourcesAtStart[i].Pts.TotalSeconds:0.000}s -> {s.Pts.TotalSeconds:0.000}s, faulted={s.Faulted}, decoded={s.Decoded}, requireHap={requireHap}");
+                    }
+                    parts.Add($"{s.Id} pts {sourcesAtStart[i].Pts.TotalSeconds:0.00}->{s.Pts.TotalSeconds:0.00}s decoded={s.Decoded}");
+                }
+                var contentText = parts.Count > 0 ? $", {string.Join(" ", parts)}" : "";
+
+                var audioText = "";
+                if (controller.AudioStatus() is { } audio)
+                {
+                    audioPeakDriftMs = Math.Max(audioPeakDriftMs, audio.PeakDriftMs);
+                    audioUnderruns += audio.Underruns;
+                    if (audio.Faulted)
+                    {
+                        audioFail = true;
+                        log.Error("Stress", $"cycle {cycle:00}/{cycles}: audio decode faulted.");
+                    }
+                    audioText = $", audio drift={audio.PeakDriftMs:0.0}ms underruns={audio.Underruns}";
+                }
+
+                if (contentFail || audioFail)
+                    break;
+                completed++;
+
+                // Resource sample. The previous show is torn down at the START of the next ApplyShow, so each
+                // snapshot holds exactly one show's objects — comparable cycle to cycle after the warm-up.
+                var live = controller.Tracker.LiveCount;
+                var alloc = controller.AllocatedBytes;
+                process.Refresh();
+                var ws = process.WorkingSet64;
+                string liveText, allocText, wsText;
+                if (cycle <= WarmupCycles)
+                {
+                    baseline = live; allocBaseline = alloc; wsBaseline = ws;
+                    liveText = $"tracked={live} (warmup)"; allocText = $"alloc={alloc / (1024 * 1024)}MB"; wsText = $"rss={ws / (1024 * 1024)}MB";
+                }
+                else
+                {
+                    var delta = live - baseline;
+                    maxGrowth = Math.Max(maxGrowth, delta);
+                    allocMax = Math.Max(allocMax, alloc);
+                    wsMax = Math.Max(wsMax, ws);
+                    liveText = $"tracked={live} (delta {delta:+0;-#})";
+                    allocText = $"alloc={alloc / (1024 * 1024)}MB (delta {((long)alloc - (long)allocBaseline) / (1024 * 1024):+0;-#}MB)";
+                    wsText = $"rss={ws / (1024 * 1024)}MB (delta {(ws - wsBaseline) / (1024 * 1024):+0;-#}MB)";
+                }
+                log.Info("Stress", $"cycle {cycle:00}/{cycles}: apply->enter->present({HoldFramesPerCycle}f)->exit->idle ok in {cycleStartedAt.Elapsed.TotalMilliseconds:0}ms, {liveText}, {allocText}, {wsText}{contentText}{audioText}, {controller.Tracker}");
+            }
+        }
+        catch (Exception ex)
+        {
+            wedged = true;
+            log.Error("Stress", $"harness failed on cycle {Volatile.Read(ref currentCycle)}: {ex}");
+        }
+        finally
+        {
+            Volatile.Write(ref currentCycle, 0);
+            watchdogStop.Set();
+            // Dispose queues the ordered teardown on the controller's worker and joins it — on this (non-main) thread.
+            controller.Dispose();
+            log.Info("Stress", $"teardown complete: {controller.Tracker}");
+        }
+
+        var allocGrowthMb = allocBaseline > 0 && allocMax > allocBaseline ? (long)(allocMax - allocBaseline) / (1024 * 1024) : 0;
+        var wsGrowthMb = wsBaseline > 0 && wsMax > wsBaseline ? (wsMax - wsBaseline) / (1024 * 1024) : 0;
+        var leakFail = maxGrowth > 0;
+        var allocFail = allocGrowthMb > AllocatedGrowthLimitMb;
+        var wsFail = wsGrowthMb > WorkingSetGrowthLimitMb;
+        var outstanding = controller.TexturesOutstandingAtDispose;
+        var audioGateFail = audioPath is not null && (audioFail || audioUnderruns > 0 || audioPeakDriftMs > AudioDriftLimitMs);
+        var commandFailures = Volatile.Read(ref failures);
+        var survivors = controller.Tracker.LiveCount;
+        var passed = completed == cycles && !wedged && !contentFail && !leakFail && !allocFail && !wsFail && outstanding == 0 && !audioGateFail && commandFailures == 0 && survivors == 0;
+
+        log.Info("Stress", $"controller: cycles={completed}/{cycles} wedges={(wedged ? 1 : 0)} commandFailures={commandFailures} texturesOutstandingAtDispose={outstanding} " +
+                           (audioPath is null ? "" : $"audio peakDrift={audioPeakDriftMs:0.0}ms underruns={audioUnderruns} ") +
+                           $"trackedBaseline={baseline} maxGrowth={maxGrowth} allocMaxGrowth={allocGrowthMb}MB rssMaxGrowth={wsGrowthMb}MB trackedAfterTeardown={survivors}");
+        log.Info("Stress", passed
+            ? $"RESULT: PASS — {completed} controller cycles clean, zero tracked-object growth, flat allocation and RSS{(audioPath is null ? "" : $", audio aligned (peakDrift={audioPeakDriftMs:0.0}ms, 0 underruns)")}."
+            : $"RESULT: FAIL — {(wedged ? "wedge detected" : commandFailures > 0 ? "controller command failures" : contentFail ? "clip source did not advance / faulted / wrong decoder" : leakFail ? "tracked Metal object growth (ownership bug)" : allocFail ? $"device allocation growth {allocGrowthMb}MB > {AllocatedGrowthLimitMb}MB" : wsFail ? $"RSS growth {wsGrowthMb}MB > {WorkingSetGrowthLimitMb}MB" : outstanding != 0 ? $"{outstanding} pooled texture(s) still held at dispose" : audioGateFail ? $"audio gate (peakDrift={audioPeakDriftMs:0.0}ms > {AudioDriftLimitMs}ms, underruns={audioUnderruns}, faulted={audioFail})" : survivors != 0 ? $"{survivors} tracked object(s) survived teardown" : "incomplete run")}.");
+        return passed ? 0 : 1;
+    }
+
+    /// <summary>Split UV for output <paramref name="index"/> of <paramref name="count"/>: the near-square
+    /// auto-grid over one source, row-major (2 → left/right halves; 4 → the quadrants). The controller path drives
+    /// the same grid through VideoWallConfiguration; the bind-once path derives it here.</summary>
+    private static UvRect SplitCellUv(int index, int count)
+    {
+        var (rows, cols) = ShowPlanner.AutoGrid(count);
+        return UvLayout.Quadrant(index / cols, index % cols, rows, cols);
     }
 
     /// <summary>The HAP clip for <c>--hap</c>: <c>--video</c>, else the MULTIMON_HAP_FIXTURE path (noted). Null when

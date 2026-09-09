@@ -7,6 +7,7 @@
     <ProjectReference Include="..\MultiMon.Graphics.Mac\MultiMon.Graphics.Mac.csproj" />
     <ProjectReference Include="..\MultiMon.Decode.Mac\MultiMon.Decode.Mac.csproj" />
     <ProjectReference Include="..\MultiMon.Audio.Mac\MultiMon.Audio.Mac.csproj" />
+    <ProjectReference Include="..\MultiMon.Control.Mac\MultiMon.Control.Mac.csproj" />
   </ItemGroup>
 
   <PropertyGroup>
@@ -19,5 +20,14 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
   </PropertyGroup>
+
+  <!-- MultiMon.Control.Mac is an app (its own bundle); referencing it for PerformanceController drags its
+       runtimeconfig.json into THIS bundle's publish set, which the Mac SDK cannot classify. Drop that one file —
+       the harness bundle carries its own runtimeconfig. -->
+  <Target Name="DropReferencedAppRuntimeConfig" BeforeTargets="_ComputePublishLocation">
+    <ItemGroup>
+      <ResolvedFileToPublish Remove="@(ResolvedFileToPublish)" Condition="'%(Filename)%(Extension)' == 'MultiMon.Control.Mac.runtimeconfig.json'" />
+    </ItemGroup>
+  </Target>
 
 </Project>
