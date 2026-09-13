@@ -297,7 +297,7 @@ public sealed class FfmpegHapConverter : IVideoConverter
                 "-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", filePath);
             if (!string.IsNullOrWhiteSpace(json))
             {
-                var meta = ParseFfprobeJson(json, filePath);
+                var meta = ParseFfprobeJson(json, filePath, _log);
                 if (meta is not null) return meta;
             }
         }
@@ -401,13 +401,13 @@ public sealed class FfmpegHapConverter : IVideoConverter
         catch (Exception ex)
         {
             // Metadata is best-effort (it only drives the progress %), so degrade to null — but don't go
-            // fully silent: surface it where a console exists (harness / redirected stdout).
-            Console.Error.WriteLine($"[WARN ] HAP convert: metadata via ffmpeg stderr failed: {ex.Message}");
+            // fully silent: surface it through the configured log sink.
+            _log.Error("FfmpegHapConverter", $"metadata via ffmpeg stderr failed: {ex.Message}");
             return null;
         }
     }
 
-    private static VideoMetadata? ParseFfprobeJson(string json, string filePath)
+    private static VideoMetadata? ParseFfprobeJson(string json, string filePath, ILog log)
     {
         try
         {
@@ -469,7 +469,7 @@ public sealed class FfmpegHapConverter : IVideoConverter
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"[WARN ] HAP convert: ffprobe JSON parse failed: {ex.Message}");
+            log.Error("FfmpegHapConverter", $"ffprobe JSON parse failed: {ex.Message}");
             return null;
         }
     }

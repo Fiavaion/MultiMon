@@ -8,6 +8,10 @@
     <ValidateXcodeVersion>false</ValidateXcodeVersion>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <!-- Single-sourced from Directory.Build.props' Version: maps to Info.plist CFBundleShortVersionString
+         (marketing version) and CFBundleVersion (build number). -->
+    <ApplicationDisplayVersion>$(Version)</ApplicationDisplayVersion>
+    <ApplicationVersion>1</ApplicationVersion>
     <!-- AVLN3001: MainWindow and ConvertToHapWindow take their view-model/log through the constructor
          (the composition root builds them), so they have no parameterless one for Avalonia's runtime XAML
          loader. Nothing loads them that way — adding an unused ctor just to silence this would be dead code. -->
