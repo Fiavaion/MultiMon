@@ -89,6 +89,19 @@ public sealed class OutputWindow
     private volatile string _renderPhase = "idle";
     public string RenderPhase => _renderPhase;
 
+    /// <summary>Harness triage only (racy cross-thread reads): the clock this output selects by, the frame the pass
+    /// last selected and whether it has drawn content — the state behind a "source did not advance" failure.</summary>
+    public string ContentDiagnostic
+    {
+        get
+        {
+            var clock = _clock;
+            var pass = Content;
+            return $"clock={(clock is null ? "shared" : $"{clock.CurrentMediaTime.TotalSeconds:0.000}s running={clock.IsRunning}")} " +
+                   $"selected={(pass is null ? "none" : $"{pass.LastSelectedPts.TotalSeconds:0.000}s drawn={pass.HasDrawnContent}")} period={_sourceFrameSeconds:0.000}s";
+        }
+    }
+
     /// <summary>Beats skipped this perform because <c>nextDrawable</c> returned null — the compositor was not
     /// consuming (window occluded/offscreen), including its ~1 s timeout.</summary>
     public long DrawableNullCount => Volatile.Read(ref _drawableNulls);
@@ -380,8 +393,10 @@ public sealed class OutputWindow
     {
         var elapsedMs = (Stopwatch.GetTimestamp() - _startupOrigin) * 1000.0 / Stopwatch.Frequency;
         Volatile.Write(ref _startupMs, elapsedMs);
+        var clock = _clock;
         _log.Info("Graphics", $"{Name}: first frame {elapsedMs:0.0} ms after EnterPerform " +
-                              $"(mode switch {Volatile.Read(ref _startupModeSwitchMs):0.0} ms, show {Volatile.Read(ref _startupShowMs):0.0} ms)");
+                              $"(mode switch {Volatile.Read(ref _startupModeSwitchMs):0.0} ms, show {Volatile.Read(ref _startupShowMs):0.0} ms), " +
+                              $"clock {(clock is null ? "shared" : $"{clock.CurrentMediaTime.TotalSeconds:0.000}s running={clock.IsRunning}")}");
     }
 
     /// <summary>Metal completion thread: the frame is on its way to the display and its uniform slot is free.</summary>

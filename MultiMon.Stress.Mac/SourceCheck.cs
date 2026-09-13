@@ -34,6 +34,9 @@ internal static class SourceCheck
     /// differently from the CPU reference. A chroma fault that moves a texel by no more than this is invisible.</summary>
     private const int HapTolerance = 8;
 
+    /// <summary>Frames the presentation-order check publishes through the real VideoToolbox source (check 9).</summary>
+    private const int OrderCheckFrames = 60;
+
     /// <summary>
     /// The colour the VideoToolbox check expects at the centre of the fixture's first frame. The fixture is a SOLID
     /// RGB (200,40,120) frame encoded to limited-range BT.709 yuv420p and tagged bt709, generated with
@@ -82,7 +85,7 @@ internal static class SourceCheck
         log.Info("Stress", "source-check: DecodedFrame -> FrameTimeline -> FullscreenQuadPass.Draw -> offscreen target -> readback");
         // The check count is fixed BEFORE anything runs so a crash mid-way can never leave passed == expected.
         var demux = hapClip is null ? null : MovHapDemuxer.Parse(hapClip);
-        var checkCount = 5 + (demux is null ? 0 : BcnReference.Supports(demux.DeclaredFormat) ? 2 : 1) + (vtClip is null ? 0 : 1);
+        var checkCount = 5 + (demux is null ? 0 : BcnReference.Supports(demux.DeclaredFormat) ? 2 : 1) + (vtClip is null ? 0 : 2);
         var passedChecks = 0;
         var provider = new GraphicsDeviceProvider(log);
         provider.Acquire();
@@ -94,7 +97,7 @@ internal static class SourceCheck
         FullscreenQuadPass? quadrantPass = null, ycocgPass = null, hapPass = null, vtPass = null;
         FrameTimeline? quadrantTimeline = null, ycocgTimeline = null;
         HapSource? hapSource = null;
-        VideoToolboxSource? vtSource = null;
+        VideoToolboxSource? vtSource = null, orderSource = null;
         try
         {
             loop.Start();
@@ -247,6 +250,35 @@ internal static class SourceCheck
                 var centre = Pixel(pixels, TargetSize / 2, TargetSize / 2);
                 passedChecks += Report(log, $"videotoolbox first frame of {Path.GetFileName(vtClip)} ({(vtSource.IsHardwareDecode ? "hardware" : "software")} decode) vs bt709 reference",
                     VideoToolboxExpected, centre, VideoToolboxTolerance);
+
+                // Check 9: presentation ORDER. A fresh source decodes the clip's first OrderCheckFrames frames (a B-frame
+                // clip: VideoToolbox's callback fires in decode order) into its timeline while this thread consumes
+                // like the render thread does (SelectInto, newest frame). FrameTimeline.Publish refuses the first
+                // non-ascending PTS by faulting the source — the decode log names the inversion — so the check is:
+                // not faulted, the frames were published, and every PTS this consumer saw was strictly ascending.
+                orderSource = new VideoToolboxSource(vtClip, provider, log, id: "vtorder");
+                orderSource.Start();
+                var seen = new List<TimeSpan>();
+                var budget = Stopwatch.StartNew();
+                while (orderSource.DecodedFrames < OrderCheckFrames && !orderSource.IsFaulted && budget.Elapsed < TimeSpan.FromSeconds(10))
+                {
+                    orderSource.Frames.SelectInto(TimeSpan.MaxValue, frame =>
+                    {
+                        if (seen.Count == 0 || frame.Pts > seen[^1]) seen.Add(frame.Pts);
+                    });
+                    Thread.Yield();
+                }
+                orderSource.Stop();
+                var ascending = true;
+                for (var i = 1; i < seen.Count; i++)
+                    if (seen[i] <= seen[i - 1])
+                    {
+                        ascending = false;
+                        log.Error("Stress", $"  FAIL first inversion seen by the consumer: {seen[i].TotalSeconds:0.000}s after {seen[i - 1].TotalSeconds:0.000}s.");
+                    }
+                log.Info("Stress", $"  videotoolbox order: {orderSource.DecodedFrames} published, consumer saw {seen.Count} ({(seen.Count > 0 ? $"{seen[0].TotalSeconds:0.000}s .. {seen[^1].TotalSeconds:0.000}s" : "none")}), faulted={orderSource.IsFaulted}.");
+                passedChecks += Report(log, $"videotoolbox presentation order: first {OrderCheckFrames} frames of {Path.GetFileName(vtClip)} published strictly ascending",
+                    !orderSource.IsFaulted && orderSource.DecodedFrames >= OrderCheckFrames && ascending && seen.Count > 1);
             }
             else
                 log.Info("Stress", "NOTE: no H.264 colour clip (--video2 or MULTIMON_H264_FIXTURE) — the videotoolbox check is skipped.");
@@ -262,6 +294,7 @@ internal static class SourceCheck
             loop.Stop();
             hapSource?.Stop();
             vtSource?.Stop();
+            orderSource?.Stop();
             quadrantPass?.Dispose();
             ycocgPass?.Dispose();
             hapPass?.Dispose();
@@ -270,6 +303,7 @@ internal static class SourceCheck
             ycocgTimeline?.Dispose();
             hapSource?.Dispose();
             vtSource?.Dispose();
+            orderSource?.Dispose();
             renderPass?.Dispose();
             DisposeTexture(provider, quadrantTexture);
             DisposeTexture(provider, ycocgTexture);

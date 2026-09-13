@@ -262,3 +262,12 @@ rebuilds). **Evidence:** span 25 fps on both displays → 120→50 Hz and 60→5
 (every vsync, each frame twice), restored every cycle, 10 cycles tracked flat. This panel has no 100 Hz mode at the
 current scaling, so 50 Hz is the honest best. `kCGDisplayShowDuplicateLowResolutionModes` must be the exported
 symbol (`Dlfcn.GetStringConstant`), not a same-spelled NSString — the latter is silently ignored.
+
+**D6 amendment (2026-09-13):** VideoToolbox's hardware decoder invokes the output callback in **decode order**
+regardless of `kVTDecodeFrame_EnableTemporalProcessing` (measured: 20/40 inversions on a B-frame clip with and
+without the flag). `VideoToolboxSource` therefore holds a sorted reorder window (`ReorderDepth = 4`; measured need
+3) and publishes the smallest PTS; `FrameTimeline.Publish` now refuses a non-ascending PTS so a deeper stream
+faults loudly instead of the selector silently picking stale frames. Before this, 92 % of presents on H.264 selected
+a stale frame — the stutter D11 was chasing was mostly this. **D11 note:** immediately after a display mode switch
+the freshly shown layer presents unthrottled for a few frames (30 presents in 16 ms observed); the harness dwell is
+now ≥300 ms per cycle so the advance check is meaningful.

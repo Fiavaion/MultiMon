@@ -64,10 +64,15 @@ public static class StressHarness
 {
     private const int WarmupCycles = 3;
     private const int HoldFramesPerCycle = 30;          // ~0.5s at 60Hz
+    /// <summary>The per-cycle hold is ALSO a minimum dwell in time: right after a display mode switch (D11) the freshly
+    /// shown layers present unthrottled (30 presents were measured in 16 ms), so a present count alone can end the
+    /// hold before the media clock has advanced one frame period — and the content check, which asserts PTS advanced
+    /// over the hold, then fails on a healthy source. This is the gate's dwell, not a delay masking a bug.</summary>
+    private static readonly TimeSpan MinHoldPerCycle = TimeSpan.FromMilliseconds(300);
     private const long WorkingSetGrowthLimitMb = 150;   // same backstop as the Windows harness
     /// <summary>Soak gate: more than this share of an output's presents showing a frame more than one frame period
     /// behind the clock means decode is not keeping up with playback — a FAIL, not a diagnostic.</summary>
-    private const double LateFrameFailRatio = 0.10;
+    private const double LateFrameFailRatio = 0.02;
     private const long AllocatedGrowthLimitMb = 128;    // the layer's drawable pool (3 × a 4K BGRA surface) may come and go
     private const double AudioDriftLimitMs = 40;       // the Mac runbook's A/V alignment gate for the audio milestone
     private const double AudioMinContentSeconds = 0.25; // every audio cycle must actually PLAY this much before it may exit
@@ -705,10 +710,11 @@ public static class StressHarness
                     }
                     if (soakSeconds > 0)
                         watchdog.Extend();
-                } while (soakSeconds > 0 && hold.Elapsed < TimeSpan.FromSeconds(soakSeconds));
+                } while (hold.Elapsed < (soakSeconds > 0 ? TimeSpan.FromSeconds(soakSeconds) : MinHoldPerCycle));
                 if (wedged)
                     break;
 
+                var holdMs = hold.Elapsed.TotalMilliseconds;
                 var statsAtHoldEnd = controller.GetStats();
                 var rows = readout.Read(statsAtHoldEnd);
                 // Start-up timing, once: how long each output took to put its first frame on screen, and what of
@@ -768,7 +774,8 @@ public static class StressHarness
                     if (!ok)
                     {
                         contentFail = true;
-                        log.Error("Stress", $"cycle {cycle:00}/{cycles}: {s.Id} ({s.Kind}) failed the content check — pts {sourcesAtStart[i].Pts.TotalSeconds:0.000}s -> {s.Pts.TotalSeconds:0.000}s, faulted={s.Faulted}, decoded={s.Decoded}, requireHap={requireHap}");
+                        log.Error("Stress", $"cycle {cycle:00}/{cycles}: {s.Id} ({s.Kind}) failed the content check — pts {sourcesAtStart[i].Pts.TotalSeconds:0.000}s -> {s.Pts.TotalSeconds:0.000}s, faulted={s.Faulted}, decoded={s.Decoded}, requireHap={requireHap}; " +
+                                            $"hold {holdMs:0}ms, presents [{string.Join(", ", controller.Outputs.Select(o => $"{o.Name} {Presents(statsAtHoldStart, statsAtHoldEnd, Array.IndexOf(controller.Outputs, o))} late {LateFrames(statsAtHoldStart, statsAtHoldEnd, Array.IndexOf(controller.Outputs, o))} {o.ContentDiagnostic}"))}]");
                     }
                     parts.Add($"{s.Id} pts {sourcesAtStart[i].Pts.TotalSeconds:0.00}->{s.Pts.TotalSeconds:0.00}s decoded={s.Decoded}");
                 }

@@ -24,14 +24,18 @@ namespace MultiMon.Decode.Mac.VideoToolbox;
 /// (<see cref="IsHardwareDecode"/>) and logged, never assumed.
 ///
 /// Threading: the decode thread (own thread, per-iteration NSAutoreleasePool — LESSON-BUG-008) reads samples and
-/// submits them asynchronously with temporal processing, so VideoToolbox delivers frames in PRESENTATION order
-/// on its own callback thread; the callback only retains the pixel buffer and queues it. The decode thread drains
-/// that queue, wraps each buffer through the texture cache and publishes; <see cref="FrameTimeline.Publish"/>
-/// blocking on a full timeline paces decode to real time (no further samples are submitted while blocked, so the
-/// queue is bounded by the decoder's own lookahead). The clip loops by recreating the reader (a reader cannot
-/// rewind); the session is reused. The loop base is carried per sample through VideoToolbox's sourceFrame token
-/// and VT is drained (FinishDelayedFrames + WaitForAsynchronousFrames) at every loop boundary so PTS stay
-/// ascending across loops (ADR 0002 D1) — drift is corrected by frame selection, never seeking.
+/// submits them asynchronously; the callback only retains the pixel buffer and queues it. VideoToolbox's hardware
+/// decoder fires that callback in DECODE order, not presentation order, whatever <c>EnableTemporalProcessing</c>
+/// says (measured 2026-09-13 on Apple Silicon: the callback PTS sequence for a B-frame clip equals the sample
+/// order with or without the flag). The decode thread therefore drains the queue into a small reorder window
+/// (<see cref="ReorderDepth"/>) and publishes the SMALLEST PTS once the window is over-full — the ascending-PTS
+/// contract of <see cref="FrameTimeline"/>, on which <c>FrameSelector</c>'s binary search depends. The window is
+/// flushed in order at every loop boundary. <see cref="FrameTimeline.Publish"/> blocking on a full timeline paces
+/// decode to real time (no further samples are submitted while blocked, so the queue is bounded by the decoder's
+/// own lookahead). The clip loops by recreating the reader (a reader cannot rewind); the session is reused. The
+/// loop base is carried per sample through VideoToolbox's sourceFrame token and VT is drained (FinishDelayedFrames
+/// + WaitForAsynchronousFrames) at every loop boundary so PTS stay ascending across loops (ADR 0002 D1) — drift is
+/// corrected by frame selection, never seeking.
 ///
 /// Lifetime / fence: a published frame OWNS its CVPixelBuffer, the CVMetalTexture the cache vended for it and
 /// the IMTLTexture wrapper. The frame's release closure — run by <see cref="DecodedFrame"/> only when the
@@ -56,6 +60,13 @@ public sealed class VideoToolboxSource : IMetalSource
     /// ample lookahead for clock-based frame selection (the Windows MF depth is 3 for the same reason).</summary>
     private const int TimelineDepth = 4;
 
+    /// <summary>Presentation-order reorder window: a decoded frame is published only once this many LATER-decoded
+    /// frames have arrived, so every B-frame that precedes it in display order is already in the window. Measured
+    /// need on the fixture clips (ffmpeg defaults, 3 B-frames): 3; one of margin. A stream needing more publishes an
+    /// inversion, which <see cref="FrameTimeline.Publish"/> refuses — the source faults loudly, it never feeds the
+    /// selector a non-ascending timeline. Each held frame pins one decoder pool buffer, like the timeline's.</summary>
+    private const int ReorderDepth = 4;
+
     /// <summary>Frames between <see cref="CVMetalTextureCache.Flush"/> calls (drops cache entries whose textures
     /// have been released; Apple requires periodic flushing).</summary>
     private const int CacheFlushInterval = 60;
@@ -71,13 +82,16 @@ public sealed class VideoToolboxSource : IMetalSource
     private readonly VTDecompressionSession _session;
     private readonly long _loopDurationTicks;
 
-    // Callback → decode-thread handoff: frames VideoToolbox has emitted, in presentation order, not yet published.
+    // Callback → decode-thread handoff: frames VideoToolbox has emitted, in DECODE order, not yet reordered.
     private readonly object _decodedGate = new();
     private readonly List<PendingFrame> _decoded = new();
+    // Decode thread only: decoded frames sorted by PTS, waiting for the window to prove nothing earlier is coming.
+    private readonly List<PendingFrame> _reorder = new(ReorderDepth + 1);
 
     private Thread? _thread;
     private volatile bool _stop;
     private volatile bool _faulted;
+    private volatile string _phase = "not started"; // where the decode thread is, for the Stop() line and stuck-source triage
     private long _ptsTicks;
     private long _decodedFrames;
     private int _outstanding;   // vended textures held by published frames / in-flight GPU reads
@@ -212,6 +226,8 @@ public sealed class VideoToolboxSource : IMetalSource
         _stop = true;
         Frames.SignalStop();
         var thread = _thread;
+        if (thread is not null)
+            _log.Info("Decode", $"{Id}: stop requested while {_phase}, decoded={DecodedFrames}, pts={CurrentPts.TotalSeconds:0.000}s.");
         thread?.Join();
         _thread = null;
     }
@@ -245,6 +261,7 @@ public sealed class VideoToolboxSource : IMetalSource
                     while (!_stop)
                     {
                         using var pool = new NSAutoreleasePool(); // sample buffers, the frame's wrappers (LESSON-BUG-008)
+                        _phase = "read-sample";
                         using var sample = output.CopyNextSampleBuffer();
                         if (sample is null)
                         {
@@ -255,12 +272,13 @@ public sealed class VideoToolboxSource : IMetalSource
                         if (sample.NumSamples == 0)
                             continue; // a timing-only marker (edit-list gap), not a frame — VideoToolbox rejects it as a parameter error
 
+                        _phase = "decode-frame";
                         var status = _session.DecodeFrame(sample, VTDecodeFrameFlags.EnableAsynchronousDecompression | VTDecodeFrameFlags.EnableTemporalProcessing,
                             (IntPtr)loopBaseTicks, out _);
                         if (status != VTStatus.Ok)
                             Enqueue(new PendingFrame(null, 0, $"DecodeFrame returned {status} for sample #{sampleIndex} pts={sample.PresentationTimeStamp.Seconds:0.000}s bytes={sample.TotalSampleSize}"));
                         sampleIndex++;
-                        if (!Drain(ref consecutiveFailures, ref firstFrameChecked, ref rateFrames, rateClock, ref flushCountdown))
+                        if (!Drain(flush: false, ref consecutiveFailures, ref firstFrameChecked, ref rateFrames, rateClock, ref flushCountdown))
                             return;
                     }
                 }
@@ -271,9 +289,10 @@ public sealed class VideoToolboxSource : IMetalSource
 
                 // Loop boundary: everything VideoToolbox still holds belongs to THIS loop base — emit and publish it
                 // before the next reader starts at PTS 0 (temporal reordering would otherwise interleave the loops).
+                _phase = "loop-boundary-drain";
                 _session.FinishDelayedFrames();
                 _session.WaitForAsynchronousFrames();
-                if (!Drain(ref consecutiveFailures, ref firstFrameChecked, ref rateFrames, rateClock, ref flushCountdown))
+                if (!Drain(flush: true, ref consecutiveFailures, ref firstFrameChecked, ref rateFrames, rateClock, ref flushCountdown))
                     return;
                 loopBaseTicks += _loopDurationTicks;
             }
@@ -287,8 +306,10 @@ public sealed class VideoToolboxSource : IMetalSource
         {
             // Quiesce VideoToolbox on THIS thread so no callback can enqueue after Stop returns, then release every
             // buffer it emitted meanwhile — nothing is published after the loop ends (stopped or faulted).
+            _phase = "exit-drain";
             _session.WaitForAsynchronousFrames();
             DiscardQueued();
+            _phase = "exited";
         }
     }
 
@@ -300,6 +321,9 @@ public sealed class VideoToolboxSource : IMetalSource
                 pending.Buffer?.Dispose();
             _decoded.Clear();
         }
+        foreach (var pending in _reorder)
+            pending.Buffer!.Dispose();
+        _reorder.Clear();
     }
 
     /// <summary>VideoToolbox's callback thread: retain the buffer and hand it to the decode thread. Nothing else —
@@ -321,78 +345,107 @@ public sealed class VideoToolboxSource : IMetalSource
         lock (_decodedGate) _decoded.Add(frame);
     }
 
-    /// <summary>Decode thread: publish every frame VideoToolbox has emitted, in order. Returns false when the
-    /// source faulted (the caller exits the loop).</summary>
-    private bool Drain(ref int consecutiveFailures, ref bool firstFrameChecked, ref long rateFrames, Stopwatch rateClock, ref int flushCountdown)
+    /// <summary>Decode thread: take every frame VideoToolbox has emitted, reorder it into presentation order and
+    /// publish what the window has proved complete — everything when <paramref name="flush"/> (loop boundary, after
+    /// VT was drained). Returns false when the source faulted (the caller exits the loop).</summary>
+    private bool Drain(bool flush, ref int consecutiveFailures, ref bool firstFrameChecked, ref long rateFrames, Stopwatch rateClock, ref int flushCountdown)
     {
         while (true)
         {
             PendingFrame pending;
             lock (_decodedGate)
             {
-                if (_decoded.Count == 0) return true;
+                if (_decoded.Count == 0) break;
                 pending = _decoded[0];
                 _decoded.RemoveAt(0);
             }
-
-            var failure = pending.Failure;
-            var buffer = pending.Buffer;
-            CVMetalTexture? metalTexture = null;
-            IMTLTexture? texture = null;
-            if (buffer is not null)
+            if (pending.Buffer is null)
             {
-                failure = Validate(buffer, ref firstFrameChecked);
-                if (failure is null)
-                {
-                    metalTexture = _cache.TextureFromImage(buffer, TextureFormat, Width, Height, 0, out var cvStatus);
-                    texture = metalTexture?.Texture;
-                    if (texture is null)
-                        failure = $"CVMetalTextureCache could not wrap the frame ({cvStatus})";
-                }
-            }
-
-            if (failure is not null)
-            {
-                texture?.Dispose();
-                metalTexture?.Dispose();
-                buffer?.Dispose();
-                consecutiveFailures++;
-                if (consecutiveFailures == 1 || consecutiveFailures == MaxConsecutiveFailures)
-                    _log.Error("Decode", $"{Id}: decode failure ({failure}); {consecutiveFailures} consecutive failure(s).");
-                if (consecutiveFailures >= MaxConsecutiveFailures || !firstFrameChecked && buffer is not null)
-                {
-                    // A burst of failures, or a first frame the pass cannot bind to (format/size): stop, never publish.
-                    _faulted = true;
-                    _log.Error("Decode", $"{Id}: stopping decode ({(consecutiveFailures >= MaxConsecutiveFailures ? $"{MaxConsecutiveFailures} consecutive failures" : $"first frame unusable: {failure}")}).");
+                // A failure carries no PTS and holds nothing: count it now, it does not enter the window.
+                if (!CountFailure(pending.Failure!, decodedFrame: false, ref consecutiveFailures, firstFrameChecked))
                     return false;
-                }
                 continue;
             }
-            consecutiveFailures = 0;
-
-            _tracker.TextureCreated();
-            Interlocked.Increment(ref _outstanding);
-            Volatile.Write(ref _ptsTicks, pending.PtsTicks);
-            Interlocked.Increment(ref _decodedFrames);
-            // The frame OWNS buffer + cache texture + wrapper; its release (timeline passed it + GPU reads completed)
-            // frees them exactly once, on whichever thread drops the last hold.
-            var owner = (Buffer: buffer!, Metal: metalTexture!, Texture: texture!);
-            Frames.Publish(new DecodedFrame(texture!, TimeSpan.FromTicks(pending.PtsTicks), () => ReleaseFrame(owner.Texture, owner.Metal, owner.Buffer)));
-
-            if (--flushCountdown == 0)
-            {
-                _cache.Flush(CVOptionFlags.None);
-                flushCountdown = CacheFlushInterval;
-            }
-            rateFrames++;
-            if (rateClock.Elapsed >= DecodeRateLogInterval)
-            {
-                _log.Info("Decode", $"{Id}: decoded {rateFrames} frames in {rateClock.Elapsed.TotalSeconds:0.0}s " +
-                                    $"({rateFrames / rateClock.Elapsed.TotalSeconds:0.0} fps, {(IsHardwareDecode ? "hardware" : "software")}), pts={CurrentPts.TotalSeconds:0.00}s.");
-                rateFrames = 0;
-                rateClock.Restart();
-            }
+            // Sorted insert (the window is at most ReorderDepth + 1 long): scan back from the end.
+            var at = _reorder.Count;
+            while (at > 0 && _reorder[at - 1].PtsTicks > pending.PtsTicks) at--;
+            _reorder.Insert(at, pending);
         }
+
+        while (_reorder.Count > ReorderDepth || flush && _reorder.Count > 0)
+        {
+            var next = _reorder[0];
+            _reorder.RemoveAt(0);
+            if (!PublishFrame(next, ref consecutiveFailures, ref firstFrameChecked, ref rateFrames, rateClock, ref flushCountdown))
+                return false;
+        }
+        return true;
+    }
+
+    /// <summary>Wraps one decoded buffer through the texture cache and publishes it. Returns false when the source
+    /// faulted.</summary>
+    private bool PublishFrame(PendingFrame pending, ref int consecutiveFailures, ref bool firstFrameChecked, ref long rateFrames, Stopwatch rateClock, ref int flushCountdown)
+    {
+        var buffer = pending.Buffer!;
+        CVMetalTexture? metalTexture = null;
+        IMTLTexture? texture = null;
+        var failure = Validate(buffer, ref firstFrameChecked);
+        if (failure is null)
+        {
+            metalTexture = _cache.TextureFromImage(buffer, TextureFormat, Width, Height, 0, out var cvStatus);
+            texture = metalTexture?.Texture;
+            if (texture is null)
+                failure = $"CVMetalTextureCache could not wrap the frame ({cvStatus})";
+        }
+
+        if (failure is not null)
+        {
+            texture?.Dispose();
+            metalTexture?.Dispose();
+            buffer.Dispose();
+            return CountFailure(failure, decodedFrame: true, ref consecutiveFailures, firstFrameChecked);
+        }
+        consecutiveFailures = 0;
+
+        _tracker.TextureCreated();
+        Interlocked.Increment(ref _outstanding);
+        Volatile.Write(ref _ptsTicks, pending.PtsTicks);
+        Interlocked.Increment(ref _decodedFrames);
+        // The frame OWNS buffer + cache texture + wrapper; its release (timeline passed it + GPU reads completed)
+        // frees them exactly once, on whichever thread drops the last hold.
+        var owner = (Buffer: buffer, Metal: metalTexture!, Texture: texture!);
+        _phase = "publish";
+        Frames.Publish(new DecodedFrame(texture!, TimeSpan.FromTicks(pending.PtsTicks), () => ReleaseFrame(owner.Texture, owner.Metal, owner.Buffer)));
+
+        if (--flushCountdown == 0)
+        {
+            _cache.Flush(CVOptionFlags.None);
+            flushCountdown = CacheFlushInterval;
+        }
+        rateFrames++;
+        if (rateClock.Elapsed >= DecodeRateLogInterval)
+        {
+            _log.Info("Decode", $"{Id}: decoded {rateFrames} frames in {rateClock.Elapsed.TotalSeconds:0.0}s " +
+                                $"({rateFrames / rateClock.Elapsed.TotalSeconds:0.0} fps, {(IsHardwareDecode ? "hardware" : "software")}), pts={CurrentPts.TotalSeconds:0.00}s.");
+            rateFrames = 0;
+            rateClock.Restart();
+        }
+        return true;
+    }
+
+    /// <summary>Counts one skipped frame (its buffer, if any, is already released). Returns false — the source faulted —
+    /// after a burst, or when the FIRST decoded frame (<paramref name="decodedFrame"/>) is one the pass cannot bind to
+    /// (format/size); a decode status failure before any frame is only counted.</summary>
+    private bool CountFailure(string failure, bool decodedFrame, ref int consecutiveFailures, bool firstFrameChecked)
+    {
+        consecutiveFailures++;
+        if (consecutiveFailures == 1 || consecutiveFailures == MaxConsecutiveFailures)
+            _log.Error("Decode", $"{Id}: decode failure ({failure}); {consecutiveFailures} consecutive failure(s).");
+        if (consecutiveFailures < MaxConsecutiveFailures && (firstFrameChecked || !decodedFrame))
+            return true;
+        _faulted = true;
+        _log.Error("Decode", $"{Id}: stopping decode ({(consecutiveFailures >= MaxConsecutiveFailures ? $"{MaxConsecutiveFailures} consecutive failures" : $"first frame unusable: {failure}")}).");
+        return false;
     }
 
     /// <summary>The first-frame format/size assertion (the Windows first-HW-frame check): every published texture must

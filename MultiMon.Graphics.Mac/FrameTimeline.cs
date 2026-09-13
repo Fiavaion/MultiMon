@@ -25,14 +25,25 @@ public sealed class FrameTimeline : IDisposable
     private readonly List<TimeSpan> _ptsScratch = new(); // reused under _gate — no per-present allocation
     private readonly int _capacity;
     private bool _stopped;
+    private TimeSpan? _lastPublishedPts;
 
     public FrameTimeline(int capacity = 8) => _capacity = Math.Max(2, capacity);
 
-    /// <summary>Decode thread: append a frame (ascending PTS). Blocks while full so decode tracks real time.</summary>
+    /// <summary>Decode thread: append a frame (ascending PTS). Blocks while full so decode tracks real time.
+    /// The ascending contract is ENFORCED: a PTS not greater than the previous published one is refused — the
+    /// frame is disposed and the producer gets an exception (its loop faults loudly) — because
+    /// <see cref="FrameSelector"/>'s binary search over a non-ascending list silently selects stale frames
+    /// (the VideoToolbox decode-order stutter, 2026-09-13).</summary>
     public void Publish(DecodedFrame frame)
     {
         lock (_gate)
         {
+            if (_lastPublishedPts is { } last && frame.Pts <= last)
+            {
+                frame.Dispose();
+                throw new InvalidOperationException(
+                    $"FrameTimeline: first inversion — published PTS {frame.Pts.TotalSeconds:0.000}s is not greater than the previous {last.TotalSeconds:0.000}s; frames must be published in presentation order.");
+            }
             while (_frames.Count >= _capacity && !_stopped)
                 Monitor.Wait(_gate);
 
@@ -42,6 +53,7 @@ public sealed class FrameTimeline : IDisposable
                 return;
             }
             _frames.Add(frame);
+            _lastPublishedPts = frame.Pts;
             Monitor.PulseAll(_gate);
         }
     }
@@ -96,6 +108,7 @@ public sealed class FrameTimeline : IDisposable
             foreach (var frame in _frames)
                 frame.Dispose();
             _frames.Clear();
+            _lastPublishedPts = null;
             _stopped = false; // re-arm: a new decode thread may Publish again after rebind
             Monitor.PulseAll(_gate);
         }
