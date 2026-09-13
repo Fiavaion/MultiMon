@@ -7,7 +7,7 @@
         Width="1180" Height="660" MinWidth="1100" MinHeight="620"
         Background="{StaticResource WindowBackground}">
 
-  <Grid Margin="22,18,22,18" RowDefinitions="Auto,Auto,Auto,*,Auto,Auto">
+  <Grid Margin="22,18,22,18" RowDefinitions="Auto,Auto,Auto,*,Auto,Auto,Auto">
 
     <!-- Header -->
     <Grid Grid.Row="0" Margin="0,0,0,10">
@@ -154,6 +154,21 @@
                  VerticalAlignment="Center" Margin="22,0,0,0"/>
     </StackPanel>
 
-    <TextBlock Grid.Row="5" Text="{Binding Status}" Classes="telemetry"/>
+    <!-- Live performance readout: one line per output, polled every 500 ms while performing only. -->
+    <HeaderedContentControl Grid.Row="5" Header="PERFORMANCE" Margin="0,0,0,10"
+                            IsVisible="{Binding PerformanceVisible}"
+                            AutomationProperties.Name="Live performance readout">
+      <ItemsControl ItemsSource="{Binding PerformanceLines}"
+                    AutomationProperties.Name="Per-output performance figures">
+        <ItemsControl.ItemTemplate>
+          <DataTemplate x:DataType="vm:PerformanceLineRow">
+            <TextBlock Text="{Binding Text}" Classes="telemetry" Margin="2,1"
+                       AutomationProperties.Name="{Binding Text}"/>
+          </DataTemplate>
+        </ItemsControl.ItemTemplate>
+      </ItemsControl>
+    </HeaderedContentControl>
+
+    <TextBlock Grid.Row="6" Text="{Binding Status}" Classes="telemetry"/>
   </Grid>
 </Window>

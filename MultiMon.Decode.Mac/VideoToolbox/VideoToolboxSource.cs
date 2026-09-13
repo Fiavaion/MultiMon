@@ -96,6 +96,8 @@ public sealed class VideoToolboxSource : IMetalSource
     /// <summary>True when the session reports the hardware decoder (read back from VideoToolbox, not assumed).</summary>
     public bool IsHardwareDecode { get; }
 
+    public string DecodePath => IsHardwareDecode ? "hardware" : "software";
+
     /// <summary>The stream's codec, for the log.</summary>
     public CMVideoCodecType Codec { get; }
 

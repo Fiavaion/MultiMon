@@ -47,6 +47,14 @@ public sealed class FullscreenQuadPass : IDisposable
     private bool _hasContent;   // a frame has been copied into _sourceTexture at least once
     private DecodedFrame? _lastCopied; // identity only, never dereferenced (see the Windows pass)
 
+    /// <summary>Render thread: true once this pass draws something real — a decoded frame has been copied in, or
+    /// it is the (always-drawable) test pattern. The output uses it to time the first frame of a perform.</summary>
+    internal bool HasDrawnContent => _source is null || _hasContent;
+
+    /// <summary>Render thread: the PTS of the frame the selector chose on the last <see cref="Draw"/> — the
+    /// output compares it against the clock to count late frames. Zero until the first selection.</summary>
+    internal TimeSpan LastSelectedPts { get; private set; }
+
     public FullscreenQuadPass(GraphicsDeviceProvider provider)
     {
         _provider = provider;
@@ -100,7 +108,11 @@ public sealed class FullscreenQuadPass : IDisposable
             // Select the frame for the clock time and blit it into the persistent texture — unless it is the
             // frame already there. Lifetime: the frame is alive for the whole callback (only PASSED frames are
             // disposed, after it returns) and the command buffer retains the source texture until it completes.
-            if (_source!.SelectInto(mediaTime, frame => { if (CopyFrameIfNew(commandBuffer, frame)) read = frame; }))
+            if (_source!.SelectInto(mediaTime, frame =>
+                {
+                    LastSelectedPts = frame.Pts;
+                    if (CopyFrameIfNew(commandBuffer, frame)) read = frame;
+                }))
                 _hasContent = true;
         }
 
@@ -177,5 +189,6 @@ public sealed class FullscreenQuadPass : IDisposable
         _provider.Tracker.TextureDisposed();
         _hasContent = false;
         _lastCopied = null;
+        LastSelectedPts = TimeSpan.Zero;
     }
 }

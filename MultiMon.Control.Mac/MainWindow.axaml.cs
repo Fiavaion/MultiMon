@@ -4,6 +4,7 @@ using Avalonia.Input;
 using Avalonia.Interactivity;
 using Avalonia.Markup.Xaml;
 using Avalonia.Platform.Storage;
+using Avalonia.Threading;
 using Metal;
 using MultiMon.Control.Shared;
 using MultiMon.Core.Diagnostics;
@@ -34,6 +35,9 @@ public partial class MainWindow : Window
     private readonly MainViewModel _vm;
     private readonly ILog _log;
     private readonly IdentifyOverlays _identify = new();
+    /// <summary>Polls the controller's live counters for the PERFORMANCE strip. Runs ONLY between Performing and
+    /// Idle: the sample is a lock-free read of published counters, but there is nothing to read when nothing plays.</summary>
+    private readonly DispatcherTimer _statsTimer = new() { Interval = TimeSpan.FromMilliseconds(500) };
 
     /// <summary><paramref name="matchDisplayRefresh"/> seeds the "Match display refresh rate" box and
     /// <paramref name="onMatchDisplayRefreshChanged"/> receives every toggle — an app-level option (not project
@@ -54,17 +58,33 @@ public partial class MainWindow : Window
             "Decode: VideoToolbox (hardware, automatic software fallback)   ·   HAP: enabled";
 
         _vm.PropertyChanged += OnViewModelChanged;
+        _statsTimer.Tick += (_, _) => _vm.RefreshPerformanceStats();
         KeyDown += OnKeyDown;
-        Closed += (_, _) => _identify.Hide();
+        Closed += (_, _) =>
+        {
+            _statsTimer.Stop();
+            _identify.Hide();
+        };
     }
 
     private void InitializeComponent() => AvaloniaXamlLoader.Load(this);
 
-    /// <summary>A show is starting — get the number overlays off the output monitors.</summary>
+    /// <summary>A show is starting — get the number overlays off the output monitors and start polling the live
+    /// performance counters; stopping ends the poll (the view-model logs the last sample and clears the strip).</summary>
     private void OnViewModelChanged(object? sender, PropertyChangedEventArgs e)
     {
-        if (e.PropertyName == nameof(MainViewModel.IsPerforming) && _vm.IsPerforming)
+        if (e.PropertyName != nameof(MainViewModel.IsPerforming))
+            return;
+        if (_vm.IsPerforming)
+        {
             _identify.Hide();
+            _vm.RefreshPerformanceStats(); // baseline sample: the first tick then reports a real rate
+            _statsTimer.Start();
+        }
+        else
+        {
+            _statsTimer.Stop();
+        }
     }
 
     private void OnKeyDown(object? sender, KeyEventArgs e)

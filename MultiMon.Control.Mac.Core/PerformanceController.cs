@@ -1,6 +1,8 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using Foundation;
 using MultiMon.Audio.Mac;
+using MultiMon.Control.Shared;
 using MultiMon.Core.Abstractions;
 using MultiMon.Core.Diagnostics;
 using MultiMon.Core.Models;
@@ -34,7 +36,7 @@ namespace MultiMon.Control.Mac;
 /// refuse to run on the main thread: a host constructs and disposes the controller on a background thread
 /// (Task.Run) and marshals the result back — the same rule the Windows App.OnExit teardown thread follows.</para>
 /// </summary>
-public sealed class PerformanceController : IPerformanceController
+public sealed class PerformanceController : IPerformanceController, IPerformanceStatsSource
 {
     private static readonly TimeSpan InFlightDrainTimeout = TimeSpan.FromSeconds(5);
 
@@ -55,6 +57,10 @@ public sealed class PerformanceController : IPerformanceController
     private readonly DisplayModeService _displayModes;
     private readonly List<DisplayRefreshMatch> _refreshMatches = new();
     private readonly List<MasterClock> _freeRunClocks = new(); // Individual free-run: one clock per source
+    private readonly Dictionary<int, double> _modeSwitchMs = new(); // output index → what its refresh match cost
+    // The ONLY state GetStats reads: an immutable pair of (bound outputs, live sources) the worker republishes
+    // whenever either changes. A caller on any thread reads the reference once and is consistent for the sample.
+    private volatile StatsPublication _stats = StatsPublication.Empty;
     private AudioEngine? _audio;
     // Master mix settings live HERE, not in the per-show engine (LESSON-BUG-007): BuildAudio creates a fresh
     // AudioEngine on every ApplyShow and re-applies these to it. Worker-thread state like the rest.
@@ -252,6 +258,81 @@ public sealed class PerformanceController : IPerformanceController
     internal OutputWindow[] Outputs => _outputs;
     internal GraphicsDeviceProvider Provider => _provider;
 
+    // ── Live performance stats (read on the CALLER's thread) ─────────────────
+
+    /// <summary>
+    /// Samples the pipeline's live counters. It reads ONLY the immutable publication the worker last posted plus
+    /// the Interlocked/volatile counters on the output windows and sources — so it never posts to the worker
+    /// queue, never takes a lock, never blocks on native work and never runs on the render thread's behalf. Safe
+    /// from the UI thread at any state, including Idle (which reports an empty snapshot).
+    /// </summary>
+    public PerformanceSnapshot GetStats()
+    {
+        var published = _stats;
+        var outputs = new OutputStats[published.Bindings.Length];
+        for (var n = 0; n < published.Bindings.Length; n++)
+        {
+            var b = published.Bindings[n];
+            var window = b.Output;
+            outputs[n] = new OutputStats(b.OutputIndex, window.Name, b.Source?.Id ?? string.Empty, window.Visible,
+                b.PixelWidth, b.PixelHeight, b.RefreshHz, b.RefreshMatch,
+                window.PresentCount, window.DrawableNullCount, window.InFlightTimeoutCount, window.LateFrameCount,
+                window.StartupMs, window.StartupModeSwitchMs, window.StartupShowMs, window.RenderPhase);
+        }
+        var sources = new SourceStats[published.Sources.Length];
+        for (var n = 0; n < published.Sources.Length; n++)
+        {
+            var source = published.Sources[n];
+            sources[n] = new SourceStats(source.Id, source.DecodePath, source.FrameRate,
+                source.CurrentPts.TotalSeconds, source.DecodedFrames, source.IsFaulted);
+        }
+        return new PerformanceSnapshot(_state, Stopwatch.GetTimestamp(), outputs, sources);
+    }
+
+    /// <summary>
+    /// Worker thread: republish what <see cref="GetStats"/> may read — the bound outputs with their source, pixel
+    /// size and CURRENT display refresh rate, and the live sources. Called whenever any of that changes (show
+    /// built/torn down, refresh matched, refresh restored), so the rate is queried from CoreGraphics at most a
+    /// handful of times per perform and never on a poll tick.
+    /// </summary>
+    private void PublishStats()
+    {
+        if (_activeOutputs.Count == 0)
+        {
+            _stats = StatsPublication.Empty;
+            return;
+        }
+
+        var bindings = new StatsBinding[_activeOutputs.Count];
+        for (var n = 0; n < _activeOutputs.Count; n++)
+        {
+            var i = _activeOutputs[n];
+            _outputSources.TryGetValue(i, out var source);
+            var bounds = Monitors[i].Bounds;
+            var refreshHz = 0.0;
+            if (uint.TryParse(Monitors[i].DeviceId, out var displayId) && _displayModes.QueryCurrent(displayId) is { } mode)
+                refreshHz = mode.RefreshRate;
+            var match = string.Empty;
+            foreach (var m in _refreshMatches)
+                if (m.Output == i)
+                    match = m.Result.ToString();
+            bindings[n] = new StatsBinding(i, _outputs[i], source, (int)bounds.Width, (int)bounds.Height, refreshHz, match);
+        }
+        _stats = new StatsPublication(bindings, _sources.ToArray());
+    }
+
+    /// <summary>What the worker publishes for <see cref="GetStats"/>: the bound outputs and the live sources as
+    /// one immutable pair, so a reader can never see half of a rebind.</summary>
+    private sealed record StatsPublication(StatsBinding[] Bindings, IMetalSource[] Sources)
+    {
+        public static StatsPublication Empty { get; } = new(Array.Empty<StatsBinding>(), Array.Empty<IMetalSource>());
+    }
+
+    /// <summary>One bound output as the stats reader sees it: the window whose counters it reads, the source it
+    /// samples (null = test pattern) and the geometry/refresh cached at publish time.</summary>
+    private sealed record StatsBinding(int OutputIndex, OutputWindow Output, IMetalSource? Source,
+        int PixelWidth, int PixelHeight, double RefreshHz, string RefreshMatch);
+
     // ── Worker-thread implementations ────────────────────────────────────────
 
     private void EnterPerformCore()
@@ -268,6 +349,10 @@ public sealed class PerformanceController : IPerformanceController
         // window shown first would flash through it. Same pixel and point size by construction, so the outputs'
         // bounds stay valid. Results are logged and recorded, never thrown — a display that will not switch performs
         // at its current rate.
+        // Start-up timing (the user's "the second screen takes longer to start" question): one origin for this
+        // EnterPerform, then what each output's own mode switch and Show cost. The render thread completes the
+        // measurement when the output first draws decoded content and logs the line.
+        var origin = Stopwatch.GetTimestamp();
         MatchOutputDisplayRefresh();
 
         // Show every bound output. A Show that fails partway (MainThread.Invoke timing out because the main run
@@ -278,7 +363,11 @@ public sealed class PerformanceController : IPerformanceController
         try
         {
             foreach (var i in _activeOutputs)
+            {
+                var showStart = Stopwatch.GetTimestamp();
                 _outputs[i].Show(Monitors[i].Bounds);
+                _outputs[i].BeginStartupTiming(origin, _modeSwitchMs.GetValueOrDefault(i), Stopwatch.GetElapsedTime(showStart).TotalMilliseconds);
+            }
         }
         catch
         {
@@ -293,6 +382,7 @@ public sealed class PerformanceController : IPerformanceController
         _clock.Reset();
         _clock.Start();                              // shared clock (synced modes + free-run fallback)
         foreach (var c in _freeRunClocks) c.Start(); // Individual free-run: independent timelines
+        PublishStats();                              // the matched refresh rates are now the current ones
         SetState(PerformState.Performing);
     }
 
@@ -311,6 +401,7 @@ public sealed class PerformanceController : IPerformanceController
         foreach (var i in _activeOutputs)
             TryHide(i, "ExitPerform"); // one failed Hide must not skip the remaining outputs
         _displayModes.RestoreAll();   // after the windows are gone, so they never flash through the switch back
+        PublishStats();               // re-cache the restored refresh rates
         SetState(PerformState.Idle);
     }
 
@@ -333,6 +424,7 @@ public sealed class PerformanceController : IPerformanceController
     private void MatchOutputDisplayRefresh()
     {
         _refreshMatches.Clear();
+        _modeSwitchMs.Clear();
         if (!MatchDisplayRefresh)
             return;
         foreach (var i in _activeOutputs)
@@ -344,7 +436,9 @@ public sealed class PerformanceController : IPerformanceController
                 _log.Info("Control", $"{_outputs[i].Name}: monitor '{Monitors[i].DeviceId}' is not a CGDirectDisplayID; refresh rate left alone.");
                 continue;
             }
+            var matchStart = Stopwatch.GetTimestamp();
             var result = _displayModes.Match(displayId, source.FrameRate);
+            _modeSwitchMs[i] = Stopwatch.GetElapsedTime(matchStart).TotalMilliseconds;
             _refreshMatches.Add(new DisplayRefreshMatch(i, displayId, source.FrameRate, result));
             _log.Info("Control", $"{_outputs[i].Name}: display {displayId}: {result.Before.PixelWidth}x{result.Before.PixelHeight} {result} for {source.FrameRate:0.###} fps clip '{source.Id}'");
         }
@@ -410,7 +504,7 @@ public sealed class PerformanceController : IPerformanceController
                     clock = new MasterClock();  // own timeline; started/stopped with the show
                     _freeRunClocks.Add(clock);
                 }
-                BindOutput(binding.OutputIndex, pass, binding.Uv, clock);
+                BindOutput(binding.OutputIndex, pass, binding.Uv, clock, source.FrameRate);
                 _outputSources[binding.OutputIndex] = source;
             }
         }
@@ -419,6 +513,8 @@ public sealed class PerformanceController : IPerformanceController
 
         foreach (var s in _sources)
             s.Start();
+
+        PublishStats();
     }
 
     /// <summary>
@@ -452,10 +548,12 @@ public sealed class PerformanceController : IPerformanceController
         return (pass, source);
     }
 
-    /// <summary>Binds an output to a pass + UV slice, optionally with its own free-run clock (null = shared).</summary>
-    private void BindOutput(int index, FullscreenQuadPass pass, UvRect uv, MasterClock? clock = null)
+    /// <summary>Binds an output to a pass + UV slice, optionally with its own free-run clock (null = shared).
+    /// <paramref name="sourceFps"/> is the bound clip's frame rate (0 for the test pattern) — the output's
+    /// late-frame counter measures against one frame period of it.</summary>
+    private void BindOutput(int index, FullscreenQuadPass pass, UvRect uv, MasterClock? clock = null, double sourceFps = 0)
     {
-        _outputs[index].SetContent(pass, uv, clock);
+        _outputs[index].SetContent(pass, uv, clock, sourceFps);
         _activeOutputs.Add(index);
     }
 
@@ -502,6 +600,7 @@ public sealed class PerformanceController : IPerformanceController
         _sources.Clear();
         _freeRunClocks.Clear();
         _audio = null;
+        PublishStats();
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────

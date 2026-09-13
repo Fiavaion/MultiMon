@@ -7,6 +7,7 @@ using MultiMon.Core.Sync;
 using MultiMon.Core.Timing;
 using MultiMon.Audio.Mac;
 using MultiMon.Control.Mac;
+using MultiMon.Control.Shared;
 using MultiMon.Core.Abstractions;
 using MultiMon.Core.Show;
 using MultiMon.Decode.Mac;
@@ -64,6 +65,9 @@ public static class StressHarness
     private const int WarmupCycles = 3;
     private const int HoldFramesPerCycle = 30;          // ~0.5s at 60Hz
     private const long WorkingSetGrowthLimitMb = 150;   // same backstop as the Windows harness
+    /// <summary>Soak gate: more than this share of an output's presents showing a frame more than one frame period
+    /// behind the clock means decode is not keeping up with playback — a FAIL, not a diagnostic.</summary>
+    private const double LateFrameFailRatio = 0.10;
     private const long AllocatedGrowthLimitMb = 128;    // the layer's drawable pool (3 × a 4K BGRA surface) may come and go
     private const double AudioDriftLimitMs = 40;       // the Mac runbook's A/V alignment gate for the audio milestone
     private const double AudioMinContentSeconds = 0.25; // every audio cycle must actually PLAY this much before it may exit
@@ -623,6 +627,10 @@ public static class StressHarness
         var wedged = false;
         var contentFail = false;
         var audioGate = new AudioGate(log, cycles, options.AudioDevice, expectSignal: options.AudioGain is not 0 && options.AudioMaster is not 0);
+        // The panel's own reader: rates come from PerformanceController.GetStats deltas, computed here rather
+        // than by the render thread (the same PerformanceReadout the control panel binds).
+        var readout = new PerformanceReadout();
+        var lateFail = false;
         long baseline = -1, maxGrowth = 0;
         ulong allocBaseline = 0, allocMax = 0;
         long wsBaseline = 0, wsMax = 0;
@@ -683,7 +691,9 @@ public static class StressHarness
                 // Hold: every bound output must keep completing frames; with --soak-seconds the perform is held
                 // that long (each pass restarts the watchdog: a soak is a deliberate dwell, not a stuck cycle).
                 var hold = Stopwatch.StartNew();
-                var presentsAtHoldStart = controller.Outputs.Select(o => o.PresentCount).ToArray();
+                readout.Reset();
+                var statsAtHoldStart = controller.GetStats();
+                readout.Read(statsAtHoldStart); // baseline for the per-second figures below
                 do
                 {
                     if (!controller.WaitForPresentedFrames(HoldFramesPerCycle, WedgeTimeout, out var stalled))
@@ -698,13 +708,26 @@ public static class StressHarness
                 } while (soakSeconds > 0 && hold.Elapsed < TimeSpan.FromSeconds(soakSeconds));
                 if (wedged)
                     break;
+
+                var statsAtHoldEnd = controller.GetStats();
+                var rows = readout.Read(statsAtHoldEnd);
+                // Start-up timing, once: how long each output took to put its first frame on screen, and what of
+                // that was the display's mode switch (the reason an external panel starts later than the built-in).
+                if (cycle == 1)
+                    foreach (var row in rows)
+                        log.Info("Stress", $"{row.Name}: first frame {row.StartupMs:0.0}ms after EnterPerform " +
+                                           $"(mode switch {row.ModeSwitchMs:0.0}ms, show {row.ShowMs:0.0}ms), display {row.RefreshHz:0.##}Hz");
                 if (soakSeconds > 0)
                 {
                     // Present rate over the soak, per output: on a matched display this is the display's refresh
-                    // rate (every vsync presents), e.g. ~100/s for 25 fps content on a 100 Hz panel.
+                    // rate (every vsync presents), e.g. ~100/s for 25 fps content on a 100 Hz panel. A late frame
+                    // is a present whose selected frame was more than one frame period behind the clock.
                     var seconds = hold.Elapsed.TotalSeconds;
-                    log.Info("Stress", $"cycle {cycle:00}/{cycles}: soak presents: " + string.Join(" ", controller.Outputs.Select((o, i) =>
-                        $"{o.Name}={o.PresentCount - presentsAtHoldStart[i]} in {seconds:0.0}s ({(o.PresentCount - presentsAtHoldStart[i]) / seconds:0.0}/s)")));
+                    log.Info("Stress", $"cycle {cycle:00}/{cycles}: soak {seconds:0.0}s: " + string.Join(" | ", rows.Select(r =>
+                        $"{r.Name} {r.PresentsPerSecond:0.0} present/s decode {r.DecodeFps:0.0} fps ({r.DecodePath}) late {LateFrames(statsAtHoldStart, statsAtHoldEnd, r.Index)}/{Presents(statsAtHoldStart, statsAtHoldEnd, r.Index)}")));
+                    lateFail = !CheckLateFrames(log, cycle, cycles, statsAtHoldStart, statsAtHoldEnd);
+                    if (lateFail)
+                        break;
                 }
                 if (audioTrack is not null)
                     audioGate.HoldForContent(cycle, () => SampleAudio(controller), watchdog.StopSignal);
@@ -811,15 +834,53 @@ public static class StressHarness
         var audioGateFail = audioPath is not null && audioGate.Failed;
         var commandFailures = Volatile.Read(ref failures);
         var survivors = controller.Tracker.LiveCount;
-        var passed = completed == cycles && !wedged && !contentFail && !leakFail && !allocFail && !wsFail && outstanding == 0 && !audioGateFail && commandFailures == 0 && survivors == 0 && !refreshFail;
+        var passed = completed == cycles && !wedged && !contentFail && !leakFail && !allocFail && !wsFail && outstanding == 0 && !audioGateFail && commandFailures == 0 && survivors == 0 && !refreshFail && !lateFail;
 
         log.Info("Stress", $"controller: cycles={completed}/{cycles} wedges={(wedged ? 1 : 0)} commandFailures={commandFailures} texturesOutstandingAtDispose={outstanding} " +
                            (audioPath is null ? "" : $"{audioGate.Summary} ") +
                            $"trackedBaseline={baseline} maxGrowth={maxGrowth} allocMaxGrowth={allocGrowthMb}MB rssMaxGrowth={wsGrowthMb}MB trackedAfterTeardown={survivors}");
         log.Info("Stress", passed
             ? $"RESULT: PASS — {completed} controller cycles clean, zero tracked-object growth, flat allocation and RSS{(audioPath is null ? "" : $", audio aligned (peakDrift={audioGate.PeakDriftMs:0.0}ms, 0 underruns)")}."
-            : $"RESULT: FAIL — {(wedged ? "wedge detected" : commandFailures > 0 ? "controller command failures" : refreshFail ? "display refresh gate (see DisplayMode/Stress lines)" : contentFail ? "clip source did not advance / faulted / wrong decoder / wrong clock count" : leakFail ? "tracked Metal object growth (ownership bug)" : allocFail ? $"device allocation growth {allocGrowthMb}MB > {AllocatedGrowthLimitMb}MB" : wsFail ? $"RSS growth {wsGrowthMb}MB > {WorkingSetGrowthLimitMb}MB" : outstanding != 0 ? $"{outstanding} pooled texture(s) still held at dispose" : audioGateFail ? $"audio gate ({audioGate.Reason})" : survivors != 0 ? $"{survivors} tracked object(s) survived teardown" : "incomplete run")}.");
+            : $"RESULT: FAIL — {(wedged ? "wedge detected" : commandFailures > 0 ? "controller command failures" : lateFail ? $"late frames over {LateFrameFailRatio:P0} of presents (decode not keeping up)" : refreshFail ? "display refresh gate (see DisplayMode/Stress lines)" : contentFail ? "clip source did not advance / faulted / wrong decoder / wrong clock count" : leakFail ? "tracked Metal object growth (ownership bug)" : allocFail ? $"device allocation growth {allocGrowthMb}MB > {AllocatedGrowthLimitMb}MB" : wsFail ? $"RSS growth {wsGrowthMb}MB > {WorkingSetGrowthLimitMb}MB" : outstanding != 0 ? $"{outstanding} pooled texture(s) still held at dispose" : audioGateFail ? $"audio gate ({audioGate.Reason})" : survivors != 0 ? $"{survivors} tracked object(s) survived teardown" : "incomplete run")}.");
         return passed ? 0 : 1;
+    }
+
+    /// <summary>Late frames / presents an output accumulated between two snapshots (the counters are zeroed by
+    /// each Show, so the delta is this perform's).</summary>
+    private static long LateFrames(PerformanceSnapshot start, PerformanceSnapshot end, int index) =>
+        Find(end, index).LateFrames - Find(start, index).LateFrames;
+
+    private static long Presents(PerformanceSnapshot start, PerformanceSnapshot end, int index) =>
+        Find(end, index).PresentCount - Find(start, index).PresentCount;
+
+    private static OutputStats Find(PerformanceSnapshot snapshot, int index)
+    {
+        foreach (var output in snapshot.Outputs)
+            if (output.Index == index)
+                return output;
+        return default;
+    }
+
+    /// <summary>The soak's playback gate: an output whose late frames exceed <see cref="LateFrameFailRatio"/> of its
+    /// presents was showing a stale frame too often (decode behind the clock), which no present-rate check sees —
+    /// the pipeline happily re-presents the frame it already has. Returns false on a FAIL.</summary>
+    private static bool CheckLateFrames(ILog log, int cycle, int cycles, PerformanceSnapshot start, PerformanceSnapshot end)
+    {
+        var ok = true;
+        foreach (var output in end.Outputs)
+        {
+            var presents = Presents(start, end, output.Index);
+            var late = LateFrames(start, end, output.Index);
+            if (presents <= 0)
+                continue;
+            var ratio = late / (double)presents;
+            if (ratio <= LateFrameFailRatio)
+                continue;
+            ok = false;
+            log.Error("Stress", $"cycle {cycle:00}/{cycles}: {output.Name}: {late} late frame(s) of {presents} presents " +
+                                $"({ratio:P1}) exceeds the {LateFrameFailRatio:P0} soak threshold — decode is not keeping up with the clock.");
+        }
+        return ok;
     }
 
     /// <summary>After EnterPerform: every display the controller says it matched (or found already matched) must be

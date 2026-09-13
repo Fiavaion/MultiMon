@@ -95,6 +95,9 @@ public sealed class HapSource : IMetalSource
     /// <summary>Frames decoded and published since Start (thread-safe read) — the harness's advance check.</summary>
     public long DecodedFrames => Volatile.Read(ref _decodedFrames);
 
+    /// <summary>HAP is a CPU (BCn) path by design: the GPU samples the compressed texture, the decode is ours.</summary>
+    public string DecodePath => "HAP CPU";
+
     /// <summary>Pooled textures still held by in-flight GPU work when <see cref="Dispose"/> ran — non-zero means the
     /// fence and the teardown order disagree (the render side had not completed its reads). The harness fails on it.</summary>
     public int OutstandingAtDispose { get; private set; }

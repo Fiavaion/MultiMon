@@ -7,6 +7,9 @@
     <ProjectReference Include="..\MultiMon.Graphics.Mac\MultiMon.Graphics.Mac.csproj" />
     <ProjectReference Include="..\MultiMon.Decode.Mac\MultiMon.Decode.Mac.csproj" />
     <ProjectReference Include="..\MultiMon.Audio.Mac\MultiMon.Audio.Mac.csproj" />
+    <!-- The live-stats records (net9.0, no UI framework) the panel binds and the harness reads; the controller
+         is their only producer, so it publishes the shared shape rather than a Mac-only one. -->
+    <ProjectReference Include="..\MultiMon.Control.Shared\MultiMon.Control.Shared.csproj" />
   </ItemGroup>
 
   <PropertyGroup>

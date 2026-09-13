@@ -33,6 +33,10 @@ public interface IMetalSource : ISource
     /// <summary>Frames decoded and published since Start (thread-safe read) — the harness's advance check.</summary>
     long DecodedFrames { get; }
 
+    /// <summary>What actually decodes this clip, read back from the decoder rather than assumed: "hardware" or
+    /// "software" for VideoToolbox, "HAP CPU" for the HAP path. Shown in the panel's performance readout.</summary>
+    string DecodePath { get; }
+
     /// <summary>Frame textures still held by in-flight GPU work when Dispose ran — non-zero means the fence and
     /// the teardown order disagree; the harness fails on it.</summary>
     int OutstandingAtDispose { get; }

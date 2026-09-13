@@ -94,6 +94,31 @@ public sealed class AudioTrackRow : INotifyPropertyChanged
 }
 
 /// <summary>
+/// One line of the panel's live performance readout. Only <see cref="Text"/> changes as the poll ticks, so the
+/// strip's rows are created once per perform and rewritten in place rather than rebuilt.
+/// </summary>
+public sealed class PerformanceLineRow : INotifyPropertyChanged
+{
+    private string _text = string.Empty;
+
+    public string Text
+    {
+        get => _text;
+        set
+        {
+            if (_text == value)
+                return;
+            _text = value;
+            OnChanged();
+        }
+    }
+
+    public event PropertyChangedEventHandler? PropertyChanged;
+    private void OnChanged([CallerMemberName] string? n = null)
+        => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(n));
+}
+
+/// <summary>
 /// The control-panel view-model, shared by every host. It issues commands to the pipeline ONLY through
 /// <see cref="IPerformanceController"/> (Core types in, Core types out) and NEVER touches a graphics /
 /// decode type or blocks on native teardown — the architectural firewall (ADR 0003 D4). Every command
@@ -130,11 +155,19 @@ public sealed class MainViewModel : INotifyPropertyChanged
     private readonly Dictionary<string, string> _probing = new();
     private bool _suppressLinkedRefresh;
 
+    // Live performance readout. The controller is polled by the HOST (a UI-thread timer) only while performing;
+    // the rates are computed here, on the reader's side, from the counters the render/decode threads publish.
+    // A controller that cannot report stats (the Windows one, today) simply leaves the strip hidden.
+    private readonly IPerformanceStatsSource? _statsSource;
+    private readonly PerformanceReadout _readout = new();
+    private bool _performanceVisible;
+
     public MainViewModel(IPerformanceController controller, ILog log, IUiDispatcher ui)
     {
         _controller = controller;
         _log = log;
         _ui = ui;
+        _statsSource = controller as IPerformanceStatsSource;
 
         Rows = new ObservableCollection<MonitorAssignmentRow>(
             controller.Monitors.Select(m => new MonitorAssignmentRow { DeviceId = m.DeviceId, DisplayName = m.ToString() }));
@@ -161,6 +194,36 @@ public sealed class MainViewModel : INotifyPropertyChanged
     public ObservableCollection<MonitorAssignmentRow> Rows { get; }
     public ObservableCollection<AudioTrackRow> AudioTracks { get; }
     public ObservableCollection<AudioOutputDevice> AudioDevices { get; }
+
+    /// <summary>One line per bound output while performing; empty otherwise (see <see cref="RefreshPerformanceStats"/>).</summary>
+    public ObservableCollection<PerformanceLineRow> PerformanceLines { get; } = new();
+
+    /// <summary>Whether the performance strip has anything to show — true only while a stats-capable controller
+    /// is performing, which is also the only time the host should be polling.</summary>
+    public bool PerformanceVisible
+    {
+        get => _performanceVisible;
+        private set { _performanceVisible = value; OnChanged(); }
+    }
+
+    /// <summary>
+    /// UI thread: take one sample and rewrite the readout lines. The host calls this on a timer (every 500 ms)
+    /// ONLY while performing — the call itself just reads published counters, so it never blocks on the
+    /// controller's worker or on native work. Rows are reused; only the strings change.
+    /// </summary>
+    public void RefreshPerformanceStats()
+    {
+        if (_statsSource is null)
+            return;
+        var rows = _readout.Read(_statsSource.GetStats());
+        while (PerformanceLines.Count > rows.Count)
+            PerformanceLines.RemoveAt(PerformanceLines.Count - 1);
+        while (PerformanceLines.Count < rows.Count)
+            PerformanceLines.Add(new PerformanceLineRow());
+        for (var i = 0; i < rows.Count; i++)
+            PerformanceLines[i].Text = rows[i].Line;
+        PerformanceVisible = rows.Count > 0 && IsPerforming;
+    }
 
     /// <summary>Master volume (0–1), applied live to the running mix.</summary>
     public double MasterVolume
@@ -668,7 +731,22 @@ public sealed class MainViewModel : INotifyPropertyChanged
             PerformState.Paused => "Paused.",
             _ => "Stopped.",
         };
+        if (state == PerformState.Idle)
+            EndPerformanceReadout();
+        else if (state == PerformState.Performing && PerformanceLines.Count == 0)
+            _readout.Reset(); // a new perform starts a fresh rate window (the counters restarted with it)
     });
+
+    /// <summary>UI thread: the perform is over — write the last sample to the log (the one place the numbers
+    /// survive the window closing) and clear the strip.</summary>
+    private void EndPerformanceReadout()
+    {
+        foreach (var row in PerformanceLines)
+            _log.Info("Perf", row.Text);
+        PerformanceLines.Clear();
+        PerformanceVisible = false;
+        _readout.Reset();
+    }
 
     private void OnControllerCommandFailed(string message) => RunOnUi(() => Status = $"Perform failed: {message}");
 
