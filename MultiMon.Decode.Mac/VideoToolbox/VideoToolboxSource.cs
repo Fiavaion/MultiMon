@@ -87,6 +87,8 @@ public sealed class VideoToolboxSource : IMetalSource
 
     public FrameTimeline Frames { get; } = new(TimelineDepth);
     public int Width { get; }
+    /// <summary>The track's nominal frame rate as AVFoundation reads it from the container (0 if absent).</summary>
+    public double FrameRate { get; }
     public int Height { get; }
     public MTLPixelFormat TextureFormat => MTLPixelFormat.BGRA8Unorm;
     public bool UseYCoCg => false;
@@ -136,6 +138,7 @@ public sealed class VideoToolboxSource : IMetalSource
             var dimensions = _formatDescription.Dimensions;
             Width = dimensions.Width;
             Height = dimensions.Height;
+            FrameRate = Math.Max(0, _track.NominalFrameRate);
             if (Width <= 0 || Height <= 0)
                 throw new InvalidDataException($"'{path}' declares an invalid size {Width}x{Height}.");
             duration = _track.TimeRange.Duration;
@@ -155,7 +158,7 @@ public sealed class VideoToolboxSource : IMetalSource
             throw;
         }
 
-        _log.Info("Decode", $"{Id}: {Codec} {Width}x{Height} @ {_track.NominalFrameRate:0.##} fps, dur={duration.Seconds:0.00}s, " +
+        _log.Info("Decode", $"{Id}: {Codec} {Width}x{Height} @ {FrameRate:0.###} fps, dur={duration.Seconds:0.00}s, " +
                             $"matrix={StreamMatrix()}, decode path={(IsHardwareDecode ? "hardware" : "software")} (VideoToolbox), output=BGRA8 via CVMetalTextureCache.");
     }
 

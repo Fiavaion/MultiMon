@@ -93,7 +93,8 @@ public partial class App : Application
             _controller = await Task.Run(() => new PerformanceController(monitors, log));
 
             vm = new MainViewModel(_controller, log, new AvaloniaUiDispatcher());
-            var window = new MainWindow(vm, log);
+            var controller = _controller;
+            var window = new MainWindow(vm, log, controller.MatchDisplayRefresh, on => controller.MatchDisplayRefresh = on);
             desktop.MainWindow = window;
             // Closing the panel means "quit", but the pipeline must come down while the run loop is still
             // pumping — so cancel this close and route it through the ordered exit, which closes for real.

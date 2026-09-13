@@ -248,3 +248,17 @@ Idle with nothing on screen.
   ungated). One duplication is owed a dedupe (D9, `Control.Shared` vs the WPF view-models).
 - Status stays **pending the TODO 9 ship gate**: the full matrix on Apple Silicon **and** one Intel Mac, plus
   the user's manual run of every mode (the TODO 8 gate, still open).
+
+## D11 — Match display refresh rate to the clip while performing (added 2026-09-13)
+
+**Decision:** on `EnterPerform`, before the output windows are shown, each output's display is switched (via
+`CGConfigureDisplayWithDisplayMode`, `kCGConfigureForAppOnly`) to the highest available mode with the **same pixel
+and point size** whose refresh rate is an integer multiple of the bound source's frame rate (|rate − k·fps| ≤ 0.06 Hz);
+restored after the hides on `ExitPerform`, on a failed Show, and at Dispose. Off switch: `MatchDisplayRefresh`
+(panel checkbox, app-level). Mac-only; no Windows parity yet.
+**Why:** 25 fps material on a 60/120 Hz cadence is an uneven 2-3 hold pattern the user saw as stutter in Span; holding
+pixel size means the persistent windows never move or resize (`MonitorsChanged` fires, bounds are identical, nothing
+rebuilds). **Evidence:** span 25 fps on both displays → 120→50 Hz and 60→50 Hz, 781 presents / 15.4 s per output
+(every vsync, each frame twice), restored every cycle, 10 cycles tracked flat. This panel has no 100 Hz mode at the
+current scaling, so 50 Hz is the honest best. `kCGDisplayShowDuplicateLowResolutionModes` must be the exported
+symbol (`Dlfcn.GetStringConstant`), not a same-spelled NSString — the latter is silently ignored.

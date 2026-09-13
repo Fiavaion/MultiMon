@@ -9,6 +9,7 @@ using MultiMon.Core.Timing;
 using MultiMon.Decode.Mac;
 using MultiMon.Decode.Mac.Hap;
 using MultiMon.Graphics.Mac;
+using MultiMon.Platform.Mac;
 
 namespace MultiMon.Control.Mac;
 
@@ -50,6 +51,9 @@ public sealed class PerformanceController : IPerformanceController
     private readonly List<IMetalSource> _sources = new();
     private readonly List<FullscreenQuadPass> _passes = new();
     private readonly List<int> _activeOutputs = new(); // indices of outputs bound by the current show
+    private readonly Dictionary<int, IMetalSource> _outputSources = new(); // output index → the source it samples
+    private readonly DisplayModeService _displayModes;
+    private readonly List<DisplayRefreshMatch> _refreshMatches = new();
     private readonly List<MasterClock> _freeRunClocks = new(); // Individual free-run: one clock per source
     private AudioEngine? _audio;
     // Master mix settings live HERE, not in the per-show engine (LESSON-BUG-007): BuildAudio creates a fresh
@@ -61,6 +65,12 @@ public sealed class PerformanceController : IPerformanceController
 
     public PerformState State => _state;
     public IReadOnlyList<MonitorInfo> Monitors { get; }
+
+    /// <summary>Switch each output's display to a refresh rate that is an integer multiple of its clip's frame rate
+    /// for the length of the perform (25 fps on a 60 Hz panel is a 2-3 pull-down stutter; on 50/100 Hz it is clean),
+    /// restored on ExitPerform. Read on the worker at EnterPerform; the panel toggles it between performs. Mac only —
+    /// the Windows controller has no equivalent.</summary>
+    public bool MatchDisplayRefresh { get; set; } = true;
 
     public event Action<PerformState>? StateChanged;
     public event Action<string>? CommandFailed;
@@ -81,6 +91,7 @@ public sealed class PerformanceController : IPerformanceController
         _log = log;
         _forceSoftwareDecode = forceSoftwareDecode;
         Monitors = monitors;
+        _displayModes = new DisplayModeService(log);
 
         _provider = new GraphicsDeviceProvider(log);
         _provider.Acquire();
@@ -220,6 +231,10 @@ public sealed class PerformanceController : IPerformanceController
     /// proof that <c>--free-run</c> actually took the free-run path. Same precondition.</summary>
     internal int FreeRunClockCount => _freeRunClocks.Count;
 
+    /// <summary>What the last EnterPerform did to each active output's display refresh rate (empty when
+    /// <see cref="MatchDisplayRefresh"/> is off or nothing is bound) — the harness's refresh gate. Same precondition.</summary>
+    internal IReadOnlyList<DisplayRefreshMatch> RefreshMatches => _refreshMatches;
+
     /// <summary>Sum of every torn-down source's <see cref="IMetalSource.OutstandingAtDispose"/> — non-zero means a
     /// pooled texture was still held by GPU work when its source went away (the fence and the teardown order disagree).</summary>
     internal int TexturesOutstandingAtDispose { get; private set; }
@@ -249,6 +264,12 @@ public sealed class PerformanceController : IPerformanceController
             return;
         }
 
+        // Refresh-rate match BEFORE the windows appear: a mode switch blanks the display for about a second, and a
+        // window shown first would flash through it. Same pixel and point size by construction, so the outputs'
+        // bounds stay valid. Results are logged and recorded, never thrown — a display that will not switch performs
+        // at its current rate.
+        MatchOutputDisplayRefresh();
+
         // Show every bound output. A Show that fails partway (MainThread.Invoke timing out because the main run
         // loop stopped pumping) must not leave the earlier windows on screen with the state still Idle — ExitPerform's
         // Idle early-return would never hide them. Hide every active output (best effort, each on its own: the one
@@ -263,6 +284,7 @@ public sealed class PerformanceController : IPerformanceController
         {
             foreach (var i in _activeOutputs)
                 TryHide(i, "rollback after a failed Show");
+            _displayModes.RestoreAll();
             throw;
         }
         // Each performance starts its timeline at zero: ApplyShow rebuilt the sources (PTS 0) and the audio
@@ -288,6 +310,7 @@ public sealed class PerformanceController : IPerformanceController
                 _log.Error("Control", $"Source '{s.Id}' faulted during the show (see Decode lines above); it is rebuilt on the next Perform.");
         foreach (var i in _activeOutputs)
             TryHide(i, "ExitPerform"); // one failed Hide must not skip the remaining outputs
+        _displayModes.RestoreAll();   // after the windows are gone, so they never flash through the switch back
         SetState(PerformState.Idle);
     }
 
@@ -302,6 +325,28 @@ public sealed class PerformanceController : IPerformanceController
         catch (Exception ex)
         {
             _log.Error("Control", $"{_outputs[index].Name}: Hide on the main thread failed during {phase} (main run loop not pumping?): {ex.Message}");
+        }
+    }
+
+    /// <summary>For each active output, the bound source's frame rate decides the display's target rate (Span/Split:
+    /// the one shared source on every output; Individual: each output's own). Worker thread.</summary>
+    private void MatchOutputDisplayRefresh()
+    {
+        _refreshMatches.Clear();
+        if (!MatchDisplayRefresh)
+            return;
+        foreach (var i in _activeOutputs)
+        {
+            if (!_outputSources.TryGetValue(i, out var source))
+                continue; // the test pattern has no frame rate
+            if (!uint.TryParse(Monitors[i].DeviceId, out var displayId))
+            {
+                _log.Info("Control", $"{_outputs[i].Name}: monitor '{Monitors[i].DeviceId}' is not a CGDirectDisplayID; refresh rate left alone.");
+                continue;
+            }
+            var result = _displayModes.Match(displayId, source.FrameRate);
+            _refreshMatches.Add(new DisplayRefreshMatch(i, displayId, source.FrameRate, result));
+            _log.Info("Control", $"{_outputs[i].Name}: display {displayId}: {result.Before.PixelWidth}x{result.Before.PixelHeight} {result} for {source.FrameRate:0.###} fps clip '{source.Id}'");
         }
     }
 
@@ -350,9 +395,10 @@ public sealed class PerformanceController : IPerformanceController
 
         for (var i = 0; i < plan.Sources.Count; i++)
         {
-            var pass = BuildSource(plan.Sources[i]);
-            if (pass is null)
+            var built = BuildSource(plan.Sources[i]);
+            if (built is null)
                 continue; // clip unopenable on any path — its outputs stay black (logged), never crash
+            var (pass, source) = built.Value;
 
             foreach (var binding in plan.Bindings)
             {
@@ -365,6 +411,7 @@ public sealed class PerformanceController : IPerformanceController
                     _freeRunClocks.Add(clock);
                 }
                 BindOutput(binding.OutputIndex, pass, binding.Uv, clock);
+                _outputSources[binding.OutputIndex] = source;
             }
         }
 
@@ -380,9 +427,9 @@ public sealed class PerformanceController : IPerformanceController
     /// first and falls through to VideoToolbox when it is not a HAP movie; the ladder itself gates HAP on the
     /// clip's format. HAP is an ENHANCEMENT: a HAP-mode clip that lands on VideoToolbox plays, with an error
     /// line. If nothing can open the clip, SKIP the source (that output stays black) — NEVER crash.
-    /// Returns the bound pass, or null when nothing could open the clip.
+    /// Returns the bound pass and its source, or null when nothing could open the clip.
     /// </summary>
-    private FullscreenQuadPass? BuildSource(PlannedSource planned)
+    private (FullscreenQuadPass Pass, IMetalSource Source)? BuildSource(PlannedSource planned)
     {
         IMetalSource? source = null;
         var pass = new FullscreenQuadPass(_provider);
@@ -402,7 +449,7 @@ public sealed class PerformanceController : IPerformanceController
         }
         _sources.Add(source);
         _passes.Add(pass);
-        return pass;
+        return (pass, source);
     }
 
     /// <summary>Binds an output to a pass + UV slice, optionally with its own free-run clock (null = shared).</summary>
@@ -439,6 +486,7 @@ public sealed class PerformanceController : IPerformanceController
                 _log.Error("Control", $"{_outputs[i].Name}: command buffers still in flight {InFlightDrainTimeout.TotalSeconds:0}s after unbind.");
         }
         _activeOutputs.Clear();
+        _outputSources.Clear();
 
         foreach (var s in _sources) s.Stop();   // joins each decode thread
         _audio?.Stop();                          // decode producers, then the AUHAL units
@@ -492,6 +540,7 @@ public sealed class PerformanceController : IPerformanceController
                 // A show-teardown fault must not stop the device from being released below.
                 _log.Error("Control", $"Show teardown failed during Dispose: {ex}");
             }
+            _displayModes.Dispose(); // idempotent restore — TeardownShow's ExitPerform already did it if performing
             _loop.Stop();          // joins the render thread; all output windows/layers disposed there
             _provider.Release();
             _provider.Dispose();
@@ -501,3 +550,7 @@ public sealed class PerformanceController : IPerformanceController
         _commands.Dispose();
     }
 }
+
+/// <summary>One output's display-refresh decision at EnterPerform: which display, the clip fps it was matched to,
+/// and what <see cref="DisplayModeService"/> did.</summary>
+public readonly record struct DisplayRefreshMatch(int Output, uint DisplayId, double Fps, DisplayMatchResult Result);

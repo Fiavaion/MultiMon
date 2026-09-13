@@ -41,6 +41,9 @@
       <CheckBox Content="Sync (frame-lock same-length clips)" VerticalAlignment="Center"
                 Margin="20,0,0,0" IsChecked="{Binding SyncIndividual}" IsEnabled="{Binding CanEdit}"
                 IsVisible="{Binding SyncToggleVisible}"/>
+      <CheckBox Name="MatchRefreshCheck" Content="Match display refresh rate to clip" VerticalAlignment="Center"
+                Margin="20,0,0,0" IsEnabled="{Binding CanEdit}"
+                ToolTip.Tip="While performing, switch each display to a refresh rate that is a multiple of its clip's frame rate (e.g. 25 fps -> 50 Hz); restored on Stop."/>
       <Button Name="IdentifyButton" Content="Identify screens" Margin="24,0,0,0"
               Click="Identify_Click" IsEnabled="{Binding CanEdit}"
               ToolTip.Tip="Show a big number on each monitor (click an overlay to dismiss)."/>

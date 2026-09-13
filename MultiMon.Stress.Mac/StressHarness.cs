@@ -26,10 +26,12 @@ namespace MultiMon.Stress.Mac;
 /// audio track to that CoreAudio device UID (<c>--list-audio</c>; an unknown UID fails the run);
 /// <paramref name="AudioGain"/> / <paramref name="AudioPan"/> / <paramref name="AudioMaster"/> drive the engine's
 /// live track-volume / track-pan / master-volume setters so the mixer DSP is exercised and metered.
-/// <paramref name="FreeRun"/> gives each Individual-mode source its OWN clock (the Windows <c>--free-run</c>).</summary>
+/// <paramref name="FreeRun"/> gives each Individual-mode source its OWN clock (the Windows <c>--free-run</c>).
+/// <paramref name="MatchRefresh"/> (default on; <c>--no-match-refresh</c>) lets the controller switch each display to a
+/// multiple of its clip's fps per perform, and gates that it did and that the mode came back.</summary>
 public sealed record StressOptions(int Cycles, int Windows, bool Fullscreen, int SoakSeconds, bool SourceCheck,
     bool Hap, string? Video, string? Video2, bool ForceSwDecode, ShowMode Mode, bool Audio, string? AudioFile, bool Controller,
-    string? AudioDevice, double? AudioGain, double? AudioPan, double? AudioMaster, bool FreeRun);
+    string? AudioDevice, double? AudioGain, double? AudioPan, double? AudioMaster, bool FreeRun, bool MatchRefresh);
 
 /// <summary>
 /// The Mac twin of <c>MultiMon.Stress.StressHarness</c>'s bind-once loop: build the persistent Metal pipeline
@@ -72,16 +74,19 @@ public static class StressHarness
 
     public static bool TryParse(string[] args, out StressOptions options)
     {
-        options = new StressOptions(50, 1, false, 0, false, false, null, null, false, ShowMode.Span, false, null, false, null, null, null, null, false);
+        options = new StressOptions(50, 1, false, 0, false, false, null, null, false, ShowMode.Span, false, null, false, null, null, null, null, false, true);
         var cycles = 50; var windows = 1; var fullscreen = false; var soak = 0; var sourceCheck = false;
         var hap = false; string? video = null; string? video2 = null; var forceSw = false; var mode = ShowMode.Span;
         var audio = false; string? audioFile = null; var controller = false;
         string? audioDevice = null; double? audioGain = null, audioPan = null, audioMaster = null; var freeRun = false;
+        var matchRefresh = true;
         foreach (var arg in args)
         {
             if (arg == "--fullscreen") fullscreen = true;
             else if (arg == "--controller") controller = true;
             else if (arg == "--free-run") freeRun = true;
+            else if (arg == "--match-refresh") matchRefresh = true;
+            else if (arg == "--no-match-refresh") matchRefresh = false;
             else if (arg == "--audio") audio = true;
             else if (arg.StartsWith("--audio-file=", StringComparison.Ordinal) && arg.Length > "--audio-file=".Length) audioFile = arg["--audio-file=".Length..];
             else if (arg.StartsWith("--audio-device=", StringComparison.Ordinal) && arg.Length > "--audio-device=".Length) audioDevice = arg["--audio-device=".Length..];
@@ -103,7 +108,7 @@ public static class StressHarness
             else return false;
         }
         options = new StressOptions(cycles, windows, fullscreen, soak, sourceCheck, hap, video, video2, forceSw, mode, audio, audioFile, controller,
-            audioDevice, audioGain, audioPan, audioMaster, freeRun);
+            audioDevice, audioGain, audioPan, audioMaster, freeRun, matchRefresh);
         return true;
     }
 
@@ -129,7 +134,7 @@ public static class StressHarness
         if (options.SourceCheck)
             return SourceCheck.Run(log, clipPath ?? ResolveHapClip(options with { Hap = true }, log), ResolveVideoToolboxClip(options, log));
 
-        var (cycles, windows, fullscreen, soakSeconds, _, requireHap, _, video2, forceSw, mode, _, _, controller, _, _, _, _, freeRunRequested) = options;
+        var (cycles, windows, fullscreen, soakSeconds, _, requireHap, _, video2, forceSw, mode, _, _, controller, _, _, _, _, freeRunRequested, _) = options;
 
         // Audio: resolve the track file BEFORE any cycle runs. --audio-file wins; otherwise the video's
         // own audio stream is used, and a video without one FAILS loudly — a silent fallback would report PASS
@@ -590,8 +595,18 @@ public static class StressHarness
         var expectedFreeRunClocks = freeRun ? show.Sources.Count : 0;
         log.Info("Stress", $"show: mode={mode} sources={show.Sources.Count}{(show.Sources.Count == 0 ? " (test pattern)" : "")} syncIndividual={show.SyncIndividual} (expect {expectedFreeRunClocks} free-run clock(s)) audioTracks={show.AudioTracks.Count} windows={windows} soakSeconds={(soakSeconds > 0 ? soakSeconds.ToString() : "off")} requireHap={requireHap} forceSwDecode={forceSw}");
 
-        var controller = new PerformanceController(infos, log, forceSw);
+        var controller = new PerformanceController(infos, log, forceSw) { MatchDisplayRefresh = options.MatchRefresh };
         var failures = 0;
+        // Refresh gate: the mode every real display starts in (id, size, rate) is the mode it must be back in after
+        // each ExitPerform and after teardown; after each EnterPerform a display the controller reports as matched
+        // must actually be running a multiple of its clip's fps (the gate observes the effect, LESSON-TEST-005).
+        using var displayModes = new DisplayModeService(log);
+        var originalModes = new Dictionary<uint, DisplayModeInfo>();
+        foreach (var info in infos)
+            if (uint.TryParse(info.DeviceId, out var id) && displayModes.QueryCurrent(id) is { } m)
+                originalModes[id] = m;
+        log.Info("Stress", $"matchRefresh={(options.MatchRefresh ? "on" : "off")} displays: " + string.Join(" | ", originalModes.Select(kv => $"{kv.Key}: {kv.Value}")));
+        var refreshFail = false;
         controller.CommandFailed += m => { Interlocked.Increment(ref failures); log.Error("Stress", $"controller command failed: {m}"); };
         var watchdog = new Watchdog(log, () => $" (controller state={controller.State})",
             () => DumpStuckState(log, controller.Loop, controller.Outputs, controller.Provider));
@@ -660,9 +675,15 @@ public static class StressHarness
                 }
                 if (audioTrack is not null)
                     audioGate.CheckOpened(cycle, SampleAudio(controller), audioTrack);
+                if (!CheckRefreshMatched(log, cycle, cycles, controller, displayModes, options.MatchRefresh))
+                {
+                    refreshFail = true;
+                    break;
+                }
                 // Hold: every bound output must keep completing frames; with --soak-seconds the perform is held
                 // that long (each pass restarts the watchdog: a soak is a deliberate dwell, not a stuck cycle).
                 var hold = Stopwatch.StartNew();
+                var presentsAtHoldStart = controller.Outputs.Select(o => o.PresentCount).ToArray();
                 do
                 {
                     if (!controller.WaitForPresentedFrames(HoldFramesPerCycle, WedgeTimeout, out var stalled))
@@ -677,6 +698,14 @@ public static class StressHarness
                 } while (soakSeconds > 0 && hold.Elapsed < TimeSpan.FromSeconds(soakSeconds));
                 if (wedged)
                     break;
+                if (soakSeconds > 0)
+                {
+                    // Present rate over the soak, per output: on a matched display this is the display's refresh
+                    // rate (every vsync presents), e.g. ~100/s for 25 fps content on a 100 Hz panel.
+                    var seconds = hold.Elapsed.TotalSeconds;
+                    log.Info("Stress", $"cycle {cycle:00}/{cycles}: soak presents: " + string.Join(" ", controller.Outputs.Select((o, i) =>
+                        $"{o.Name}={o.PresentCount - presentsAtHoldStart[i]} in {seconds:0.0}s ({(o.PresentCount - presentsAtHoldStart[i]) / seconds:0.0}/s)")));
+                }
                 if (audioTrack is not null)
                     audioGate.HoldForContent(cycle, () => SampleAudio(controller), watchdog.StopSignal);
 
@@ -697,6 +726,11 @@ public static class StressHarness
                 {
                     wedged = true;
                     log.Error("Stress", $"cycle {cycle:00}/{cycles}: WEDGE — command buffers still in flight {WedgeTimeout.TotalSeconds:0}s after hide.");
+                    break;
+                }
+                if (!CheckRefreshRestored(log, $"cycle {cycle:00}/{cycles}: after ExitPerform", displayModes, originalModes))
+                {
+                    refreshFail = true;
                     break;
                 }
 
@@ -764,6 +798,8 @@ public static class StressHarness
             controller.Dispose();
             watchdog.Stop();
             log.Info("Stress", $"teardown complete: {controller.Tracker}");
+            if (!CheckRefreshRestored(log, "after teardown", displayModes, originalModes))
+                refreshFail = true;
         }
 
         var allocGrowthMb = allocBaseline > 0 && allocMax > allocBaseline ? (long)(allocMax - allocBaseline) / (1024 * 1024) : 0;
@@ -775,15 +811,69 @@ public static class StressHarness
         var audioGateFail = audioPath is not null && audioGate.Failed;
         var commandFailures = Volatile.Read(ref failures);
         var survivors = controller.Tracker.LiveCount;
-        var passed = completed == cycles && !wedged && !contentFail && !leakFail && !allocFail && !wsFail && outstanding == 0 && !audioGateFail && commandFailures == 0 && survivors == 0;
+        var passed = completed == cycles && !wedged && !contentFail && !leakFail && !allocFail && !wsFail && outstanding == 0 && !audioGateFail && commandFailures == 0 && survivors == 0 && !refreshFail;
 
         log.Info("Stress", $"controller: cycles={completed}/{cycles} wedges={(wedged ? 1 : 0)} commandFailures={commandFailures} texturesOutstandingAtDispose={outstanding} " +
                            (audioPath is null ? "" : $"{audioGate.Summary} ") +
                            $"trackedBaseline={baseline} maxGrowth={maxGrowth} allocMaxGrowth={allocGrowthMb}MB rssMaxGrowth={wsGrowthMb}MB trackedAfterTeardown={survivors}");
         log.Info("Stress", passed
             ? $"RESULT: PASS — {completed} controller cycles clean, zero tracked-object growth, flat allocation and RSS{(audioPath is null ? "" : $", audio aligned (peakDrift={audioGate.PeakDriftMs:0.0}ms, 0 underruns)")}."
-            : $"RESULT: FAIL — {(wedged ? "wedge detected" : commandFailures > 0 ? "controller command failures" : contentFail ? "clip source did not advance / faulted / wrong decoder / wrong clock count" : leakFail ? "tracked Metal object growth (ownership bug)" : allocFail ? $"device allocation growth {allocGrowthMb}MB > {AllocatedGrowthLimitMb}MB" : wsFail ? $"RSS growth {wsGrowthMb}MB > {WorkingSetGrowthLimitMb}MB" : outstanding != 0 ? $"{outstanding} pooled texture(s) still held at dispose" : audioGateFail ? $"audio gate ({audioGate.Reason})" : survivors != 0 ? $"{survivors} tracked object(s) survived teardown" : "incomplete run")}.");
+            : $"RESULT: FAIL — {(wedged ? "wedge detected" : commandFailures > 0 ? "controller command failures" : refreshFail ? "display refresh gate (see DisplayMode/Stress lines)" : contentFail ? "clip source did not advance / faulted / wrong decoder / wrong clock count" : leakFail ? "tracked Metal object growth (ownership bug)" : allocFail ? $"device allocation growth {allocGrowthMb}MB > {AllocatedGrowthLimitMb}MB" : wsFail ? $"RSS growth {wsGrowthMb}MB > {WorkingSetGrowthLimitMb}MB" : outstanding != 0 ? $"{outstanding} pooled texture(s) still held at dispose" : audioGateFail ? $"audio gate ({audioGate.Reason})" : survivors != 0 ? $"{survivors} tracked object(s) survived teardown" : "incomplete run")}.");
         return passed ? 0 : 1;
+    }
+
+    /// <summary>After EnterPerform: every display the controller says it matched (or found already matched) must be
+    /// running a multiple of the clip's fps RIGHT NOW (queried, not trusted); a reported switch failure is a FAIL; a
+    /// "no suitable mode" is honest and passes. With matching off, any recorded match is a FAIL (the path must not run).</summary>
+    private static bool CheckRefreshMatched(ILog log, int cycle, int cycles, PerformanceController controller, DisplayModeService displayModes, bool matchRefresh)
+    {
+        var ok = true;
+        var matches = controller.RefreshMatches;
+        if (!matchRefresh && matches.Count > 0)
+        {
+            log.Error("Stress", $"cycle {cycle:00}/{cycles}: --no-match-refresh but the controller recorded {matches.Count} refresh match(es).");
+            return false;
+        }
+        foreach (var m in matches)
+        {
+            var now = displayModes.QueryCurrent(m.DisplayId);
+            var text = $"cycle {cycle:00}/{cycles}: refresh gate output{m.Output + 1} display {m.DisplayId}: {m.Result} for {m.Fps:0.###} fps, now {now?.ToString() ?? "no mode"}";
+            switch (m.Result.Outcome)
+            {
+                case DisplayMatchOutcome.Matched:
+                case DisplayMatchOutcome.AlreadyMatched:
+                    if (now is { } n && DisplayModeService.IsMultiple(n.RefreshRate, m.Fps) &&
+                        n.PixelWidth == m.Result.Before.PixelWidth && n.PixelHeight == m.Result.Before.PixelHeight)
+                        log.Info("Stress", text + " ok");
+                    else { ok = false; log.Error("Stress", text + " — NOT a multiple of the clip fps at the original pixel size."); }
+                    break;
+                case DisplayMatchOutcome.NoSuitableMode:
+                    log.Info("Stress", text + " (no suitable mode; accepted)");
+                    break;
+                default:
+                    ok = false;
+                    log.Error("Stress", text + " — switch FAILED.");
+                    break;
+            }
+        }
+        return ok;
+    }
+
+    /// <summary>Every display must be back in exactly the mode (IOKit mode id) it started the run in.</summary>
+    private static bool CheckRefreshRestored(ILog log, string phase, DisplayModeService displayModes, Dictionary<uint, DisplayModeInfo> originalModes)
+    {
+        var ok = true;
+        foreach (var (id, original) in originalModes)
+        {
+            var now = displayModes.QueryCurrent(id);
+            if (now is { } n && n.ModeId == original.ModeId)
+                continue;
+            ok = false;
+            log.Error("Stress", $"{phase}: display {id} is {now?.ToString() ?? "no mode"}, expected the original {original}.");
+        }
+        if (ok)
+            log.Info("Stress", $"{phase}: displays restored: " + string.Join(" | ", originalModes.Select(kv => $"{kv.Key}: {kv.Value.RefreshRate:0.##}Hz")));
+        return ok;
     }
 
     /// <summary>The controller path's audio sample, read through its harness surface (the same counters the

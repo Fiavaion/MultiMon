@@ -20,6 +20,10 @@ public interface IMetalSource : ISource
     int Width { get; }
     int Height { get; }
 
+    /// <summary>The clip's nominal frame rate (frames per second), or 0 when the container does not say — the
+    /// display-refresh matcher skips a source without one.</summary>
+    double FrameRate { get; }
+
     /// <summary>The Metal format of every published frame (the pass's persistent texture uses the same).</summary>
     MTLPixelFormat TextureFormat { get; }
 

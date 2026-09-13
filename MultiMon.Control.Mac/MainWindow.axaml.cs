@@ -35,12 +35,19 @@ public partial class MainWindow : Window
     private readonly ILog _log;
     private readonly IdentifyOverlays _identify = new();
 
-    public MainWindow(MainViewModel viewModel, ILog log)
+    /// <summary><paramref name="matchDisplayRefresh"/> seeds the "Match display refresh rate" box and
+    /// <paramref name="onMatchDisplayRefreshChanged"/> receives every toggle — an app-level option (not project
+    /// content), so it is wired by the composition root rather than the shared view-model.</summary>
+    public MainWindow(MainViewModel viewModel, ILog log, bool matchDisplayRefresh, Action<bool> onMatchDisplayRefreshChanged)
     {
         InitializeComponent();
         _vm = viewModel;
         _log = log;
         DataContext = viewModel;
+
+        var matchRefresh = this.FindControl<CheckBox>("MatchRefreshCheck")!;
+        matchRefresh.IsChecked = matchDisplayRefresh;
+        matchRefresh.IsCheckedChanged += (_, _) => onMatchDisplayRefreshChanged(matchRefresh.IsChecked == true);
 
         this.FindControl<TextBlock>("GpuText")!.Text =
             $"GPU: {MTLDevice.SystemDefault?.Name ?? "(no Metal device)"}   ·   " +

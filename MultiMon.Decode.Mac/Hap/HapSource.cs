@@ -73,6 +73,8 @@ public sealed class HapSource : IMetalSource
     /// texture holds and the full-frame UV shows at the right/bottom edge — logged at open).
     /// </summary>
     public int Width { get; }
+    /// <summary>Frames over the track duration (the mdhd timescale already scaled the sample deltas into ticks).</summary>
+    public double FrameRate { get; }
     public int Height { get; }
 
     /// <summary>The Metal BCn format the pass must create its source texture in.</summary>
@@ -122,6 +124,7 @@ public sealed class HapSource : IMetalSource
         _frameBytes = _rowPitch * (Height / 4);
         _pixels = new byte[_frameBytes];
         _loopDurationTicks = Math.Max(1, _demux.Duration.Ticks);
+        FrameRate = _demux.Duration.Ticks > 0 ? _demux.Samples.Count / _demux.Duration.TotalSeconds : 0;
 
         using var descriptor = MTLTextureDescriptor.CreateTexture2DDescriptor(TextureFormat, (nuint)Width, (nuint)Height, false);
         descriptor.Usage = MTLTextureUsage.ShaderRead;
@@ -130,7 +133,7 @@ public sealed class HapSource : IMetalSource
         descriptor.StorageMode = provider.Device.HasUnifiedMemory ? MTLStorageMode.Shared : MTLStorageMode.Managed;
         _pool = new TexturePool(provider.Device, descriptor, TimelineDepth + InFlightMargin, provider.Tracker);
 
-        _log.Info("Decode", $"{Id}: HAP {_demux.Fourcc} {_demux.Width}x{_demux.Height}, {_demux.Samples.Count} frames, " +
+        _log.Info("Decode", $"{Id}: HAP {_demux.Fourcc} {_demux.Width}x{_demux.Height}, {_demux.Samples.Count} frames @ {FrameRate:0.###} fps, " +
                             $"format={TextureFormat} ycocg={UseYCoCg} dur={_demux.Duration.TotalSeconds:0.00}s, " +
                             $"pool={_pool.Count}x{_frameBytes / 1024}KB ({descriptor.StorageMode}).");
         if (Width != _demux.Width || Height != _demux.Height)
