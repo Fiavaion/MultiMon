@@ -53,12 +53,12 @@ New-Item -ItemType Directory -Path $KitStressDir -Force | Out-Null
 
 # --- Publish MultiMon.Control ---
 Write-Host "`nPublishing MultiMon.Control..."
-dotnet publish "$ControlProj" -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o "$KitAppDir"
+dotnet publish "$ControlProj" -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:DebugType=none -p:DebugSymbols=false -o "$KitAppDir"
 if ($LASTEXITCODE -ne 0) { throw "dotnet publish MultiMon.Control failed (exit $LASTEXITCODE)" }
 
 # --- Publish MultiMon.Stress ---
 Write-Host "`nPublishing MultiMon.Stress..."
-dotnet publish "$StressProj" -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o "$KitStressDir"
+dotnet publish "$StressProj" -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:DebugType=none -p:DebugSymbols=false -o "$KitStressDir"
 if ($LASTEXITCODE -ne 0) { throw "dotnet publish MultiMon.Stress failed (exit $LASTEXITCODE)" }
 
 # --- Copy root docs ---
