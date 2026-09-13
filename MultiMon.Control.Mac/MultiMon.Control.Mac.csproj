@@ -6,6 +6,7 @@
     <SupportedOSPlatformVersion>12.0</SupportedOSPlatformVersion>
     <!-- Workload 26.5 pins Xcode 26.5; the installed Xcode is newer (26.6). Newer is safe; the check is major.minor equality. -->
     <ValidateXcodeVersion>false</ValidateXcodeVersion>
+    <CodesignEntitlements>Entitlements.plist</CodesignEntitlements>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <!-- Single-sourced from Directory.Build.props' Version: maps to Info.plist CFBundleShortVersionString
