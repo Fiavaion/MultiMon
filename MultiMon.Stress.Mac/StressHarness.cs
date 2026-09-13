@@ -141,7 +141,18 @@ public static class StressHarness
             return 2;
         }
         if (options.SourceCheck)
-            return SourceCheck.Run(log, clipPath ?? ResolveHapClip(options with { Hap = true }, log), ResolveVideoToolboxClip(options, log));
+        {
+            // Both clips are REQUIRED: a source-check that skipped the HAP or VideoToolbox checks would report PASS
+            // for paths that never ran (the LESSON-TEST-004 rule) — a missing clip is a FAIL, never a note.
+            var hapCheckClip = ResolveSourceCheckClip(log, "HAP colour", options.Video, "--video", "MULTIMON_HAP_COLOUR_FIXTURE", Path.Combine("Hap", "colour_hapq.mov"));
+            var vtCheckClip = ResolveSourceCheckClip(log, "H.264 colour", options.Video2, "--video2", "MULTIMON_H264_FIXTURE", "colour_h264.mp4");
+            if (hapCheckClip is null || vtCheckClip is null)
+            {
+                log.Info("Stress", "RESULT: FAIL — source-check did not run (clip missing, see above).");
+                return 1;
+            }
+            return SourceCheck.Run(log, hapCheckClip, vtCheckClip);
+        }
 
         var (cycles, windows, fullscreen, soakSeconds, _, requireHap, _, video2, forceSw, mode, _, _, controller, _, _, _, _, freeRunRequested, _) = options;
 
@@ -272,6 +283,7 @@ public static class StressHarness
         var freeRunClocks = freeRun ? Enumerable.Range(0, windows).Select(_ => new MasterClock()).ToArray() : [];
         int sourcesStarted = 0, sourcesStopped = 0, sourcesDisposed = 0, texturesOutstandingAtDispose = 0;
         var contentFail = false;
+        var lateFail = false;
         // Audio: the engine is built, started, stopped and disposed PER CYCLE — the app's real per-perform path
         // (a rebuilt engine must re-baseline its content position against the already-running clock).
         AudioEngine? audioEngine = null;
@@ -297,6 +309,8 @@ public static class StressHarness
             watchdog.Start();
 
             var targets = new long[windows];
+            var presentsAtHoldStart = new long[windows];
+            var lateAtHoldStart = new long[windows];
             for (var cycle = 1; cycle <= cycles; cycle++)
             {
                 using var pool = new NSAutoreleasePool(); // this thread's AppKit calls (Show/Hide) return autoreleased objects
@@ -341,7 +355,7 @@ public static class StressHarness
                     {
                         var uv = perOutput ? UvRect.Full : mode == ShowMode.Split ? SplitCellUv(i, windows) : UvLayout.Spanning(i, bounds);
                         var source = clipSources[perOutput ? i : 0];
-                        outputs[i].SetContent(perOutput ? clipPasses[i] : clipPasses[0], uv, freeRun ? freeRunClocks[i] : null);
+                        outputs[i].SetContent(perOutput ? clipPasses[i] : clipPasses[0], uv, freeRun ? freeRunClocks[i] : null, source.FrameRate);
                         if (cycle == 1)
                             log.Info("Stress", $"{outputs[i].Name} <- {source.Id} ({source.GetType().Name}) uv={uv} clock={(freeRun ? "own (free-run)" : "shared")}");
                     }
@@ -374,6 +388,11 @@ public static class StressHarness
                 // Hold: every output must complete its frames (concurrently: targets snapshotted first), or this
                 // cycle wedged.
                 var hold = Stopwatch.StartNew();
+                for (var i = 0; i < windows; i++)
+                {
+                    presentsAtHoldStart[i] = outputs[i].PresentCount;
+                    lateAtHoldStart[i] = outputs[i].LateFrameCount;
+                }
                 do
                 {
                     for (var i = 0; i < windows; i++)
@@ -390,6 +409,18 @@ public static class StressHarness
                     if (soakSeconds > 0 && !wedged)
                         watchdog.Extend(); // a soak is a deliberate dwell, not a stuck cycle
                 } while (!wedged && soakSeconds > 0 && hold.Elapsed < TimeSpan.FromSeconds(soakSeconds));
+
+                // Late frames over this hold, per output (the controller path gates the same ratio).
+                var lateParts = new List<string>(windows);
+                for (var i = 0; i < windows && !wedged; i++)
+                {
+                    var late = outputs[i].LateFrameCount - lateAtHoldStart[i];
+                    var presents = outputs[i].PresentCount - presentsAtHoldStart[i];
+                    lateParts.Add($"{outputs[i].Name} late {late}/{presents}");
+                    if (!LateFramesOk(log, cycle, cycles, outputs[i].Name, late, presents))
+                        lateFail = true;
+                }
+                var lateText = $", [{string.Join(", ", lateParts)}]";
 
                 // Audio hold: the callback must have consumed real content (not just opened and rendered silence)
                 // before this cycle may end, or the audio gate below is measuring nothing. Bounded by the wedge timeout.
@@ -450,7 +481,7 @@ public static class StressHarness
                     hapText += $", stop+dispose {joinWatch.Elapsed.TotalMilliseconds:0}ms";
                 }
 
-                if (wedged || contentFail || audioGate.Fail is not null)
+                if (wedged || contentFail || lateFail || audioGate.Fail is not null)
                     break;
                 completed++;
 
@@ -476,7 +507,7 @@ public static class StressHarness
                     allocText = $"alloc={alloc / (1024 * 1024)}MB (delta {((long)alloc - (long)allocBaseline) / (1024 * 1024):+0;-#}MB)";
                     wsText = $"rss={ws / (1024 * 1024)}MB (delta {(ws - wsBaseline) / (1024 * 1024):+0;-#}MB)";
                 }
-                log.Info("Stress", $"cycle {cycle:00}/{cycles} [{label}]: enter->present({HoldFramesPerCycle}f)->exit ok in {watchdog.Elapsed.TotalMilliseconds:0}ms, {liveText}, {allocText}, {wsText}{hapText}{audioText}, {provider.Tracker}");
+                log.Info("Stress", $"cycle {cycle:00}/{cycles} [{label}]: enter->present({HoldFramesPerCycle}f)->exit ok in {watchdog.Elapsed.TotalMilliseconds:0}ms, {liveText}, {allocText}, {wsText}{lateText}{hapText}{audioText}, {provider.Tracker}");
             }
         }
         catch (Exception ex)
@@ -523,7 +554,7 @@ public static class StressHarness
         // A/V alignment gate: the audio engine drift-corrects its content position against the SAME MasterClock the
         // render thread selects frames from, so a stream that stayed inside the limit with zero starvation is aligned.
         var audioGateFail = audioPath is not null && audioGate.Failed;
-        var passed = completed == cycles && !wedged && !contentFail && !leakFail && !allocFail && !wsFail && !frameFail && !sourceFail && !audioGateFail && provider.Tracker.LiveCount == 0;
+        var passed = completed == cycles && !wedged && !contentFail && !lateFail && !leakFail && !allocFail && !wsFail && !frameFail && !sourceFail && !audioGateFail && provider.Tracker.LiveCount == 0;
         log.Info("Stress", $"cycles={completed}/{cycles} wedges={(wedged ? 1 : 0)} framesCompleted={outputs.Sum(o => o.PresentCount)} " +
                            (clipPath is null ? $"sourceFrames published={framesPublished} released={framesReleased} "
                                             : $"sources started={sourcesStarted} stopped={sourcesStopped} disposed={sourcesDisposed} (expected {expectedSources}) texturesOutstandingAtDispose={texturesOutstandingAtDispose} ") +
@@ -531,7 +562,7 @@ public static class StressHarness
                            $"trackedBaseline={baseline} maxGrowth={maxGrowth} allocMaxGrowth={allocGrowthMb}MB rssMaxGrowth={wsGrowthMb}MB trackedAfterTeardown={provider.Tracker.LiveCount}");
         log.Info("Stress", passed
             ? $"RESULT: PASS — all cycles clean, zero tracked-object growth, flat allocation and RSS{(audioPath is null ? "" : $", audio aligned (peakDrift={audioGate.PeakDriftMs:0.0}ms, 0 underruns)")}."
-            : $"RESULT: FAIL — {(wedged ? "wedge detected" : contentFail ? "clip source did not advance / faulted" : leakFail ? "tracked Metal object growth (ownership bug)" : allocFail ? $"device allocation growth {allocGrowthMb}MB > {AllocatedGrowthLimitMb}MB" : wsFail ? $"RSS growth {wsGrowthMb}MB > {WorkingSetGrowthLimitMb}MB" : frameFail ? $"source frames published={framesPublished} released={framesReleased} (frame ownership bug)" : sourceFail ? $"sources started={sourcesStarted} stopped={sourcesStopped} disposed={sourcesDisposed}, expected {expectedSources}; {texturesOutstandingAtDispose} pooled texture(s) still held at dispose" : audioGateFail ? $"audio gate ({audioGate.Reason})" : provider.Tracker.LiveCount != 0 ? $"{provider.Tracker.LiveCount} tracked object(s) survived teardown" : "incomplete run")}.");
+            : $"RESULT: FAIL — {(wedged ? "wedge detected" : lateFail ? $"late frames over {LateFrameFailRatio:P0} of presents (decode not keeping up)" : contentFail ? "clip source did not advance / faulted" : leakFail ? "tracked Metal object growth (ownership bug)" : allocFail ? $"device allocation growth {allocGrowthMb}MB > {AllocatedGrowthLimitMb}MB" : wsFail ? $"RSS growth {wsGrowthMb}MB > {WorkingSetGrowthLimitMb}MB" : frameFail ? $"source frames published={framesPublished} released={framesReleased} (frame ownership bug)" : sourceFail ? $"sources started={sourcesStarted} stopped={sourcesStopped} disposed={sourcesDisposed}, expected {expectedSources}; {texturesOutstandingAtDispose} pooled texture(s) still held at dispose" : audioGateFail ? $"audio gate ({audioGate.Reason})" : provider.Tracker.LiveCount != 0 ? $"{provider.Tracker.LiveCount} tracked object(s) survived teardown" : "incomplete run")}.");
         return passed ? 0 : 1;
     }
 
@@ -716,25 +747,19 @@ public static class StressHarness
 
                 var holdMs = hold.Elapsed.TotalMilliseconds;
                 var statsAtHoldEnd = controller.GetStats();
-                var rows = readout.Read(statsAtHoldEnd);
-                // Start-up timing, once: how long each output took to put its first frame on screen, and what of
-                // that was the display's mode switch (the reason an external panel starts later than the built-in).
-                if (cycle == 1)
-                    foreach (var row in rows)
-                        log.Info("Stress", $"{row.Name}: first frame {row.StartupMs:0.0}ms after EnterPerform " +
-                                           $"(mode switch {row.ModeSwitchMs:0.0}ms, show {row.ShowMs:0.0}ms), display {row.RefreshHz:0.##}Hz");
-                if (soakSeconds > 0)
-                {
-                    // Present rate over the soak, per output: on a matched display this is the display's refresh
-                    // rate (every vsync presents), e.g. ~100/s for 25 fps content on a 100 Hz panel. A late frame
-                    // is a present whose selected frame was more than one frame period behind the clock.
-                    var seconds = hold.Elapsed.TotalSeconds;
-                    log.Info("Stress", $"cycle {cycle:00}/{cycles}: soak {seconds:0.0}s: " + string.Join(" | ", rows.Select(r =>
-                        $"{r.Name} {r.PresentsPerSecond:0.0} present/s decode {r.DecodeFps:0.0} fps ({r.DecodePath}) late {LateFrames(statsAtHoldStart, statsAtHoldEnd, r.Index)}/{Presents(statsAtHoldStart, statsAtHoldEnd, r.Index)}")));
-                    lateFail = !CheckLateFrames(log, cycle, cycles, statsAtHoldStart, statsAtHoldEnd);
-                    if (lateFail)
-                        break;
-                }
+                // The panel's readout lines over this hold (the SAME formatter the strip binds): present rate — on a
+                // matched display the display's refresh rate, e.g. ~100/s for 25 fps content on a 100 Hz panel —
+                // decode rate, late frames, drawable nulls and the first-frame start-up timing (what of it was the
+                // display's mode switch: the reason an external panel starts later than the built-in). Then the
+                // late-frame gate over the hold, every cycle: a present whose selected frame was more than one frame
+                // period behind the clock is a stale picture no present-rate check sees.
+                log.Info("Stress", $"cycle {cycle:00}/{cycles}: hold {hold.Elapsed.TotalSeconds:0.0}s: " + string.Join(" | ", readout.Read(statsAtHoldEnd)) +
+                                   $" | late over hold [{string.Join(", ", statsAtHoldEnd.Outputs.Select(o => $"{o.Name} {LateFrames(statsAtHoldStart, statsAtHoldEnd, o.Index)}/{Presents(statsAtHoldStart, statsAtHoldEnd, o.Index)}"))}]");
+                foreach (var output in statsAtHoldEnd.Outputs)
+                    if (!LateFramesOk(log, cycle, cycles, output.Name, LateFrames(statsAtHoldStart, statsAtHoldEnd, output.Index), Presents(statsAtHoldStart, statsAtHoldEnd, output.Index)))
+                        lateFail = true;
+                if (lateFail)
+                    break;
                 if (audioTrack is not null)
                     audioGate.HoldForContent(cycle, () => SampleAudio(controller), watchdog.StopSignal);
 
@@ -868,26 +893,20 @@ public static class StressHarness
         return default;
     }
 
-    /// <summary>The soak's playback gate: an output whose late frames exceed <see cref="LateFrameFailRatio"/> of its
-    /// presents was showing a stale frame too often (decode behind the clock), which no present-rate check sees —
-    /// the pipeline happily re-presents the frame it already has. Returns false on a FAIL.</summary>
-    private static bool CheckLateFrames(ILog log, int cycle, int cycles, PerformanceSnapshot start, PerformanceSnapshot end)
+    /// <summary>The per-cycle playback gate (both paths): an output whose late frames over the hold exceed
+    /// <see cref="LateFrameFailRatio"/> of its presents was showing a stale frame too often (decode behind the clock),
+    /// which no present-rate check sees — the pipeline happily re-presents the frame it already has. Returns false on
+    /// a FAIL.</summary>
+    private static bool LateFramesOk(ILog log, int cycle, int cycles, string name, long late, long presents)
     {
-        var ok = true;
-        foreach (var output in end.Outputs)
-        {
-            var presents = Presents(start, end, output.Index);
-            var late = LateFrames(start, end, output.Index);
-            if (presents <= 0)
-                continue;
-            var ratio = late / (double)presents;
-            if (ratio <= LateFrameFailRatio)
-                continue;
-            ok = false;
-            log.Error("Stress", $"cycle {cycle:00}/{cycles}: {output.Name}: {late} late frame(s) of {presents} presents " +
-                                $"({ratio:P1}) exceeds the {LateFrameFailRatio:P0} soak threshold — decode is not keeping up with the clock.");
-        }
-        return ok;
+        if (presents <= 0)
+            return true;
+        var ratio = late / (double)presents;
+        if (ratio <= LateFrameFailRatio)
+            return true;
+        log.Error("Stress", $"cycle {cycle:00}/{cycles}: {name}: {late} late frame(s) of {presents} presents " +
+                            $"({ratio:P1}) exceeds the {LateFrameFailRatio:P0} threshold — decode is not keeping up with the clock.");
+        return false;
     }
 
     /// <summary>After EnterPerform: every display the controller says it matched (or found already matched) must be
@@ -1137,17 +1156,29 @@ public static class StressHarness
         return fixture;
     }
 
-    /// <summary>The known-colour H.264 clip for the source-check's VideoToolbox check: <c>--video2</c>, else the
-    /// MULTIMON_H264_FIXTURE path (noted), else null (the check is skipped, noted).</summary>
-    private static string? ResolveVideoToolboxClip(StressOptions options, ILog log)
+    /// <summary>The media folder the source-check's default clips live in.</summary>
+    private static readonly string MediaRoot =
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Desktop", "AIprojects", "MultiMonMedia");
+
+    /// <summary>A clip the source-check REQUIRES: the <paramref name="argumentName"/> value, else the
+    /// <paramref name="envName"/> variable, else <paramref name="defaultRelative"/> under <see cref="MediaRoot"/> — the
+    /// first of those that is given must exist. Null (with the error naming all three ways) when it does not: the
+    /// caller fails the run rather than skip the check.</summary>
+    private static string? ResolveSourceCheckClip(ILog log, string what, string? argument, string argumentName, string envName, string defaultRelative)
     {
-        if (options.Video2 is not null)
-            return options.Video2;
-        var fixture = Environment.GetEnvironmentVariable("MULTIMON_H264_FIXTURE");
-        if (string.IsNullOrEmpty(fixture))
+        var env = Environment.GetEnvironmentVariable(envName);
+        var (path, origin) = argument is not null ? (argument, argumentName)
+            : !string.IsNullOrEmpty(env) ? (env, envName)
+            : (Path.Combine(MediaRoot, defaultRelative), "the default");
+        if (!File.Exists(path))
+        {
+            log.Error("Stress", $"--source-check: the {what} clip '{path}' (from {origin}) does not exist. Give it one of three ways: " +
+                                $"{argumentName}=<clip>, {envName}=<clip>, or the default {Path.Combine(MediaRoot, defaultRelative)}.");
             return null;
-        log.Info("Stress", $"NOTE: --source-check without --video2 — using the MULTIMON_H264_FIXTURE clip {fixture}.");
-        return fixture;
+        }
+        if (argument is null)
+            log.Info("Stress", $"NOTE: --source-check without {argumentName} — using the {what} clip {path} (from {origin}).");
+        return path;
     }
 
     /// <summary>The controller's ExitPerform order for the sources: stop every decode thread (join) → dispose the

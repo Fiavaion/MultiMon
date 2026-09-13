@@ -74,12 +74,15 @@ public sealed class PerformanceController : IPerformanceController, IPerformance
 
     /// <summary>Switch each output's display to a refresh rate that is an integer multiple of its clip's frame rate
     /// for the length of the perform (25 fps on a 60 Hz panel is a 2-3 pull-down stutter; on 50/100 Hz it is clean),
-    /// restored on ExitPerform. Read on the worker at EnterPerform; the panel toggles it between performs. Mac only —
-    /// the Windows controller has no equivalent.</summary>
-    public bool MatchDisplayRefresh { get; set; } = true;
+    /// restored on ExitPerform. Written on the UI thread (the panel toggles it between performs), read on the worker at
+    /// EnterPerform — volatile-backed so the worker sees the latest write. Mac only — the Windows controller has no
+    /// equivalent.</summary>
+    public bool MatchDisplayRefresh { get => _matchDisplayRefresh; set => _matchDisplayRefresh = value; }
+    private volatile bool _matchDisplayRefresh = true;
 
     public event Action<PerformState>? StateChanged;
     public event Action<string>? CommandFailed;
+    public event Action<string>? SourceFaulted;
 
     /// <summary>
     /// Builds the persistent pipeline for <paramref name="monitors"/> (one output window each) on the calling
@@ -264,7 +267,9 @@ public sealed class PerformanceController : IPerformanceController, IPerformance
     /// Samples the pipeline's live counters. It reads ONLY the immutable publication the worker last posted plus
     /// the Interlocked/volatile counters on the output windows and sources — so it never posts to the worker
     /// queue, never takes a lock, never blocks on native work and never runs on the render thread's behalf. Safe
-    /// from the UI thread at any state, including Idle (which reports an empty snapshot).
+    /// from the UI thread at any state, including Idle (which reports an empty snapshot). The first sample that
+    /// sees a source faulted raises <see cref="SourceFaulted"/> for it, once per source per show (the flag lives in
+    /// the publication, so a rebuilt show starts clean).
     /// </summary>
     public PerformanceSnapshot GetStats()
     {
@@ -274,19 +279,21 @@ public sealed class PerformanceController : IPerformanceController, IPerformance
         {
             var b = published.Bindings[n];
             var window = b.Output;
-            outputs[n] = new OutputStats(b.OutputIndex, window.Name, b.Source?.Id ?? string.Empty, window.Visible,
-                b.PixelWidth, b.PixelHeight, b.RefreshHz, b.RefreshMatch,
-                window.PresentCount, window.DrawableNullCount, window.InFlightTimeoutCount, window.LateFrameCount,
-                window.StartupMs, window.StartupModeSwitchMs, window.StartupShowMs, window.RenderPhase);
+            outputs[n] = new OutputStats(b.OutputIndex, window.Name, b.Source?.Id ?? string.Empty,
+                b.PixelWidth, b.PixelHeight, b.RefreshHz,
+                window.PresentCount, window.DrawableNullCount, window.LateFrameCount,
+                window.StartupMs, window.StartupModeSwitchMs, window.StartupShowMs);
         }
         var sources = new SourceStats[published.Sources.Length];
         for (var n = 0; n < published.Sources.Length; n++)
         {
             var source = published.Sources[n];
-            sources[n] = new SourceStats(source.Id, source.DecodePath, source.FrameRate,
-                source.CurrentPts.TotalSeconds, source.DecodedFrames, source.IsFaulted);
+            var faulted = source.IsFaulted;
+            sources[n] = new SourceStats(source.Id, source.DecodePath, source.CurrentPts.TotalSeconds, source.DecodedFrames, faulted);
+            if (faulted && Interlocked.Exchange(ref published.FaultReported[n], 1) == 0)
+                SourceFaulted?.Invoke(source.Id);
         }
-        return new PerformanceSnapshot(_state, Stopwatch.GetTimestamp(), outputs, sources);
+        return new PerformanceSnapshot(Stopwatch.GetTimestamp(), outputs, sources);
     }
 
     /// <summary>
@@ -312,26 +319,24 @@ public sealed class PerformanceController : IPerformanceController, IPerformance
             var refreshHz = 0.0;
             if (uint.TryParse(Monitors[i].DeviceId, out var displayId) && _displayModes.QueryCurrent(displayId) is { } mode)
                 refreshHz = mode.RefreshRate;
-            var match = string.Empty;
-            foreach (var m in _refreshMatches)
-                if (m.Output == i)
-                    match = m.Result.ToString();
-            bindings[n] = new StatsBinding(i, _outputs[i], source, (int)bounds.Width, (int)bounds.Height, refreshHz, match);
+            bindings[n] = new StatsBinding(i, _outputs[i], source, (int)bounds.Width, (int)bounds.Height, refreshHz);
         }
-        _stats = new StatsPublication(bindings, _sources.ToArray());
+        var sources = _sources.ToArray();
+        _stats = new StatsPublication(bindings, sources, new int[sources.Length]);
     }
 
     /// <summary>What the worker publishes for <see cref="GetStats"/>: the bound outputs and the live sources as
-    /// one immutable pair, so a reader can never see half of a rebind.</summary>
-    private sealed record StatsPublication(StatsBinding[] Bindings, IMetalSource[] Sources)
+    /// one immutable pair, so a reader can never see half of a rebind. <paramref name="FaultReported"/> (one slot
+    /// per source, 0/1) is the only mutable part: the Interlocked once-flag behind <see cref="SourceFaulted"/>.</summary>
+    private sealed record StatsPublication(StatsBinding[] Bindings, IMetalSource[] Sources, int[] FaultReported)
     {
-        public static StatsPublication Empty { get; } = new(Array.Empty<StatsBinding>(), Array.Empty<IMetalSource>());
+        public static StatsPublication Empty { get; } = new(Array.Empty<StatsBinding>(), Array.Empty<IMetalSource>(), Array.Empty<int>());
     }
 
     /// <summary>One bound output as the stats reader sees it: the window whose counters it reads, the source it
     /// samples (null = test pattern) and the geometry/refresh cached at publish time.</summary>
     private sealed record StatsBinding(int OutputIndex, OutputWindow Output, IMetalSource? Source,
-        int PixelWidth, int PixelHeight, double RefreshHz, string RefreshMatch);
+        int PixelWidth, int PixelHeight, double RefreshHz);
 
     // ── Worker-thread implementations ────────────────────────────────────────
 
@@ -351,17 +356,18 @@ public sealed class PerformanceController : IPerformanceController, IPerformance
         // at its current rate.
         // Start-up timing (the user's "the second screen takes longer to start" question): one origin for this
         // EnterPerform, then what each output's own mode switch and Show cost. The render thread completes the
-        // measurement when the output first draws decoded content and logs the line.
+        // measurement when the output first draws decoded content; the stats readout prints it.
         var origin = Stopwatch.GetTimestamp();
-        MatchOutputDisplayRefresh();
 
-        // Show every bound output. A Show that fails partway (MainThread.Invoke timing out because the main run
-        // loop stopped pumping) must not leave the earlier windows on screen with the state still Idle — ExitPerform's
-        // Idle early-return would never hide them. Hide every active output (best effort, each on its own: the one
-        // whose Show timed out may still appear when the main thread resumes, and the queue is FIFO) and rethrow →
-        // CommandFailed; the state stays Idle and the clock never starts.
+        // Match, then show every bound output. A Show that fails partway (MainThread.Invoke timing out because the
+        // main run loop stopped pumping) — or a match that throws — must not leave earlier windows on screen or a
+        // display switched with the state still Idle: ExitPerform's Idle early-return would never undo either. Hide
+        // every active output (best effort, each on its own: the one whose Show timed out may still appear when the
+        // main thread resumes, and the queue is FIFO), restore the displays and rethrow → CommandFailed; the state
+        // stays Idle and the clock never starts.
         try
         {
+            MatchOutputDisplayRefresh();
             foreach (var i in _activeOutputs)
             {
                 var showStart = Stopwatch.GetTimestamp();
@@ -372,7 +378,7 @@ public sealed class PerformanceController : IPerformanceController, IPerformance
         catch
         {
             foreach (var i in _activeOutputs)
-                TryHide(i, "rollback after a failed Show");
+                TryHide(i, "rollback after a failed EnterPerform");
             _displayModes.RestoreAll();
             throw;
         }

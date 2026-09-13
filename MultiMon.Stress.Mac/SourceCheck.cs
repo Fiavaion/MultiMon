@@ -78,14 +78,15 @@ internal static class SourceCheck
         return CreateUploadedTexture(provider, QuadrantTextureSize, pixels);
     }
 
-    /// <summary><paramref name="hapClip"/>: the HAP .mov for the hap checks, or null to skip them (noted);
-    /// <paramref name="vtClip"/>: the known-colour H.264 clip for the VideoToolbox check, or null to skip it (noted).</summary>
-    public static int Run(ILog log, string? hapClip, string? vtClip)
+    /// <summary><paramref name="hapClip"/>: the HAP .mov for the hap checks; <paramref name="vtClip"/>: the known-colour
+    /// H.264 clip for the VideoToolbox checks. Both required (the harness resolves and verifies them) — a check that
+    /// could be skipped would let the gate PASS on a path that never ran.</summary>
+    public static int Run(ILog log, string hapClip, string vtClip)
     {
         log.Info("Stress", "source-check: DecodedFrame -> FrameTimeline -> FullscreenQuadPass.Draw -> offscreen target -> readback");
         // The check count is fixed BEFORE anything runs so a crash mid-way can never leave passed == expected.
-        var demux = hapClip is null ? null : MovHapDemuxer.Parse(hapClip);
-        var checkCount = 5 + (demux is null ? 0 : BcnReference.Supports(demux.DeclaredFormat) ? 2 : 1) + (vtClip is null ? 0 : 2);
+        var demux = MovHapDemuxer.Parse(hapClip);
+        var checkCount = 5 + (BcnReference.Supports(demux.DeclaredFormat) ? 2 : 1) + 2;
         var passedChecks = 0;
         var provider = new GraphicsDeviceProvider(log);
         provider.Acquire();
@@ -160,128 +161,126 @@ internal static class SourceCheck
             // window centred on it so the target's centre fragment lands exactly on that texel — the pixel must not
             // be the clear colour and must match the CPU reference. BC4/BC7 have no reference and settle for a
             // non-clear, non-uniform full frame.
-            if (hapClip is not null)
+            var sampleIndex = demux.Samples.Count / 2;
+            var targetPts = TimeSpan.FromTicks(demux.Samples[sampleIndex].PtsTicks);
+            hapSource = new HapSource(hapClip, provider, log, "check");
+            hapPass = new FullscreenQuadPass(provider);
+            hapPass.BindSource(hapSource.Frames, hapSource.Width, hapSource.Height, hapSource.TextureFormat, hapSource.UseYCoCg);
+            hapSource.Start();
+            if (!SpinWait.SpinUntil(() => hapSource.DecodedFrames > 0 || hapSource.IsFaulted, TimeSpan.FromSeconds(5)) || hapSource.IsFaulted)
+                throw new InvalidOperationException($"HAP source published no frame within 5s (faulted={hapSource.IsFaulted}).");
+            var draws = 0;
+            var budget = Stopwatch.StartNew();
+            do
             {
-                var sampleIndex = demux!.Samples.Count / 2;
-                var targetPts = TimeSpan.FromTicks(demux.Samples[sampleIndex].PtsTicks);
-                hapSource = new HapSource(hapClip, provider, log, "check");
-                hapPass = new FullscreenQuadPass(provider);
-                hapPass.BindSource(hapSource.Frames, hapSource.Width, hapSource.Height, hapSource.TextureFormat, hapSource.UseYCoCg);
-                hapSource.Start();
-                if (!SpinWait.SpinUntil(() => hapSource.DecodedFrames > 0 || hapSource.IsFaulted, TimeSpan.FromSeconds(5)) || hapSource.IsFaulted)
-                    throw new InvalidOperationException($"HAP source published no frame within 5s (faulted={hapSource.IsFaulted}).");
-                var draws = 0;
-                var budget = Stopwatch.StartNew();
-                do
+                RenderTarget(loop, provider, hapPass, renderPass, uniforms, target, readback, UvRect.Full, targetPts);
+                draws++;
+            } while (hapSource.CurrentPts < targetPts && !hapSource.IsFaulted && budget.Elapsed < TimeSpan.FromSeconds(10));
+            if (hapSource.CurrentPts < targetPts)
+                throw new InvalidOperationException($"HAP source never reached sample {sampleIndex} (pts {targetPts.TotalSeconds:0.000}s) after {draws} draws in {budget.Elapsed.TotalSeconds:0.0}s (decoded={hapSource.DecodedFrames} faulted={hapSource.IsFaulted}).");
+            if (BcnReference.Supports(demux.DeclaredFormat))
+            {
+                var sample = demux.Samples[sampleIndex];
+                var compressed = new byte[sample.Size];
+                using (var file = File.OpenRead(hapClip))
                 {
-                    RenderTarget(loop, provider, hapPass, renderPass, uniforms, target, readback, UvRect.Full, targetPts);
-                    draws++;
-                } while (hapSource.CurrentPts < targetPts && !hapSource.IsFaulted && budget.Elapsed < TimeSpan.FromSeconds(10));
-                if (hapSource.CurrentPts < targetPts)
-                    throw new InvalidOperationException($"HAP source never reached sample {sampleIndex} (pts {targetPts.TotalSeconds:0.000}s) after {draws} draws in {budget.Elapsed.TotalSeconds:0.0}s (decoded={hapSource.DecodedFrames} faulted={hapSource.IsFaulted}).");
-                if (BcnReference.Supports(demux.DeclaredFormat))
-                {
-                    var sample = demux.Samples[sampleIndex];
-                    var compressed = new byte[sample.Size];
-                    using (var file = File.OpenRead(hapClip))
-                    {
-                        file.Position = sample.FileOffset;
-                        file.ReadExactly(compressed);
-                    }
-                    var decoded = HapFrameDecoder.Decode(compressed);
-                    int w = hapSource.Width, h = hapSource.Height;
-                    var (chromatic, brightest) = BcnReference.FindReferenceTexels(decoded.Data, decoded.Format, w, h, step: 4);
-                    log.Info("Stress", $"  hap sample {sampleIndex} (pts {targetPts.TotalSeconds:0.000}s, {draws} draws to reach it) of {hapClip}: " +
-                                       $"most chromatic texel {chromatic}, brightest texel {brightest}");
-                    foreach (var ((tx, ty), kind) in new[] { (chromatic, "most chromatic"), (brightest, "brightest") })
-                    {
-                        // A TargetSize-texel window whose centre fragment (i.uv = 32.5/64) samples texel (tx, ty) exactly:
-                        // x = (x0 + 32.5) - 0.5 = tx when x0 = tx - 32 (clamped into the frame, then re-derived).
-                        var x0 = Math.Clamp(tx - TargetSize / 2, 0, w - TargetSize);
-                        var y0 = Math.Clamp(ty - TargetSize / 2, 0, h - TargetSize);
-                        var window = new UvRect((float)x0 / w, (float)y0 / h, (float)(x0 + TargetSize) / w, (float)(y0 + TargetSize) / h);
-                        var u = (x0 + TargetSize / 2 + 0.5f) / w;
-                        var v = (y0 + TargetSize / 2 + 0.5f) / h;
-                        var reference = BcnReference.Sample(decoded.Data, decoded.Format, w, h, u, v);
-                        if (kind == "most chromatic" && BcnReference.ChromaSensitivity(reference) <= HapTolerance)
-                            log.Info("Stress", $"  NOTE: the most chromatic texel decodes to ({reference.R},{reference.G},{reference.B}), chroma sensitivity {BcnReference.ChromaSensitivity(reference)} <= ±{HapTolerance} — " +
-                                               $"this clip is (near) greyscale at sample {sampleIndex}, so this run does NOT prove the chroma channels/sign/scale; use a colour HapQ clip for that.");
-                        var pixels = RenderTarget(loop, provider, hapPass, renderPass, uniforms, target, readback, window, targetPts);
-                        var centre = Pixel(pixels, TargetSize / 2, TargetSize / 2);
-                        var nonClear = centre != ((byte)0, (byte)0, (byte)0);
-                        var match = Report(log, $"hap {kind} texel ({x0 + TargetSize / 2},{y0 + TargetSize / 2}) in window {window} vs CPU {decoded.Format} reference", reference, centre, HapTolerance);
-                        passedChecks += match == 1 && nonClear ? 1 : 0;
-                        if (!nonClear)
-                            log.Error("Stress", $"  FAIL hap {kind} centre is the clear colour (0,0,0).");
-                    }
-                    hapSource.Stop();
+                    file.Position = sample.FileOffset;
+                    file.ReadExactly(compressed);
                 }
-                else
+                var decoded = HapFrameDecoder.Decode(compressed);
+                int w = hapSource.Width, h = hapSource.Height;
+                var (chromatic, brightest) = BcnReference.FindReferenceTexels(decoded.Data, decoded.Format, w, h, step: 4);
+                log.Info("Stress", $"  hap sample {sampleIndex} (pts {targetPts.TotalSeconds:0.000}s, {draws} draws to reach it) of {hapClip}: " +
+                                   $"most chromatic texel {chromatic}, brightest texel {brightest}");
+                foreach (var ((tx, ty), kind) in new[] { (chromatic, "most chromatic"), (brightest, "brightest") })
                 {
-                    // Unexercised: no fixture in the media set is BC4 (HAP Alpha) or BC7 (HAP R); this branch has never run.
-                    var pixels = RenderTarget(loop, provider, hapPass, renderPass, uniforms, target, readback, UvRect.Full, targetPts);
-                    hapSource.Stop();
+                    // A TargetSize-texel window whose centre fragment (i.uv = 32.5/64) samples texel (tx, ty) exactly:
+                    // x = (x0 + 32.5) - 0.5 = tx when x0 = tx - 32 (clamped into the frame, then re-derived).
+                    var x0 = Math.Clamp(tx - TargetSize / 2, 0, w - TargetSize);
+                    var y0 = Math.Clamp(ty - TargetSize / 2, 0, h - TargetSize);
+                    var window = new UvRect((float)x0 / w, (float)y0 / h, (float)(x0 + TargetSize) / w, (float)(y0 + TargetSize) / h);
+                    var u = (x0 + TargetSize / 2 + 0.5f) / w;
+                    var v = (y0 + TargetSize / 2 + 0.5f) / h;
+                    var reference = BcnReference.Sample(decoded.Data, decoded.Format, w, h, u, v);
+                    if (kind == "most chromatic" && BcnReference.ChromaSensitivity(reference) <= HapTolerance)
+                        log.Info("Stress", $"  NOTE: the most chromatic texel decodes to ({reference.R},{reference.G},{reference.B}), chroma sensitivity {BcnReference.ChromaSensitivity(reference)} <= ±{HapTolerance} — " +
+                                           $"this clip is (near) greyscale at sample {sampleIndex}, so this run does NOT prove the chroma channels/sign/scale; use a colour HapQ clip for that.");
+                    var pixels = RenderTarget(loop, provider, hapPass, renderPass, uniforms, target, readback, window, targetPts);
                     var centre = Pixel(pixels, TargetSize / 2, TargetSize / 2);
-                    var corners = new[] { Pixel(pixels, 0, 0), Pixel(pixels, TargetSize - 1, 0), Pixel(pixels, 0, TargetSize - 1), Pixel(pixels, TargetSize - 1, TargetSize - 1) };
                     var nonClear = centre != ((byte)0, (byte)0, (byte)0);
-                    var nonUniform = corners.Any(c => c != centre) || corners.Distinct().Count() > 1;
-                    log.Info("Stress", $"  NOTE: no CPU reference for {demux.DeclaredFormat}; the hap check is non-clear + non-uniform only. " +
-                                       $"centre=({centre.R},{centre.G},{centre.B}) corners=[{string.Join(" ", corners.Select(c => $"({c.R},{c.G},{c.B})"))}]");
-                    passedChecks += Report(log, $"hap sample {sampleIndex} non-clear + non-uniform", nonClear && nonUniform);
+                    var match = Report(log, $"hap {kind} texel ({x0 + TargetSize / 2},{y0 + TargetSize / 2}) in window {window} vs CPU {decoded.Format} reference", reference, centre, HapTolerance);
+                    passedChecks += match == 1 && nonClear ? 1 : 0;
+                    if (!nonClear)
+                        log.Error("Stress", $"  FAIL hap {kind} centre is the clear colour (0,0,0).");
                 }
+                hapSource.Stop();
             }
             else
-                log.Info("Stress", "NOTE: no HAP clip (--video or MULTIMON_HAP_FIXTURE) — the hap check is skipped.");
+            {
+                // Unexercised: no fixture in the media set is BC4 (HAP Alpha) or BC7 (HAP R); this branch has never run.
+                var pixels = RenderTarget(loop, provider, hapPass, renderPass, uniforms, target, readback, UvRect.Full, targetPts);
+                hapSource.Stop();
+                var centre = Pixel(pixels, TargetSize / 2, TargetSize / 2);
+                var corners = new[] { Pixel(pixels, 0, 0), Pixel(pixels, TargetSize - 1, 0), Pixel(pixels, 0, TargetSize - 1), Pixel(pixels, TargetSize - 1, TargetSize - 1) };
+                var nonClear = centre != ((byte)0, (byte)0, (byte)0);
+                var nonUniform = corners.Any(c => c != centre) || corners.Distinct().Count() > 1;
+                log.Info("Stress", $"  NOTE: no CPU reference for {demux.DeclaredFormat}; the hap check is non-clear + non-uniform only. " +
+                                   $"centre=({centre.R},{centre.G},{centre.B}) corners=[{string.Join(" ", corners.Select(c => $"({c.R},{c.G},{c.B})"))}]");
+                passedChecks += Report(log, $"hap sample {sampleIndex} non-clear + non-uniform", nonClear && nonUniform);
+            }
 
             // Check 8: the real VideoToolbox path. The source's FIRST frame (media time 0 selects it) is a cache-vended
             // BGRA texture wrapping the decoder's own pixel buffer; blitted through the pass, the solid fixture colour
             // must reach the target's centre — proving demux → VT decode → YCbCr→BGRA conversion → CVMetalTextureCache
             // → blit → sample with the expected colour matrix.
-            if (vtClip is not null)
-            {
-                vtSource = new VideoToolboxSource(vtClip, provider, log, id: "vtcheck");
-                vtPass = new FullscreenQuadPass(provider);
-                vtPass.BindSource(vtSource.Frames, vtSource.Width, vtSource.Height, vtSource.TextureFormat, vtSource.UseYCoCg);
-                vtSource.Start();
-                if (!SpinWait.SpinUntil(() => vtSource.DecodedFrames > 0 || vtSource.IsFaulted, TimeSpan.FromSeconds(5)) || vtSource.IsFaulted)
-                    throw new InvalidOperationException($"VideoToolbox source published no frame within 5s (faulted={vtSource.IsFaulted}).");
-                var pixels = RenderTarget(loop, provider, vtPass, renderPass, uniforms, target, readback, UvRect.Full, TimeSpan.Zero);
-                vtSource.Stop();
-                var centre = Pixel(pixels, TargetSize / 2, TargetSize / 2);
-                passedChecks += Report(log, $"videotoolbox first frame of {Path.GetFileName(vtClip)} ({(vtSource.IsHardwareDecode ? "hardware" : "software")} decode) vs bt709 reference",
-                    VideoToolboxExpected, centre, VideoToolboxTolerance);
+            vtSource = new VideoToolboxSource(vtClip, provider, log, id: "vtcheck");
+            vtPass = new FullscreenQuadPass(provider);
+            vtPass.BindSource(vtSource.Frames, vtSource.Width, vtSource.Height, vtSource.TextureFormat, vtSource.UseYCoCg);
+            vtSource.Start();
+            if (!SpinWait.SpinUntil(() => vtSource.DecodedFrames > 0 || vtSource.IsFaulted, TimeSpan.FromSeconds(5)) || vtSource.IsFaulted)
+                throw new InvalidOperationException($"VideoToolbox source published no frame within 5s (faulted={vtSource.IsFaulted}).");
+            var vtPixels = RenderTarget(loop, provider, vtPass, renderPass, uniforms, target, readback, UvRect.Full, TimeSpan.Zero);
+            vtSource.Stop();
+            var vtCentre = Pixel(vtPixels, TargetSize / 2, TargetSize / 2);
+            passedChecks += Report(log, $"videotoolbox first frame of {Path.GetFileName(vtClip)} ({(vtSource.IsHardwareDecode ? "hardware" : "software")} decode) vs bt709 reference",
+                VideoToolboxExpected, vtCentre, VideoToolboxTolerance);
 
-                // Check 9: presentation ORDER. A fresh source decodes the clip's first OrderCheckFrames frames (a B-frame
-                // clip: VideoToolbox's callback fires in decode order) into its timeline while this thread consumes
-                // like the render thread does (SelectInto, newest frame). FrameTimeline.Publish refuses the first
-                // non-ascending PTS by faulting the source — the decode log names the inversion — so the check is:
-                // not faulted, the frames were published, and every PTS this consumer saw was strictly ascending.
-                orderSource = new VideoToolboxSource(vtClip, provider, log, id: "vtorder");
-                orderSource.Start();
-                var seen = new List<TimeSpan>();
-                var budget = Stopwatch.StartNew();
-                while (orderSource.DecodedFrames < OrderCheckFrames && !orderSource.IsFaulted && budget.Elapsed < TimeSpan.FromSeconds(10))
+            // Check 9: presentation ORDER. A fresh source decodes the clip's first OrderCheckFrames frames (a B-frame
+            // clip: VideoToolbox's callback fires in decode order) into its timeline while this thread consumes
+            // like the render thread does (SelectInto, newest frame). FrameTimeline.Publish refuses the first
+            // non-ascending PTS by faulting the source (the decode log names the inversion), so the check is: not
+            // faulted, AND every distinct frame this consumer selected — recorded by identity, so an equal-PTS frame
+            // counts as a new one, inversions included — forms a strictly ascending list at least OrderCheckFrames
+            // long. A consumer that only kept ascending PTS could never fail this.
+            orderSource = new VideoToolboxSource(vtClip, provider, log, id: "vtorder");
+            orderSource.Start();
+            var seen = new List<TimeSpan>();
+            DecodedFrame? lastSeen = null;
+            var orderBudget = Stopwatch.StartNew();
+            while (seen.Count < OrderCheckFrames && !orderSource.IsFaulted && orderBudget.Elapsed < TimeSpan.FromSeconds(10))
+            {
+                orderSource.Frames.SelectInto(TimeSpan.MaxValue, frame =>
                 {
-                    orderSource.Frames.SelectInto(TimeSpan.MaxValue, frame =>
-                    {
-                        if (seen.Count == 0 || frame.Pts > seen[^1]) seen.Add(frame.Pts);
-                    });
-                    Thread.Yield();
-                }
-                orderSource.Stop();
-                var ascending = true;
-                for (var i = 1; i < seen.Count; i++)
-                    if (seen[i] <= seen[i - 1])
-                    {
-                        ascending = false;
-                        log.Error("Stress", $"  FAIL first inversion seen by the consumer: {seen[i].TotalSeconds:0.000}s after {seen[i - 1].TotalSeconds:0.000}s.");
-                    }
-                log.Info("Stress", $"  videotoolbox order: {orderSource.DecodedFrames} published, consumer saw {seen.Count} ({(seen.Count > 0 ? $"{seen[0].TotalSeconds:0.000}s .. {seen[^1].TotalSeconds:0.000}s" : "none")}), faulted={orderSource.IsFaulted}.");
-                passedChecks += Report(log, $"videotoolbox presentation order: first {OrderCheckFrames} frames of {Path.GetFileName(vtClip)} published strictly ascending",
-                    !orderSource.IsFaulted && orderSource.DecodedFrames >= OrderCheckFrames && ascending && seen.Count > 1);
+                    if (ReferenceEquals(frame, lastSeen)) return;
+                    lastSeen = frame;
+                    seen.Add(frame.Pts);
+                });
+                Thread.Yield();
             }
-            else
-                log.Info("Stress", "NOTE: no H.264 colour clip (--video2 or MULTIMON_H264_FIXTURE) — the videotoolbox check is skipped.");
+            orderSource.Stop();
+            var inversions = 0;
+            for (var i = 1; i < seen.Count; i++)
+                if (seen[i] <= seen[i - 1])
+                {
+                    if (inversions++ == 0)
+                        log.Error("Stress", $"  FAIL first inversion seen by the consumer: {seen[i].TotalSeconds:0.000}s after {seen[i - 1].TotalSeconds:0.000}s.");
+                }
+            log.Info("Stress", $"  videotoolbox order: {orderSource.DecodedFrames} published, consumer saw {seen.Count} distinct frames " +
+                               $"({(seen.Count > 0 ? $"{seen[0].TotalSeconds:0.000}s .. {seen[^1].TotalSeconds:0.000}s" : "none")}), {inversions} inversion(s), faulted={orderSource.IsFaulted}.");
+            if (seen.Count < OrderCheckFrames)
+                log.Error("Stress", $"  FAIL consumer saw {seen.Count} distinct frames, fewer than {OrderCheckFrames} within {orderBudget.Elapsed.TotalSeconds:0.0}s.");
+            passedChecks += Report(log, $"videotoolbox presentation order: {OrderCheckFrames} distinct frames of {Path.GetFileName(vtClip)} seen strictly ascending",
+                !orderSource.IsFaulted && inversions == 0 && seen.Count >= OrderCheckFrames);
         }
         catch (Exception ex)
         {

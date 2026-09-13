@@ -189,6 +189,8 @@ public sealed class MainViewModel : INotifyPropertyChanged
 
         _controller.StateChanged += OnControllerStateChanged;
         _controller.CommandFailed += OnControllerCommandFailed;
+        if (_statsSource is not null)
+            _statsSource.SourceFaulted += OnSourceFaulted;
     }
 
     public ObservableCollection<MonitorAssignmentRow> Rows { get; }
@@ -221,7 +223,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
         while (PerformanceLines.Count < rows.Count)
             PerformanceLines.Add(new PerformanceLineRow());
         for (var i = 0; i < rows.Count; i++)
-            PerformanceLines[i].Text = rows[i].Line;
+            PerformanceLines[i].Text = rows[i];
         PerformanceVisible = rows.Count > 0 && IsPerforming;
     }
 
@@ -733,8 +735,6 @@ public sealed class MainViewModel : INotifyPropertyChanged
         };
         if (state == PerformState.Idle)
             EndPerformanceReadout();
-        else if (state == PerformState.Performing && PerformanceLines.Count == 0)
-            _readout.Reset(); // a new perform starts a fresh rate window (the counters restarted with it)
     });
 
     /// <summary>UI thread: the perform is over — write the last sample to the log (the one place the numbers
@@ -749,6 +749,12 @@ public sealed class MainViewModel : INotifyPropertyChanged
     }
 
     private void OnControllerCommandFailed(string message) => RunOnUi(() => Status = $"Perform failed: {message}");
+
+    /// <summary>A decode loop died mid-perform: its output is frozen on the last frame, which nothing but the
+    /// PERFORMANCE strip's FAULTED token would otherwise show. Raised from the stats poll (UI thread) — marshalled
+    /// anyway, since the interface only promises "the caller's thread".</summary>
+    private void OnSourceFaulted(string sourceId) => RunOnUi(() =>
+        Status = $"Source '{sourceId}' faulted — its output is frozen on the last frame (see the log); Stop and Perform again to rebuild it.");
 
     private void RunOnUi(Action action)
     {

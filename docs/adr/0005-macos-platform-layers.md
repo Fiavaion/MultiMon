@@ -267,7 +267,15 @@ symbol (`Dlfcn.GetStringConstant`), not a same-spelled NSString — the latter i
 regardless of `kVTDecodeFrame_EnableTemporalProcessing` (measured: 20/40 inversions on a B-frame clip with and
 without the flag). `VideoToolboxSource` therefore holds a sorted reorder window (`ReorderDepth = 4`; measured need
 3) and publishes the smallest PTS; `FrameTimeline.Publish` now refuses a non-ascending PTS so a deeper stream
-faults loudly instead of the selector silently picking stale frames. Before this, 92 % of presents on H.264 selected
-a stale frame — the stutter D11 was chasing was mostly this. **D11 note:** immediately after a display mode switch
+faults loudly instead of the selector silently picking stale frames. `ReorderDepth = 4` is an **empirical bound**,
+not a derivation from the codec: the fixture survey (ffmpeg-default H.264/HEVC, 3 B-frames) needed depth 3, and 4 is
+that plus one of margin; a stream with deeper reordering faults the source (the guard) rather than stuttering. Note
+also that `Drain` moves the whole burst VideoToolbox emitted since the last drain into the window before publishing,
+so the effective window is max(4, burst) — a burst never shrinks it. `--source-check` check 9 is the gate for this
+(60 distinct frames of the B-frame fixture, consumed like the render thread, strictly ascending; it fails with the
+guard and the window disabled); its two clips are required — `--video`/`--video2`, else `MULTIMON_HAP_FIXTURE`/
+`MULTIMON_H264_FIXTURE`, else the media-folder defaults `Hap/colour_hapq.mov`/`colour_h264.mp4` — and a missing clip
+FAILS the run instead of skipping the check. Before this, 92 % of presents on H.264 selected a stale frame — the
+stutter D11 was chasing was mostly this. **D11 note:** immediately after a display mode switch
 the freshly shown layer presents unthrottled for a few frames (30 presents in 16 ms observed); the harness dwell is
 now ≥300 ms per cycle so the advance check is meaningful.

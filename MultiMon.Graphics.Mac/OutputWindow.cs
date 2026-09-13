@@ -58,7 +58,6 @@ public sealed class OutputWindow
     // Live diagnostics. All written with Interlocked/Volatile on the render thread and read by anyone
     // (the panel's poll, the harness); the per-perform ones are zeroed by Show.
     private long _drawableNulls;
-    private long _inFlightTimeouts;
     private long _lateFrames;
     private double _sourceFrameSeconds;  // one frame period of the bound clip, 0 when unknown (render-thread-owned)
 
@@ -105,9 +104,6 @@ public sealed class OutputWindow
     /// <summary>Beats skipped this perform because <c>nextDrawable</c> returned null — the compositor was not
     /// consuming (window occluded/offscreen), including its ~1 s timeout.</summary>
     public long DrawableNullCount => Volatile.Read(ref _drawableNulls);
-
-    /// <summary>Beats skipped this perform because no uniform ring slot freed within the in-flight timeout.</summary>
-    public long InFlightTimeoutCount => Volatile.Read(ref _inFlightTimeouts);
 
     /// <summary>Presents this perform whose selected frame was more than one frame period behind the clock —
     /// i.e. decode did not keep up and the picture repeated a frame it should have moved past.</summary>
@@ -196,7 +192,6 @@ public sealed class OutputWindow
         _loop.ThrowIfRenderThread(nameof(Show));
         // Per-perform counters start clean, so the panel and the harness read THIS show's figures.
         Volatile.Write(ref _drawableNulls, 0);
-        Volatile.Write(ref _inFlightTimeouts, 0);
         Volatile.Write(ref _lateFrames, 0);
         MainThread.Invoke(() =>
         {
@@ -315,7 +310,6 @@ public sealed class OutputWindow
         _renderPhase = "in-flight-wait";
         if (!_inFlight.Wait(InFlightTimeout))
         {
-            Interlocked.Increment(ref _inFlightTimeouts);
             _renderPhase = "idle";
             return false;
         }
@@ -376,27 +370,17 @@ public sealed class OutputWindow
     /// Render thread, right after the pass encoded this beat: records the first frame that carried content (the
     /// start-up measurement) and counts a late frame when the frame the selector chose is more than one frame
     /// period behind the clock — decode not keeping up, which is invisible in the present rate because the
-    /// pipeline happily re-presents the frame it already has. Counters only; no allocation, no lock.
+    /// pipeline happily re-presents the frame it already has. Counters only; no allocation, no lock — the figures
+    /// are printed by the stats readout (<c>PerformanceReadout</c>), never formatted here.
     /// </summary>
     private void NoteFrameTiming(FullscreenQuadPass pass, TimeSpan time)
     {
         if (!pass.HasDrawnContent)
             return; // nothing decoded yet: the pass cleared to black, and that is not a late frame
         if (Interlocked.CompareExchange(ref _startupPending, 0, 1) == 1)
-            LogFirstContentPresent();
+            Volatile.Write(ref _startupMs, (Stopwatch.GetTimestamp() - _startupOrigin) * 1000.0 / Stopwatch.Frequency);
         if (_sourceFrameSeconds > 0 && (time - pass.LastSelectedPts).TotalSeconds > _sourceFrameSeconds)
             Interlocked.Increment(ref _lateFrames);
-    }
-
-    /// <summary>Render thread, once per perform (the arming flag has already been taken).</summary>
-    private void LogFirstContentPresent()
-    {
-        var elapsedMs = (Stopwatch.GetTimestamp() - _startupOrigin) * 1000.0 / Stopwatch.Frequency;
-        Volatile.Write(ref _startupMs, elapsedMs);
-        var clock = _clock;
-        _log.Info("Graphics", $"{Name}: first frame {elapsedMs:0.0} ms after EnterPerform " +
-                              $"(mode switch {Volatile.Read(ref _startupModeSwitchMs):0.0} ms, show {Volatile.Read(ref _startupShowMs):0.0} ms), " +
-                              $"clock {(clock is null ? "shared" : $"{clock.CurrentMediaTime.TotalSeconds:0.000}s running={clock.IsRunning}")}");
     }
 
     /// <summary>Metal completion thread: the frame is on its way to the display and its uniform slot is free.</summary>
