@@ -215,7 +215,10 @@ public sealed class MainViewModel : INotifyPropertyChanged
     /// </summary>
     public void RefreshPerformanceStats()
     {
-        if (_statsSource is null)
+        // Only sample while performing: a tick that lands after ExitPerform would read an idle interval
+        // (outputs hidden, presents stopped) and the row logged at the end of the perform would show a
+        // meaningless rate (observed 5.9 present/s against a live 50).
+        if (_statsSource is null || !IsPerforming)
             return;
         var rows = _readout.Read(_statsSource.GetStats());
         while (PerformanceLines.Count > rows.Count)
