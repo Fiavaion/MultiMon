@@ -261,10 +261,11 @@ with `Avalonia.Native was not able to start the RenderTimer. Native error code i
       Gate: `--controller` 50 cycles PASS in Span, Individual, Split, HAP and audio.
       *Done 2026-09-09.* Host contract: construct/dispose the controller off the main thread; keep the NSApplication
       run loop pumping (window show/hide is marshalled to the main queue with a 5 s bound).
-- [ ] **TODO 8 — Avalonia control panel.** Reuse `MainViewModel`'s contract (WPF today; lift the view-model
+- [x] **TODO 8 — Avalonia control panel.** Reuse `MainViewModel`'s contract (WPF today; lift the view-model
       logic into a portable `MultiMon.Control.Shared` if the Dispatcher seam is the only WPF dependency —
       check first). Monitor rows, mode picker, Identify overlay, mixer, New/Open/Save, Convert-to-HAP
       (ffmpeg via a Homebrew path probe). Gate: the user's manual run of every mode.
+      *Done 2026-09-14 — user's manual pass of every mode on two displays PASSED.*
       *Code-complete 2026-09-09* (commit "Mac control panel"); the manual-run gate is still open. Host contract: `NSApplication.Init()`
       first on the main thread; controller built/disposed off the main thread; exit = bounded off-thread teardown while the run loop
       is alive, then `desktop.Shutdown()` (LESSON-BUG-009). Mac-specific choices: hotkeys frontmost-only, no Report-a-bug button,
