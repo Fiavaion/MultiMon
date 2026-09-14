@@ -3,6 +3,7 @@ using Avalonia.Controls;
 using Avalonia.Input;
 using Avalonia.Layout;
 using Avalonia.Media;
+using Avalonia.Platform;
 using MultiMon.Core.Models;
 
 namespace MultiMon.Control.Mac;
@@ -31,7 +32,7 @@ internal sealed class IdentifyOverlays
     {
         Hide();
         for (var i = 0; i < monitors.Count; i++)
-            _windows.Add(CreateOverlay(monitors[i], i + 1));
+            _windows.Add(CreateOverlay(monitors[i], i + 1, monitors));
     }
 
     public void Hide()
@@ -41,7 +42,7 @@ internal sealed class IdentifyOverlays
         _windows.Clear();
     }
 
-    private Window CreateOverlay(MonitorInfo monitor, int number)
+    private Window CreateOverlay(MonitorInfo monitor, int number, IReadOnlyList<MonitorInfo> monitors)
     {
         var card = new Border
         {
@@ -76,7 +77,6 @@ internal sealed class IdentifyOverlays
             },
         };
 
-        var b = monitor.Bounds;
         var w = new Window
         {
             WindowDecorations = WindowDecorations.None,
@@ -87,19 +87,23 @@ internal sealed class IdentifyOverlays
             // Faint scrim so the number reads clearly while the desktop stays visible behind it.
             Background = new SolidColorBrush(Color.FromArgb(0x55, 0x06, 0x08, 0x0C)),
             WindowStartupLocation = WindowStartupLocation.Manual,
-            // MonitorService reports physical pixels with a top-left origin — the same space as
-            // PixelPoint/PixelSize — so the overlay covers exactly its monitor on mixed-scale layouts.
-            Position = new PixelPoint((int)b.Left, (int)b.Top),
             // Never steal focus: the control panel keeps the keyboard, so Esc there dismisses these too.
             ShowActivated = false,
             Content = card,
         };
-        // Unit rule: Position is physical pixels, but Width/Height are DIPs — divide by the screen's scale or
-        // a 2x Retina overlay is built twice the size of its monitor.
-        var centre = new PixelPoint((int)(b.Left + b.Width / 2), (int)(b.Top + b.Height / 2));
-        var scale = w.Screens.ScreenFromPoint(centre)?.Scaling ?? 1.0;
-        w.Width = b.Width / scale;
-        w.Height = b.Height / scale;
+        // Coordinate rule (two-display pass, 2026-09-14): MonitorService reports physical pixels — origins in
+        // AppKit points × the PRIMARY screen's backing scale (ADR 0005). Avalonia's Screens on macOS are in
+        // AppKit points (scaling reported as 1), so a Retina laptop + 1080p external puts the external at
+        // x=4112 for us but x=2056 for Avalonia; positioning with our pixels lands the overlay off-screen and
+        // AppKit clamps it back onto the laptop. Convert our origin to points via the primary pair, then let
+        // the Avalonia screen containing that point supply position and size in its own units.
+        var pixelOrigin = new PixelPoint((int)monitor.Bounds.Left, (int)monitor.Bounds.Top);
+        var screen = w.Screens.ScreenFromPoint(ToAvaloniaPoint(pixelOrigin, monitors, w.Screens.All))
+                     ?? w.Screens.Primary
+                     ?? throw new InvalidOperationException("No screens reported by Avalonia.");
+        w.Position = screen.Bounds.Position;
+        w.Width = screen.Bounds.Width / screen.Scaling;
+        w.Height = screen.Bounds.Height / screen.Scaling;
         w.PointerPressed += (_, _) => Hide();
         w.KeyDown += (_, e) =>
         {
@@ -111,5 +115,16 @@ internal sealed class IdentifyOverlays
         };
         w.Show();
         return w;
+    }
+
+    /// <summary>Physical-pixel origin (MonitorService space) → AppKit-point origin (Avalonia screen space).
+    /// Both spaces share the primary's top-left as (0,0); the ratio between them is the primary's backing scale,
+    /// read off the primary pair rather than assumed.</summary>
+    private static PixelPoint ToAvaloniaPoint(PixelPoint pixels, IReadOnlyList<MonitorInfo> monitors, IReadOnlyList<Screen> screens)
+    {
+        var ourPrimary = monitors.FirstOrDefault(m => m.IsPrimary) ?? monitors[0];
+        var avPrimary = screens.FirstOrDefault(s => s.IsPrimary) ?? screens[0];
+        var scale = ourPrimary.Bounds.Width / (avPrimary.Bounds.Width * avPrimary.Scaling);
+        return new PixelPoint((int)Math.Round(pixels.X / scale), (int)Math.Round(pixels.Y / scale));
     }
 }
