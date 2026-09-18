@@ -12,8 +12,8 @@ body:
     id: version
     attributes:
       label: MultiMon version
-      description: Shown in the window title / file properties (e.g. 1.0.0-rc.1).
-      placeholder: "1.0.0-rc.1"
+      description: Shown in the window title / file properties (e.g. 1.0.0).
+      placeholder: "1.0.0"
     validations:
       required: true
   - type: dropdown

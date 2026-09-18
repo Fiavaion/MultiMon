@@ -6,6 +6,31 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.0.0] - 2026-09-19
+
+First stable release, for **Windows (x64)** and **macOS (Apple Silicon)**. Everything in 1.0.0-rc.1 below is
+included; the macOS port is new.
+
+### Added
+
+- **macOS port (Apple Silicon, macOS 14+)** — Metal render core, HAP and VideoToolbox decode, CoreAudio output,
+  Avalonia control panel, display refresh matching and a performance readout. Shipped as a DMG, signed with a
+  Developer ID (not yet notarized: right-click → Open on first launch). Intel Macs are deferred to 1.1.
+- **Application icon** on both platforms (`MultiMon.ico` / `MultiMon.icns`), built from the final idents.
+
+### Changed
+
+- Release kit is published without debug symbols.
+
+### Known limitations
+
+- The real-Intel (QuickSync) acceptance pass, a multi-vendor rig of four or more screens, and a live audio
+  device-pull have not been run on hardware; Windows stability is verified on AMD and NVIDIA.
+- The Windows build is unsigned (SmartScreen warns on first run); the macOS build is signed but not notarized.
+- Convert to HAP resolves FFmpeg from `PATH`; FFmpeg is not bundled.
+
+---
+
 ## [1.0.0-rc.1] - 2026-06-18
 
 This is the first release candidate of the MultiMon ground-up rebuild. The old WPF + LibVLCSharp

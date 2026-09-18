@@ -5,7 +5,7 @@
 | Version      | Supported |
 |--------------|-----------|
 | 1.0.0-rc.x   | Yes — active release candidate |
-| < 1.0.0-rc.1 | No |
+| < 1.0.0 | No |
 
 ## Reporting a vulnerability
 
