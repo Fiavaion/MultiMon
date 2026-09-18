@@ -1,0 +1,68 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:MultiMon.Control.Shared"
+        xmlns:local="using:MultiMon.Control.Mac"
+        x:Class="MultiMon.Control.Mac.ConvertToHapWindow"
+        x:DataType="vm:ConvertToHapViewModel"
+        Title="Convert to HAP" Width="640" Height="400" CanResize="False"
+        Background="{StaticResource WindowBackground}" WindowStartupLocation="CenterOwner">
+
+  <Window.Resources>
+    <local:HapFormatDescConverter x:Key="HapFmtDesc"/>
+  </Window.Resources>
+
+  <Grid Margin="20" RowDefinitions="Auto,Auto,Auto,Auto,Auto,Auto,Auto,Auto">
+
+    <!-- FFmpeg discovery result -->
+    <TextBlock Grid.Row="0" Text="{Binding FfmpegStatus}" Classes="hint"
+               Foreground="{StaticResource CyanBrush}" Margin="0,0,0,14" TextWrapping="Wrap"/>
+
+    <!-- Input file -->
+    <Grid Grid.Row="1" Margin="0,0,0,4" ColumnDefinitions="90,*,Auto">
+      <TextBlock Grid.Column="0" Text="INPUT VIDEO" Classes="label"/>
+      <TextBox Grid.Column="1" Text="{Binding InputPath}" IsEnabled="{Binding CanEdit}"/>
+      <Button Grid.Column="2" Content="Browse…" Margin="8,0,0,0"
+              Click="BrowseInput_Click" IsEnabled="{Binding CanEdit}"/>
+    </Grid>
+
+    <!-- Metadata summary -->
+    <TextBlock Grid.Row="2" Text="{Binding MetadataText}" Classes="hint" Margin="90,0,0,12"/>
+
+    <!-- Encode settings -->
+    <StackPanel Grid.Row="3" Orientation="Horizontal" Margin="0,0,0,12">
+      <TextBlock Text="FORMAT" Classes="label" Width="90"/>
+      <ComboBox Name="FormatCombo" Width="270" SelectedItem="{Binding SelectedFormat}" IsEnabled="{Binding CanEdit}">
+        <ComboBox.ItemTemplate>
+          <DataTemplate>
+            <TextBlock Text="{Binding Converter={StaticResource HapFmtDesc}}"/>
+          </DataTemplate>
+        </ComboBox.ItemTemplate>
+      </ComboBox>
+      <TextBlock Text="CHUNKS" Classes="label" Margin="20,0,8,0"/>
+      <NumericUpDown Width="100" Minimum="1" Maximum="16" Increment="1" FormatString="0"
+                     Value="{Binding ChunkCount}" IsEnabled="{Binding CanEdit}"/>
+    </StackPanel>
+
+    <!-- Output path -->
+    <Grid Grid.Row="4" Margin="0,0,0,14" ColumnDefinitions="90,*,Auto">
+      <TextBlock Grid.Column="0" Text="OUTPUT .MOV" Classes="label"/>
+      <TextBox Grid.Column="1" Name="OutputBox" Text="{Binding OutputPath}"
+               IsEnabled="{Binding CanEdit}" TextChanged="OutputBox_TextChanged"/>
+      <Button Grid.Column="2" Content="Save…" Margin="8,0,0,0"
+              Click="BrowseOutput_Click" IsEnabled="{Binding CanEdit}"/>
+    </Grid>
+
+    <!-- Progress. OneWay: Progress is read-only on the view-model (LESSON-UI-001). -->
+    <ProgressBar Grid.Row="5" Height="14" Minimum="0" Maximum="100"
+                 Value="{Binding Progress, Mode=OneWay}" Margin="0,0,0,6"/>
+
+    <TextBlock Grid.Row="6" Text="{Binding StatusText}" Classes="hint"
+               Foreground="{StaticResource TextSecondaryBrush}" Margin="0,0,0,16" TextWrapping="Wrap"/>
+
+    <StackPanel Grid.Row="7" Orientation="Horizontal" HorizontalAlignment="Right">
+      <Button Content="Convert" Width="104" Height="30" Margin="0,0,8,0" Classes="accent"
+              Click="Convert_Click" IsEnabled="{Binding CanConvert}"/>
+      <Button Content="Cancel" Width="90" Height="30" Click="Cancel_Click" IsEnabled="{Binding CanCancel}"/>
+    </StackPanel>
+  </Grid>
+</Window>
