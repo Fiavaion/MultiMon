@@ -108,3 +108,20 @@ bash scripts/publish-release-mac.sh
 
 `dist/` is git-ignored. FFmpeg is not bundled in either kit; it is an external prerequisite for the
 Convert-to-HAP feature only.
+
+## Mac session — first things after this merge lands
+
+Do these on the Mac, in order, and record results in `notes/CURRENT_STATUS.md`:
+
+1. `git checkout master && git pull` — the Mac projects now live on master; `mac-port` is finished and can be deleted.
+2. Build and test from master exactly as CI does: `dotnet build MultiMon.Mac.sln -c Release -warnaserror`, then
+   `dotnet test MultiMon.Core.Tests -c Release`. Then the Mac stress harness on real hardware (the human gate CI cannot run).
+3. First real run of `scripts/publish-release-mac.sh` (unsigned first, no env vars). Compare its DMG with the one you built by hand
+   for `v1.0.0-rc.1-mac`: app launches, icon present, `Stress/` layout, size. Fix the script until they match; commit the fixes.
+4. Signing: run it again with `MAC_SIGN_IDENTITY` set, then with the `APPLE_*` variables for notarization. Note whether the hand-built
+   DMG used `--deep` or inside-out signing and make the script match; decide whether `Stress/` should be in the public DMG at all.
+5. Export the Developer ID Application certificate as `.p12`, base64 it, and give the repo owner the six secrets named above so
+   `release.yml` can sign in CI. Until then CI produces an unsigned DMG and the job still succeeds.
+6. Rebuild 1.0.0 from the `v1.0.0` tag with the script and replace the DMG asset on the GitHub release, so the shipped Mac build
+   reports 1.0.0 rather than rc.1 in About.
+7. From then on: never build a release by hand. Bump `Directory.Build.props` + `CHANGELOG.md`, tag, let CI build both, publish the draft.
