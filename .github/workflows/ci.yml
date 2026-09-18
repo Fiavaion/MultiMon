@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 9.0.x
+
+      # --- Windows: the full solution (WPF, Vortice, Media Foundation) + both test projects ---
+      - name: Build MultiMon.sln
+        if: runner.os == 'Windows'
+        run: dotnet build MultiMon.sln -c Release -warnaserror
+
+      - name: Test MultiMon.Core.Tests
+        if: runner.os == 'Windows'
+        run: dotnet test MultiMon.Core.Tests -c Release --no-build
+
+      - name: Test MultiMon.Tests
+        if: runner.os == 'Windows'
+        run: dotnet test MultiMon.Tests -c Release --no-build
+
+      # --- macOS: MultiMon.Control.Mac / Stress.Mac target net9.0-macos, so the workload is required ---
+      - name: Install macos workload
+        if: runner.os == 'macOS'
+        run: dotnet workload install macos
+
+      - name: Build MultiMon.Mac.sln
+        if: runner.os == 'macOS'
+        run: dotnet build MultiMon.Mac.sln -c Release -warnaserror
+
+      # MultiMon.Tests is net9.0-windows; only the portable suite runs here.
+      - name: Test MultiMon.Core.Tests
+        if: runner.os == 'macOS'
+        run: dotnet test MultiMon.Core.Tests -c Release --no-build

@@ -5,8 +5,9 @@ namespace MultiMon.Core.Diagnostics;
 /// <summary>
 /// File-backed <see cref="ILog"/> for the windowed app, which has no console (a normal double-click launch
 /// loses every <see cref="ConsoleLog"/> line — the field-diagnosability gap noted in RELEASE_REVIEW.md).
-/// Writes timestamped lines to <c>%LOCALAPPDATA%\MultiMon\Logs\</c> and also echoes to the console, so a
-/// redirected launch (<c>app.exe &gt; mm.log</c>) still captures everything.
+/// Writes timestamped lines to <c>%LOCALAPPDATA%\MultiMon\Logs\</c> (<c>~/Library/Logs/MultiMon/</c> on
+/// macOS) and also echoes to the console, so a redirected launch (<c>app &gt; mm.log</c>) still captures
+/// everything.
 ///
 /// <para>Logging must never destabilize the app: construction failures fall back to console-only, and every
 /// write is guarded — a logging fault is swallowed, never thrown into a render/decode/audio thread.
@@ -29,9 +30,7 @@ public sealed class FileLog : ILog, IDisposable
     {
         try
         {
-            var dir = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "MultiMon", "Logs");
+            var dir = LogDirectory();
             Directory.CreateDirectory(dir);
             Prune(dir);
 
@@ -50,6 +49,13 @@ public sealed class FileLog : ILog, IDisposable
             FilePath = null;
         }
     }
+
+    /// <summary>Where the log files live: <c>%LOCALAPPDATA%\MultiMon\Logs</c> on Windows,
+    /// <c>~/Library/Logs/MultiMon</c> on macOS (the platform convention, and where Console.app looks).
+    /// Resolved with BCL calls only — Core never references a platform type.</summary>
+    internal static string LogDirectory() => OperatingSystem.IsMacOS()
+        ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Library", "Logs", "MultiMon")
+        : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "MultiMon", "Logs");
 
     public void Info(string source, string message)  => Write("INFO ", source, message);
     public void Debug(string source, string message) => Write("DEBUG", source, message);
