@@ -199,21 +199,34 @@ assemblies in "Solution structure". Commit on a `mac-port` branch: `Scaffold the
 | D3D11 debug-layer live-object count | Metal validation (`MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1`) + a tracked-resource counter in `Graphics.Mac` + `MTLDevice.currentAllocatedSize` |
 | `DEVICE_REMOVED` recovery | no equivalent on a healthy device; keep the recovery *sequencing* (`DeviceRemovedHandler` shape) for eGPU unplug (`MTLDevice` removal notifications) |
 
+**Control-panel dev switch.** `MultiMon.Control.Mac --autoperform=<clip>[,seconds]` loads the clip on
+monitor 1, performs for `seconds` (default 3), stops and exits 0 — driving the real `MainViewModel`, so it
+gates the path the user clicks (LESSON-TEST-004) and includes the ordered teardown. Headless-friendly:
+`… --autoperform=~/…/5sec.mp4,3 > run.log 2>&1`; the pass signal is exit 0 plus the MEASURED tracker line `teardown complete: live=0 (textures=0 buffers=0 …)` — a wedge, a faulted teardown or any survivor logs `RESULT: FAIL — …` and exits 70.
+
+**The display must be awake** for any Mac GUI run here: Avalonia's macOS backend creates a `CVDisplayLink`,
+and with the screen locked and the panel asleep `CGGetActiveDisplayList` returns 0 displays, so startup dies
+with `Avalonia.Native was not able to start the RenderTimer. Native error code is: -6661`. Hold it awake with
+`caffeinate -u -t 900 &` before launching (this is environmental, not a code fault).
+
 ---
 
 ## 6. Dev-phase TODO list (in order; each ends in a checkable gate)
 
-- [ ] **TODO 0 — Install routing** (section 3). Gate: `/agents` lists all eight; `modelswitcher` loads.
+- [x] **TODO 0 — Install routing** (section 3). Gate: `/agents` lists all eight; `modelswitcher` loads.
       *If `mac-handoff/` is missing, hardcode from Appendix A–C.*
-- [ ] **TODO 1 — Scaffold `MultiMon.Mac.sln`** (section 4). Gate: builds empty, 0 warnings; `MultiMon.Core.Tests` still 126/126.
-- [ ] **TODO 2 — `MultiMon.Platform.Mac`: `NSScreen` monitor service.** `MonitorInfo.DeviceId` = the
-      `CGDirectDisplayID` as a string (an opaque key — all `ShowPlanner` does with it); `Bounds` in
-      global-desktop points × backing scale (pixels, matching the Windows contract); `IsPrimary` = the screen
+- [x] **TODO 1 — Scaffold `MultiMon.Mac.sln`** (section 4). Gate: builds empty, 0 warnings; `MultiMon.Core.Tests` still 126/126.
+- [x] **TODO 2 — `MultiMon.Platform.Mac`: `NSScreen` monitor service.** `MonitorInfo.DeviceId` = the
+      `CGDirectDisplayID` as a string (an opaque key — all `ShowPlanner` does with it); `Bounds` in pixels,
+      matching the Windows contract — **origins:** AppKit global points × the *primary* screen's backing scale,
+      Y flipped about the primary's top edge; **sizes:** each screen's own points × its own backing scale
+      (one uniform unit for positions, else a Retina + non-Retina pair overlaps and Span collapses to 1×1);
+      `RefreshRate` = the *current* `CGDisplayMode` rate (not `MaximumFramesPerSecond`); `IsPrimary` = the screen
       with the menu bar; `MonitorsChanged` from `NSApplication.didChangeScreenParametersNotification`.
       Gate: a small console program lists every attached display with correct pixel bounds; a `ShowPlanner`
       Span plan over that list matches the Windows plan for the same geometry (add it as a
       `MultiMon.Core.Tests` case using the real values).
-- [ ] **TODO 3 — `MultiMon.Graphics.Mac`** (`stability-core` agent). One `MTLDevice`
+- [x] **TODO 3 — `MultiMon.Graphics.Mac`** (`stability-core` agent). One `MTLDevice`
       (`MTLCreateSystemDefaultDevice`; on multi-GPU Macs pick the device driving the most outputs and log the
       candidates — the Windows adapter rule). One borderless `NSWindow` + `CAMetalLayer` per screen, created
       ONCE, shown/hidden per perform, never recreated. Render loop on one dedicated thread;
@@ -221,30 +234,43 @@ assemblies in "Solution structure". Commit on a `mac-port` branch: `Scaffold the
       + UV sub-rect + HapQ shader from `MultiMon.Graphics/QuadPipeline.cs` HLSL to MSL.
       Gate: `MultiMon.Stress.Mac --cycles=50 --windows=N` on the test pattern: zero wedge, zero sustained
       resource growth, flat RSS.
-- [ ] **TODO 4 — `MultiMon.Decode.Mac`, HAP first.** `HapSource` twin: `MultiMon.Hap` decodes, upload via
+- [x] **TODO 4 — `MultiMon.Decode.Mac`, HAP first.** `HapSource` twin: `MultiMon.Hap` decodes, upload via
       `replaceRegion` (`bc1_rgba`, `bc3_rgba`, `bc4_rUnorm`, `bc7_rgbaUnorm`), pooled buffers returned in the
       frame's release closure, same length/format validation as Windows.
       Gate: harness `--hap --mode=span` 50 cycles PASS; HAP visibly playing on two screens.
-- [ ] **TODO 5 — `MultiMon.Decode.Mac`, VideoToolbox.** `VTDecompressionSession` with
+      *Done 2026-09-06.* The 5sec fixture is greyscale; `--source-check --hap --video=…/Hap/colour_hapq.mov` (HAP-Q
+      testsrc2, generated with ffmpeg) is the chroma gate — the check NOTEs when a clip cannot prove chroma.
+- [x] **TODO 5 — `MultiMon.Decode.Mac`, VideoToolbox.** `VTDecompressionSession` with
       `kCVPixelBufferMetalCompatibilityKey`; `CVMetalTextureCache` for zero copy; BGRA output for parity with
       the Windows pass (NV12 + a YUV→RGB MSL pass only if measured to matter); assert the first frame's
       format/size like Windows does and log the decode path.
       Gate: harness `--mode=individual --video --video2` 50 cycles PASS; 4K H.264 and HEVC play.
-- [ ] **TODO 6 — `MultiMon.Audio.Mac`.** Port `AudioRing` (pure); `AVAudioEngine` or `AudioUnit` output per
+      *Done 2026-09-08.* BGRA via CVMetalTextureCache (unpaced 4K decode 412 fps, so no NV12 pass). HEVC clips
+      generated with `hevc_videotoolbox` into `MultiMonMedia/`; `colour_h264.mp4` is the VT readback fixture.
+- [x] **TODO 6 — `MultiMon.Audio.Mac`.** Port `AudioRing` (pure); `AVAudioEngine` or `AudioUnit` output per
       track; drift correction against `MasterClock` (copy the one-shot proportional policy from
       `WasapiOutput`); device selection by `AudioTrack.OutputDeviceId`; device-invalidated rebuild.
       Gate: harness `--audio` 30 cycles, 0 underruns, peak drift under 40 ms.
-- [ ] **TODO 7 — Mac `PerformanceController` + `MultiMon.Stress.Mac --controller`.** Same shape as
+      *Done 2026-09-08.* AUHAL per track (device-selectable; AVAudioEngine cannot target a device). `AudioRing` moved to
+      `MultiMon.Core/Audio` (namespace `MultiMon.Audio` kept) — **needs one Windows build of `MultiMon.sln` before merge.**
+- [x] **TODO 7 — Mac `PerformanceController` + `MultiMon.Stress.Mac --controller`.** Same shape as
       Windows: one worker thread, `BlockingCollection<Action>` FIFO, UI posts and returns, `StateChanged` /
       `CommandFailed` events, `ShowPlanner` for the mapping (no port needed), symmetric decode ladder (`.mov`
       probed on HAP first). **Never** run native teardown on the AppKit main thread — LESSON-TEST-004 and the
       V0087 deadlock rule apply verbatim.
       Gate: `--controller` 50 cycles PASS in Span, Individual, Split, HAP and audio.
-- [ ] **TODO 8 — Avalonia control panel.** Reuse `MainViewModel`'s contract (WPF today; lift the view-model
+      *Done 2026-09-09.* Host contract: construct/dispose the controller off the main thread; keep the NSApplication
+      run loop pumping (window show/hide is marshalled to the main queue with a 5 s bound).
+- [x] **TODO 8 — Avalonia control panel.** Reuse `MainViewModel`'s contract (WPF today; lift the view-model
       logic into a portable `MultiMon.Control.Shared` if the Dispatcher seam is the only WPF dependency —
       check first). Monitor rows, mode picker, Identify overlay, mixer, New/Open/Save, Convert-to-HAP
       (ffmpeg via a Homebrew path probe). Gate: the user's manual run of every mode.
-- [ ] **TODO 9 — Ship gate.** Full matrix on Apple Silicon **and** one Intel Mac; write
+      *Done 2026-09-14 — user's manual pass of every mode on two displays PASSED.*
+      *Code-complete 2026-09-09* (commit "Mac control panel"); the manual-run gate is still open. Host contract: `NSApplication.Init()`
+      first on the main thread; controller built/disposed off the main thread; exit = bounded off-thread teardown while the run loop
+      is alive, then `desktop.Shutdown()` (LESSON-BUG-009). Mac-specific choices: hotkeys frontmost-only, no Report-a-bug button,
+      HAP always enabled on Metal.
+- [ ] **TODO 9 — Ship gate.** Full matrix on Apple Silicon (**Intel Mac deferred to 1.1/1.2 — user decision 2026-09-11**); write
       `docs/sessions/<date>-mac-checkpoint.md`; update `notes/CURRENT_STATUS.md`; ADR 0005 "macOS platform
       layers" in `docs/adr/` recording the stack choices actually made.
 
@@ -252,7 +278,8 @@ Windows stays green throughout: never add a platform type to `MultiMon.Core` or 
 change must keep `MultiMon.Core.Tests` at ≥126 passing and must be built on Windows before it reaches
 `master` (the user runs that side).
 
-Branching: work on `mac-port` off `master`; merge to `master` only after the user's manual check, per the
+Branching: the port merged into `master` on 2026-10-18. Mac work now uses short branches off `master` and a
+pull request, like Windows work — see `docs/DEV_PATHS.md`. Merge only after the user's manual check, per the
 existing feedback rule.
 
 ---

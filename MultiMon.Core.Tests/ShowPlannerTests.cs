@@ -112,6 +112,55 @@ public class ShowPlannerTests
         Assert.Empty(plan.Warnings);
     }
 
+    /// <summary>
+    /// Real geometry from <c>MultiMon.Stress.Mac --list-monitors</c> (MacBook Pro 14", Apple Silicon,
+    /// 2026-09-06): one built-in Retina display, CGDirectDisplayID 1, pixel bounds 3456x2234 at (0,0).
+    /// Pins that the macOS <c>MonitorService</c> feeds ShowPlanner a list it plans exactly like a Windows
+    /// one — the sole screen takes the whole frame.
+    /// </summary>
+    [Fact]
+    public void Span_RealMacGeometry_1Screen_TakesWholeFrame()
+    {
+        var monitors = new List<MonitorInfo> { Monitor("1", 0, 0, 3456, 2234) };
+
+        var plan = ShowPlanner.Plan(Show(ShowMode.Span, Binding("main", "/Users/mark/wall.mp4")), monitors);
+
+        Assert.Equal(new[] { "main" }, plan.Sources.Select(s => s.SourceId));
+        Assert.Empty(plan.Warnings);
+        Assert.Single(plan.Bindings);
+        Assert.Equal(0, plan.Bindings[0].SourceIndex);
+        Assert.Equal(0, plan.Bindings[0].OutputIndex);
+        Assert.Equal(ShowClock.Shared, plan.Bindings[0].Clock);
+        AssertUv(new UvRect(0f, 0f, 1f, 1f), plan.Bindings[0].Uv);
+    }
+
+    /// <summary>
+    /// Mixed-DPI Mac geometry DERIVED from the <c>MultiMon.Platform.Mac.MonitorService</c> coordinate rule
+    /// (origins: AppKit global points × the primary's backing scale, Y flipped about the primary's top edge;
+    /// sizes: each screen's own points × its own backing scale) — not observed on hardware. A Retina primary
+    /// (1728x1117 pt, x2 → 3456x2234 px at (0,0)) plus a non-Retina 1920x1080 external at AppKit frame
+    /// {1728,0,1920,1080} (x1 → 1920x1080 px at (3456,74)): the screens abut with no overlap and the span
+    /// splits in half per screen.
+    /// </summary>
+    [Fact]
+    public void Span_MixedDpiMacGeometry_RetinaPlusExternalRight_SplitsInHalf()
+    {
+        var monitors = new List<MonitorInfo>
+        {
+            Monitor("1", 0, 0, 3456, 2234),
+            Monitor("2", 3456, 74, 1920, 1080),
+        };
+
+        var plan = ShowPlanner.Plan(Show(ShowMode.Span, Binding("main", "/Users/mark/wall.mp4")), monitors);
+
+        Assert.Single(plan.Sources);
+        Assert.Empty(plan.Warnings);
+        Assert.Equal(2, plan.Bindings.Count);
+        Assert.Equal(new[] { 0, 1 }, plan.Bindings.Select(b => b.OutputIndex));
+        AssertUv(new UvRect(0f, 0f, 0.5f, 1f), plan.Bindings[0].Uv);
+        AssertUv(new UvRect(0.5f, 0f, 1f, 1f), plan.Bindings[1].Uv);
+    }
+
     // ── Individual / Hap ─────────────────────────────────────────────────────
 
     [Fact]
