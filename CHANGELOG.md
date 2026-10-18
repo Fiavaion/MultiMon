@@ -6,7 +6,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
-## [1.0.0] - 2026-09-19
+## [1.0.0] - 2026-10-18
 
 First stable release, for **Windows (x64)** and **macOS (Apple Silicon)**. Everything in 1.0.0-rc.1 below is
 included; the macOS port is new.

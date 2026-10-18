@@ -8,7 +8,7 @@ selected monitors.
 [![Platform: Windows](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D6.svg)](REQUIREMENTS.md)
 [![Latest release](https://img.shields.io/github/v/release/Fiavaion/MultiMon?include_prereleases)](https://github.com/Fiavaion/MultiMon/releases)
 
-> **Status: `1.0.0`** — released 2026-09-19 for Windows (x64) and macOS (Apple Silicon). Stable on AMD and NVIDIA;
+> **Status: `1.0.0`** — released 2026-10-18 for Windows (x64) and macOS (Apple Silicon). Stable on AMD and NVIDIA;
 > the real-Intel (QuickSync) acceptance pass and a multi-vendor 4+ screen rig remain to be run on hardware — see CHANGELOG known limitations.
 
 Built on a persistent Direct3D 11 pipeline (Vortice.Windows), Media Foundation hardware decode with
